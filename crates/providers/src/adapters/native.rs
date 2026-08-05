@@ -533,11 +533,27 @@ mod tests {
         })
     }
 
+    fn fixture_executable() -> PathBuf {
+        #[cfg(windows)]
+        {
+            PathBuf::from(r"C:\AudiobookAI\native-tts-fixture.exe")
+        }
+        #[cfg(not(windows))]
+        {
+            PathBuf::from("/audiobookai/native-tts-fixture")
+        }
+    }
+
+    #[test]
+    fn fixture_executable_is_host_absolute() {
+        assert!(fixture_executable().is_absolute());
+    }
+
     #[tokio::test]
     async fn parses_macos_voice_fixture() {
         let runner = fixture(b"Ava en_US # Hello\nAnna de_DE # Hallo\n", None);
         let provider = NativeTtsProvider::new(
-            NativeTtsConfig::new(NativePlatform::MacOs, PathBuf::from("/usr/bin/say")).unwrap(),
+            NativeTtsConfig::new(NativePlatform::MacOs, fixture_executable()).unwrap(),
             runner,
         )
         .unwrap();
@@ -553,7 +569,7 @@ mod tests {
             None,
         );
         let provider = NativeTtsProvider::new(
-            NativeTtsConfig::new(NativePlatform::Linux, PathBuf::from("/app/espeak-ng")).unwrap(),
+            NativeTtsConfig::new(NativePlatform::Linux, fixture_executable()).unwrap(),
             runner,
         )
         .unwrap();
@@ -592,12 +608,7 @@ mod tests {
     async fn parses_windows_voice_fixture() {
         let runner = fixture(br#"[{"id":"SAPI\\Voice1","name":"Microsoft Voice"}]"#, None);
         let provider = NativeTtsProvider::new(
-            NativeTtsConfig::new(
-                NativePlatform::Windows,
-                // Host-absolute fixture; Windows builds use an absolute drive path.
-                PathBuf::from("/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"),
-            )
-            .unwrap(),
+            NativeTtsConfig::new(NativePlatform::Windows, fixture_executable()).unwrap(),
             runner,
         )
         .unwrap();
@@ -610,7 +621,7 @@ mod tests {
         const WAV: &[u8] = b"RIFF....WAVEfixture";
         let runner = fixture(b"", Some(WAV));
         let provider = NativeTtsProvider::new(
-            NativeTtsConfig::new(NativePlatform::MacOs, PathBuf::from("/usr/bin/say")).unwrap(),
+            NativeTtsConfig::new(NativePlatform::MacOs, fixture_executable()).unwrap(),
             runner.clone(),
         )
         .unwrap();

@@ -289,4 +289,17 @@ mod tests {
         assert_eq!(installed_sidecar_directory(resources.path()), Some(bin));
         assert!(installed_sidecar_directory(&resources.path().join("missing")).is_none());
     }
+
+    #[test]
+    fn base_updater_config_is_secret_free_and_deserializable() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).expect("valid Tauri config");
+        let updater = config
+            .pointer("/plugins/updater")
+            .and_then(serde_json::Value::as_object)
+            .expect("base updater configuration must be an object");
+
+        assert_eq!(updater.get("endpoints"), Some(&serde_json::json!([])));
+        assert_eq!(updater.get("pubkey"), Some(&serde_json::json!("")));
+    }
 }
