@@ -1,5 +1,83 @@
 # Packaging inputs
 
+## Local native development build
+
+`make native-local` is the deterministic, host-native developer packaging
+entrypoint. It invokes Tauri in an optimized debug profile with dependency
+locking and release-identity signing disabled, then publishes only generated files beneath the gitignored
+`artifacts/local-native/` tree:
+
+- `current/<rust-host-target>/` is the stable, discoverable view of the latest
+  successful build. It contains the native executable, the host package,
+  `manifest.json`, `SHA256SUMS`, and a `CURRENT` build identifier.
+- `builds/<rust-host-target>/<build-id>/` is the immutable snapshot referenced
+  by the manifest. Prior snapshots are retained rather than removed.
+
+The build ID incorporates the current tracked diff, relevant untracked build
+inputs, and the produced artifact hashes. The script rechecks that source state
+after Tauri exits, normalizes macOS app-archive metadata, writes sorted JSON and
+checksums, and verifies both the immutable and current copies before reporting
+success. On macOS, extract `AudiobookAI.app.tar.gz` to recover the development app
+bundle, or run the standalone `AudiobookAI` executable directly. Apple Silicon's
+linker may apply an ad-hoc signature to the Mach-O executable even with Tauri
+signing disabled; the manifest records that possibility without treating it as
+distribution signing.
+
+The debug profile intentionally permits FFmpeg and ffprobe from `PATH`, so the
+host must provide both tools for conversion, quality-control, and export use.
+Linux native speech additionally requires eSpeak NG. The build does not copy
+those host tools into the artifact.
+
+This path intentionally does not consume release sidecars, signing keys,
+notarization credentials, or the updater key. It is not a supported public
+installer and must never be uploaded as a release artifact.
+
+## Automated GitHub builds
+
+A successful `Native CI` run for a push to `main` triggers
+`.github/workflows/snapshot.yml` with that run's immutable commit SHA. A red,
+cancelled, pull-request, fork, non-`main`, or manually dispatched CI run cannot
+publish a snapshot. Packaging then runs entirely on GitHub-hosted Windows,
+macOS, and Linux runners and produces this exact rolling development prerelease
+asset set:
+
+- `AudiobookAI-development-windows-x86_64.exe`
+- `AudiobookAI-development-macos-universal.dmg`
+- `AudiobookAI-development-linux-x86_64.AppImage`
+- `AudiobookAI-development-linux-x86_64.deb`
+- `DEVELOPMENT-BUILD.txt`, `LICENSE`, and `SHA256SUMS`
+
+Checksums and the combined candidate are generated only after every native
+target succeeds. Publication creates an unpublished prerelease draft, uploads
+the complete set, downloads it again, compares every name and byte, and only
+then makes it public. A newly verified snapshot is published before best-effort
+pruning of older workflow-owned snapshots, so pruning cannot create an
+availability gap.
+
+These are optimized debug builds with a separate package identifier. Windows
+and Linux are unsigned. The macOS DMG uses Tauri's literal `-` ad-hoc identity
+to keep the downloaded app structurally signed, but that is not a trusted
+Developer ID signature and the app is not notarized. No snapshot is
+updater-enabled or a supported stable release, and snapshots intentionally omit
+the unresolved audited sidecar bundles. Development media use therefore
+requires system FFmpeg/ffprobe and, on Linux, eSpeak NG. Windows SmartScreen and
+macOS Gatekeeper may warn or block them. The desktop service may still share
+application data with stable builds; use disposable test data and keep backups.
+
+`.github/workflows/release.yml` is the independent stable path. Pushing a
+qualifying annotated `vMAJOR.MINOR.PATCH` tag starts it automatically. The tag
+must match every committed version, resolve to the immutable quality-gated
+commit, be signed by the locally trusted release identity, and pass the
+finalized-sidecar and full signed native matrix. The aggregate job creates and
+signs checksums only after all targets succeed. Publication then stages an
+unpublished draft, uploads and byte-verifies every asset, and makes it public
+without a second workflow-dispatch run. The `stable-release` and
+`stable-publish` environments still pause their jobs for required-reviewer
+approval when that protection is configured; the tag is the release intent,
+not a bypass around those controls.
+
+## Signed release inputs
+
 `sidecars.lock.json` is the signed-release allowlist for native media tools. It pins the
 upstream source, build contract, bundle archive, and critical files independently. The committed
 manifest intentionally has `releaseReady: false` and unresolved bundle hashes: no release may be

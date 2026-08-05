@@ -4605,6 +4605,13 @@ fn provider_mode_matches_runtime(
     )
 }
 
+fn persisted_provider_mode_matches(
+    expected: Option<ProviderModeView>,
+    current: ProviderModeView,
+) -> bool {
+    expected == Some(current)
+}
+
 fn persisted_provider_snapshot_matches(expected: Option<Uuid>, current: Option<Uuid>) -> bool {
     expected.is_some() && expected == current
 }
@@ -4644,7 +4651,7 @@ async fn validate_regeneration_retry_provider_snapshot(
     })?;
     if profile.kind != segment.assignment.provider_kind
         || profile.endpoint != segment.assignment.provider_endpoint
-        || segment.assignment.provider_mode != Some(profile.mode)
+        || !persisted_provider_mode_matches(segment.assignment.provider_mode, profile.mode)
         || !voice_matches
     {
         return Err(ServiceError::Conflict(
@@ -4901,13 +4908,15 @@ async fn normalize_provider_audio(
         .prefix("audiobookai-provider-")
         .suffix(suffix)
         .tempfile()
-        .map_err(ServiceError::Io)?;
-    tokio::fs::write(input.path(), &response.audio).await?;
+        .map_err(ServiceError::Io)?
+        .into_temp_path();
+    tokio::fs::write(&input, &response.audio).await?;
     let output = tempfile::Builder::new()
         .prefix("audiobookai-normalized-")
         .suffix(".flac")
         .tempfile()
-        .map_err(ServiceError::Io)?;
+        .map_err(ServiceError::Io)?
+        .into_temp_path();
     let filter = if short_segment {
         "dynaudnorm=f=75:g=9:p=0.85:m=5,alimiter=limit=0.7079"
     } else {
@@ -4918,7 +4927,7 @@ async fn normalize_provider_audio(
         "-nostdin".to_owned(),
         "-y".to_owned(),
         "-i".to_owned(),
-        input.path().to_string_lossy().into_owned(),
+        input.to_string_lossy().into_owned(),
         "-vn".to_owned(),
         "-af".to_owned(),
         filter.to_owned(),
@@ -4932,10 +4941,10 @@ async fn normalize_provider_audio(
         "8".to_owned(),
         "-f".to_owned(),
         "flac".to_owned(),
-        output.path().to_string_lossy().into_owned(),
+        output.to_string_lossy().into_owned(),
     ];
     run_process(&sidecars.ffmpeg, &arguments, "normalize provider audio").await?;
-    let bytes = tokio::fs::read(output.path()).await?;
+    let bytes = tokio::fs::read(&output).await?;
     if bytes.len() < 4 || &bytes[..4] != b"fLaC" {
         return Err(ServiceError::Internal(
             "FFmpeg did not produce a valid canonical FLAC segment".to_owned(),
@@ -5171,7 +5180,8 @@ async fn assemble_chapter(
         .prefix(".chapter-")
         .suffix(".flac")
         .tempfile_in(&output_directory)
-        .map_err(ServiceError::Io)?;
+        .map_err(ServiceError::Io)?
+        .into_temp_path();
     let mut arguments = vec![
         "-hide_banner".to_owned(),
         "-nostdin".to_owned(),
@@ -5213,7 +5223,7 @@ async fn assemble_chapter(
         "8".to_owned(),
         "-f".to_owned(),
         "flac".to_owned(),
-        temporary.path().to_string_lossy().into_owned(),
+        temporary.to_string_lossy().into_owned(),
     ]);
     // A pause can begin after the worker's initial proof-export validation. Check the job state
     // again at the actual input-consumption boundary, then re-hash every selected take before
@@ -5227,8 +5237,8 @@ async fn assemble_chapter(
         verify_selected_artifacts_before_use(&artifacts).await?;
     }
     run_process(&sidecars.ffmpeg, &arguments, "assemble chapter").await?;
-    validate_flac(temporary.path()).await?;
-    atomic_promote(temporary.path(), &destination).await?;
+    validate_flac(&temporary).await?;
+    atomic_promote(&temporary, &destination).await?;
     let duration_ms = probe_duration_ms(sidecars, &destination).await?;
     let artifact = artifact_for_file(
         ArtifactKind::ChapterMaster,
@@ -6168,10 +6178,11 @@ async fn copy_file_atomically(source: &Path, destination: &Path) -> Result<(), S
     let temporary = tempfile::Builder::new()
         .prefix(".audiobookai-copy-")
         .tempfile_in(parent)
-        .map_err(ServiceError::Io)?;
-    tokio::fs::copy(source, temporary.path()).await?;
-    sync_file(temporary.path()).await?;
-    atomic_promote(temporary.path(), destination).await
+        .map_err(ServiceError::Io)?
+        .into_temp_path();
+    tokio::fs::copy(source, &temporary).await?;
+    sync_file(&temporary).await?;
+    atomic_promote(&temporary, destination).await
 }
 
 async fn write_file_atomically(destination: &Path, bytes: &[u8]) -> Result<(), ServiceError> {
@@ -6182,10 +6193,11 @@ async fn write_file_atomically(destination: &Path, bytes: &[u8]) -> Result<(), S
     let temporary = tempfile::Builder::new()
         .prefix(".audiobookai-write-")
         .tempfile_in(parent)
-        .map_err(ServiceError::Io)?;
-    tokio::fs::write(temporary.path(), bytes).await?;
-    sync_file(temporary.path()).await?;
-    atomic_promote(temporary.path(), destination).await
+        .map_err(ServiceError::Io)?
+        .into_temp_path();
+    tokio::fs::write(&temporary, bytes).await?;
+    sync_file(&temporary).await?;
+    atomic_promote(&temporary, destination).await
 }
 
 async fn write_job_staging_file_atomically(
@@ -6200,9 +6212,10 @@ async fn write_job_staging_file_atomically(
     let temporary = tempfile::Builder::new()
         .prefix(".audiobookai-staging-write-")
         .tempfile_in(parent)
-        .map_err(ServiceError::Io)?;
-    tokio::fs::write(temporary.path(), bytes).await?;
-    sync_file(temporary.path()).await?;
+        .map_err(ServiceError::Io)?
+        .into_temp_path();
+    tokio::fs::write(&temporary, bytes).await?;
+    sync_file(&temporary).await?;
     ensure_private_staging_file_path(private_root, destination).await?;
     match tokio::fs::symlink_metadata(destination).await {
         Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
@@ -6217,7 +6230,7 @@ async fn write_job_staging_file_atomically(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(ServiceError::Io(error)),
     }
-    atomic_promote(temporary.path(), destination).await
+    atomic_promote(&temporary, destination).await
 }
 
 async fn prepare_private_export_staging(
@@ -6339,17 +6352,26 @@ async fn sync_file(path: &Path) -> Result<(), ServiceError> {
     Ok(())
 }
 
+fn no_clobber_conflict(destination: &Path) -> ServiceError {
+    ServiceError::Conflict(format!("refusing to overwrite {}", destination.display()))
+}
+
+async fn failed_no_clobber_operation_is_conflict(
+    error: &std::io::Error,
+    destination: &Path,
+) -> bool {
+    error.kind() == std::io::ErrorKind::AlreadyExists
+        || tokio::fs::symlink_metadata(destination).await.is_ok()
+}
+
 async fn atomic_promote(source: &Path, destination: &Path) -> Result<(), ServiceError> {
     sync_file(source).await?;
     match tokio::fs::hard_link(source, destination).await {
         Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            return Err(ServiceError::Conflict(format!(
-                "refusing to overwrite {}",
-                destination.display()
-            )));
-        }
         Err(error) => {
+            if failed_no_clobber_operation_is_conflict(&error, destination).await {
+                return Err(no_clobber_conflict(destination));
+            }
             tracing::debug!(
                 diagnostic_code = "storage.promotion.hard_link.unavailable",
                 %error,
@@ -6387,13 +6409,12 @@ where
         .await
     {
         Ok(output) => output,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            return Err(ServiceError::Conflict(format!(
-                "refusing to overwrite {}",
-                destination.display()
-            )));
+        Err(error) => {
+            if failed_no_clobber_operation_is_conflict(&error, destination).await {
+                return Err(no_clobber_conflict(destination));
+            }
+            return Err(ServiceError::Io(error));
         }
-        Err(error) => return Err(ServiceError::Io(error)),
     };
     if let Err(error) = tokio::io::copy(input, &mut output).await {
         drop(output);
@@ -6420,10 +6441,13 @@ async fn create_directory_no_clobber(destination: &Path) -> Result<(), ServiceEr
             }
             Ok(())
         }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Err(
-            ServiceError::Conflict(format!("refusing to overwrite {}", destination.display())),
-        ),
-        Err(error) => Err(ServiceError::Io(error)),
+        Err(error) => {
+            if failed_no_clobber_operation_is_conflict(&error, destination).await {
+                Err(no_clobber_conflict(destination))
+            } else {
+                Err(ServiceError::Io(error))
+            }
+        }
     }
 }
 
@@ -9779,6 +9803,30 @@ mod tests {
         assert_eq!(tokio::fs::read(&source).await.unwrap(), b"job-owned output");
     }
 
+    #[tokio::test]
+    async fn permission_denied_is_a_conflict_when_the_no_clobber_destination_exists() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let existing = directory.path().join("book.m4b");
+        tokio::fs::write(&existing, b"foreign output")
+            .await
+            .unwrap();
+        let permission_denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+
+        assert!(
+            failed_no_clobber_operation_is_conflict(&permission_denied, &existing).await,
+            "Windows can report an existing no-clobber target as access denied"
+        );
+        assert!(
+            !failed_no_clobber_operation_is_conflict(
+                &permission_denied,
+                &directory.path().join("available.m4b"),
+            )
+            .await,
+            "an unrelated permission failure must remain an I/O error"
+        );
+        assert_eq!(tokio::fs::read(existing).await.unwrap(), b"foreign output");
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn managed_export_staging_ignores_a_hostile_legacy_public_symlink() {
@@ -10302,7 +10350,20 @@ mod tests {
     }
 
     #[test]
-    fn regeneration_retry_requires_an_exact_persisted_provider_snapshot() {
+    fn regeneration_retry_requires_an_exact_persisted_provider_identity() {
+        assert!(persisted_provider_mode_matches(
+            Some(ProviderModeView::CloudRemote),
+            ProviderModeView::CloudRemote,
+        ));
+        assert!(!persisted_provider_mode_matches(
+            None,
+            ProviderModeView::CloudRemote,
+        ));
+        assert!(!persisted_provider_mode_matches(
+            Some(ProviderModeView::ExternalEndpoint),
+            ProviderModeView::CloudRemote,
+        ));
+
         let snapshot = Uuid::new_v4();
         assert!(persisted_provider_snapshot_matches(
             Some(snapshot),

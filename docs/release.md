@@ -97,13 +97,21 @@ URLs for sidecars.
 ## Workflow separation and publication boundaries
 
 - `ci.yml` runs normal locked builds and tests on GitHub-hosted native runners. It receives no
-  provider or release credential and never accesses paid provider APIs.
+  provider or release credential and never accesses paid provider APIs. A successful run caused
+  by a push to `main` is the only event that can trigger `snapshot.yml`.
+- `snapshot.yml` checks out that successful CI run's immutable commit, builds the complete
+  GitHub-hosted Windows, macOS, and Linux development matrix, verifies the combined checksums and
+  uploaded bytes, and publishes a clearly marked untrusted prerelease. Pull-request, fork,
+  manually dispatched, cancelled, and failed CI runs cannot publish a snapshot.
 - `release.yml` first runs credential-free quality gates, then locally verifies the tag signature
-  on the owner-controlled Linux release runner before any signing job can start.
+  on the owner-controlled Linux release runner before any signing job can start. A qualifying
+  annotated stable tag automatically enters this pipeline.
 - Native package and aggregate jobs use only locally provisioned signers. They upload signatures
   and signed artifacts, never the signing material.
-- Publishing is a separate boolean workflow-dispatch choice behind `stable-publish` approval. A
-  tag-triggered run cannot publish automatically.
+- After the complete stable aggregate passes, the tag-triggered run automatically enters the
+  `stable-publish` job. Required reviewers on that empty environment can still pause final
+  publication; no second workflow-dispatch run is required. Manual dispatch remains a recovery
+  path for an existing tag, and its explicit `publish` choice never bypasses an environment gate.
 
 Every third-party GitHub Action is pinned to a full commit SHA. Before each
 `actions/upload-artifact`, provenance attestation, and `gh release create` step, the exact candidate
@@ -133,14 +141,17 @@ does not make an earlier secret-bearing commit safe to push.
    release tag must be exactly `v<version>` and the major version must be at least 1.
 4. From a credential-free development checkout, run the history scanner, commit clean lockfiles,
    create an annotated OpenPGP-signed tag, scan again, and push only after the installed pre-push
-   hook has scanned the exact object IDs Git is about to send.
-5. Run `Native desktop release` with that tag and `publish` disabled. Approve `stable-release` only
-   after confirming the immutable tag and the dedicated runners.
-6. Review code-signing output, notarization/stapling, updater signatures, SBOM, source bundle,
-   checksums, provenance, and every scanner result.
-7. Install every artifact on a disposable clean machine and complete the matrix below.
-8. Rerun the immutable tag with `publish` enabled. Approval of the empty `stable-publish`
-   environment is the final authorization to create the GitHub Release.
+   hook has scanned the exact object IDs Git is about to send. That push starts `Native desktop
+   release` automatically.
+5. Approve `stable-release` only after confirming the immutable tag and dedicated runners. Review
+   code-signing output, notarization/stapling, updater signatures, SBOM, source bundle, checksums,
+   provenance, and every scanner result as the jobs complete.
+6. Install the staged workflow artifacts on disposable clean machines and complete the matrix
+   below before approving `stable-publish`. Configure that environment with required reviewers so
+   this acceptance gate cannot be skipped for a stable release.
+7. Approval of the empty `stable-publish` environment lets the same run create an unpublished
+   draft, upload and download every asset for byte verification, and then make it public. Do not
+   rerun or recreate the tag.
 
 The workflow fails closed for a mismatched/untrusted tag, pre-1.0 version, unresolved sidecar
 manifest, absent local signer, updater key inside the checkout, absent updater signature, failed

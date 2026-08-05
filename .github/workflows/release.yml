@@ -36,6 +36,7 @@ jobs:
     outputs:
       version: ${{ steps.metadata.outputs.version }}
       source_date_epoch: ${{ steps.metadata.outputs.source_date_epoch }}
+      commit_sha: ${{ steps.metadata.outputs.commit_sha }}
     steps:
       - name: Check out the requested tag without persisted credentials
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -83,8 +84,10 @@ jobs:
         run: |
           version="${RELEASE_TAG#v}"
           source_date_epoch="$(git show -s --format=%ct HEAD)"
+          commit_sha="$(git rev-parse HEAD)"
           echo "version=${version}" >>"${GITHUB_OUTPUT}"
           echo "source_date_epoch=${source_date_epoch}" >>"${GITHUB_OUTPUT}"
+          echo "commit_sha=${commit_sha}" >>"${GITHUB_OUTPUT}"
 
       - name: Require an annotated tag that resolves to the checked-out commit
         shell: bash
@@ -128,7 +131,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ needs.quality.outputs.commit_sha }}
 
       - name: Reject credentials in source and history
         run: python3 scripts/security/check_no_secrets.py --current --history
@@ -157,7 +160,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ needs.quality.outputs.commit_sha }}
 
       - name: Install build-time Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
@@ -238,7 +241,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ needs.quality.outputs.commit_sha }}
 
       - name: Install pinned pnpm
         uses: pnpm/action-setup@9fd676a19091d4595eefd76e4bd31c97133911f1 # v4.2.0
@@ -450,7 +453,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ needs.quality.outputs.commit_sha }}
 
       - name: Install pinned pnpm
         uses: pnpm/action-setup@9fd676a19091d4595eefd76e4bd31c97133911f1 # v4.2.0
@@ -546,7 +549,7 @@ jobs:
 
   publish:
     name: Publish approved stable desktop release
-    if: github.event_name == 'workflow_dispatch' && inputs.publish == true
+    if: github.event_name == 'push' || inputs.publish == true
     needs: [quality, aggregate]
     runs-on: ubuntu-22.04
     environment: stable-publish
@@ -558,7 +561,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ needs.quality.outputs.commit_sha }}
 
       - name: Install checksum verification tools
         run: |
@@ -584,24 +587,55 @@ jobs:
           (cd release/dist && sha256sum --check SHA256SUMS)
           rm -rf "${verification_home}"
 
-      - name: Refuse to overwrite an existing release
+      - name: Refuse to overwrite a published release and clear a stale draft
         env:
           GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
           if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
-            echo "release ${RELEASE_TAG} already exists; immutable releases are never overwritten" >&2
-            exit 2
+            if test "$(gh release view "${RELEASE_TAG}" --json isDraft --jq .isDraft)" != true; then
+              echo "release ${RELEASE_TAG} is already published; immutable releases are never overwritten" >&2
+              exit 2
+            fi
+            gh release delete "${RELEASE_TAG}" --yes
           fi
 
-      - name: Secret-scan final GitHub Release upload
+      - name: Secret-scan stable draft creation
         run: python3 scripts/security/check_no_secrets.py --path release/dist
 
-      - name: Publish signed stable release
+      - name: Create unpublished stable release draft
         env:
           GH_TOKEN: ${{ github.token }}
         run: >-
           gh release create "${RELEASE_TAG}"
-          release/dist/*
+          --draft
           --verify-tag
           --title "AudiobookAI ${RELEASE_TAG}"
           --generate-notes
+
+      - name: Secret-scan stable draft asset upload
+        run: python3 scripts/security/check_no_secrets.py --path release/dist
+
+      - name: Upload complete candidate to stable release draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${RELEASE_TAG}" release/dist/*
+
+      - name: Download stable draft assets for byte verification
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "${RELEASE_TAG}" --dir release/uploaded
+
+      - name: Verify every uploaded stable asset byte-for-byte
+        run: >-
+          python3 scripts/release/verify_release_upload.py
+          release/dist
+          release/uploaded
+
+      - name: Secret-scan verified stable draft before publication
+        run: python3 scripts/security/check_no_secrets.py --path release/uploaded
+
+      - name: Publish verified stable release draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "${RELEASE_TAG}" --draft=false --latest

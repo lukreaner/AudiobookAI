@@ -56,6 +56,37 @@ cargo test --workspace
 pnpm --dir web tauri dev
 ```
 
+To produce a fresh native executable and non-release-signed host package from the current
+checkout, run:
+
+```bash
+make native-local
+```
+
+`make desktop` is retained as an alias for the same packaging path.
+The command uses the locked Rust and pnpm dependency graph, builds the embedded
+dashboard and an optimized debug Tauri host, and publishes a stable current view under
+`artifacts/local-native/current/<rust-host-target>/`. That directory contains
+the executable, a host package, `manifest.json`, and `SHA256SUMS`; immutable
+content-addressed snapshots remain under `artifacts/local-native/builds/`.
+These local artifacts are for development and deliberately use no release
+identity, so they do not satisfy the public release procedure. On Apple Silicon,
+the linker can still apply an ad-hoc Mach-O signature; that is not project
+distribution signing or notarization.
+The development profile accepts system FFmpeg and ffprobe from `PATH`; those
+tools must be installed for conversion, quality-control, and export features,
+and Linux native speech additionally requires eSpeak NG.
+
+A successful cross-platform `Native CI` run for a push to `main` starts the
+GitHub-hosted rolling development snapshot workflow. It publishes a prerelease
+only after the Windows x64, macOS universal, and Linux x64 packaging jobs all
+succeed and the aggregate job verifies the complete set and its checksums.
+Snapshot installers are debug builds with a separate package identifier.
+Windows and Linux are unsigned; macOS uses only an untrusted ad-hoc signature
+and is not notarized. All are updater-disabled and omit the audited release
+sidecars. They may share AudiobookAI application data, so use them only with
+disposable test data and backups.
+
 The service defaults to loopback. LAN binding is deliberately unavailable until
 owner authentication and either a TLS identity or the separately confirmed
 insecure-LAN override are configured. Provider setup is optional during first
@@ -74,6 +105,16 @@ diagnostic exports, build artifacts, or Git history.
 The signed desktop installers are the only supported public application
 distributions; SBOMs, notices, checksums, and corresponding source accompany
 them as release materials.
+
+A qualifying annotated stable tag automatically starts the full signed release
+pipeline. The tag, Cargo workspace, Tauri app, and dashboard versions must agree;
+all protected-environment approvals and every native/signing gate must pass.
+Only then is the byte-verified draft made public, without a second manual
+dispatch. The `stable-release` and `stable-publish` environments remain approval
+boundaries when required reviewers are configured.
+
+See [the packaging inputs](packaging/README.md) for the distinction between the
+non-release-signed local native command and signed release packaging.
 
 See [the architecture](docs/architecture.md), [security model](docs/security.md),
 and [provider contract](docs/providers.md) for implementation details.

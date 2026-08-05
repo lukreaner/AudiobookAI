@@ -1,0 +1,343 @@
+name: Untrusted development snapshot
+
+on:
+  workflow_run:
+    workflows: ["Native CI"]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: >-
+    rolling-development-snapshot-${{ github.event.workflow_run.event }}-${{ github.event.workflow_run.head_branch }}-${{ github.event.workflow_run.conclusion }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  AUDIOBOOKAI_LIVE_PROVIDER_TESTS: "0"
+
+jobs:
+  quality:
+    name: Accept successful immutable Native CI source
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.metadata.outputs.version }}
+      commit_sha: ${{ steps.metadata.outputs.commit_sha }}
+    steps:
+      - name: Check out the immutable main commit without persisted credentials
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Install build-time Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.13"
+
+      - name: Derive immutable snapshot metadata
+        id: metadata
+        shell: bash
+        run: |
+          commit_sha="$(git rev-parse HEAD)"
+          test "${commit_sha}" = "${{ github.event.workflow_run.head_sha }}"
+          version="$(python -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          echo "version=${version}" >>"${GITHUB_OUTPUT}"
+          echo "commit_sha=${commit_sha}" >>"${GITHUB_OUTPUT}"
+
+      - name: Revalidate publication policy, versions, and repository history
+        run: |
+          python scripts/security/check_no_secrets.py --current --history
+          python scripts/release/validate_workflow.py
+          python scripts/release/check_versions.py
+          python scripts/release/sidecars.py manifest --allow-unresolved
+
+  native-package:
+    name: Build untrusted development package for ${{ matrix.name }}
+    needs: quality
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            os: windows-2022
+            target: x86_64-pc-windows-msvc
+            rust_targets: x86_64-pc-windows-msvc
+            tauri_target: x86_64-pc-windows-msvc
+            bundles: nsis
+          - name: macOS universal
+            os: macos-15
+            target: universal-apple-darwin
+            rust_targets: aarch64-apple-darwin x86_64-apple-darwin
+            tauri_target: universal-apple-darwin
+            bundles: dmg
+          - name: Linux x64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            rust_targets: x86_64-unknown-linux-gnu
+            tauri_target: x86_64-unknown-linux-gnu
+            bundles: appimage,deb
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_DEV_OPT_LEVEL: "1"
+      CARGO_PROFILE_DEV_STRIP: symbols
+    steps:
+      - name: Check out validated snapshot commit without persisted credentials
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.quality.outputs.commit_sha }}
+
+      - name: Install pinned pnpm
+        uses: pnpm/action-setup@9fd676a19091d4595eefd76e4bd31c97133911f1 # v4.2.0
+        with:
+          version: 11.18.0
+          run_install: false
+
+      - name: Install pinned Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 26.0.0
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install build-time Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.13"
+
+      - name: Install Linux packaging dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential \
+            desktop-file-utils \
+            file \
+            libayatana-appindicator3-dev \
+            libfuse2 \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            patchelf
+
+      - name: Resolve pinned Rust targets
+        run: rustup target add ${{ matrix.rust_targets }}
+
+      - name: Install locked frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate isolated untrusted development overlay
+        run: >-
+          python scripts/release/prepare_snapshot_config.py
+          --target "${{ matrix.target }}"
+          --output apps/desktop/src-tauri/tauri.snapshot.generated.json
+
+      - name: Build debug installer without stable signers or sidecars
+        run: >-
+          pnpm --dir web tauri build
+          --debug
+          --target "${{ matrix.tauri_target }}"
+          --bundles "${{ matrix.bundles }}"
+          --config tauri.snapshot.generated.json
+          --ci
+
+      - name: Collect and label expected development installer artifacts
+        run: >-
+          python scripts/release/collect_snapshot_artifacts.py
+          "${{ matrix.target }}"
+          "target/${{ matrix.tauri_target }}/debug/bundle"
+          "snapshot/native/${{ matrix.target }}"
+
+      - name: Secret-scan development package transfer
+        run: >-
+          python scripts/security/check_no_secrets.py
+          --path "snapshot/native/${{ matrix.target }}"
+
+      - name: Upload development package for aggregate verification
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: snapshot-native-${{ matrix.target }}
+          path: snapshot/native/${{ matrix.target }}/*
+          if-no-files-found: error
+          retention-days: 2
+
+  aggregate:
+    name: Verify complete untrusted development matrix
+    needs: [quality, native-package]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out validated snapshot commit without persisted credentials
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.quality.outputs.commit_sha }}
+
+      - name: Install build-time Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.13"
+
+      - name: Download every native snapshot candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: snapshot-native-*
+          path: snapshot/dist
+          merge-multiple: true
+
+      - name: Add development warning and distributable license
+        run: |
+          cp LICENSE snapshot/dist/LICENSE
+          python scripts/release/write_snapshot_metadata.py \
+            --version "${{ needs.quality.outputs.version }}" \
+            --commit "${{ needs.quality.outputs.commit_sha }}" \
+            --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --output snapshot/dist/DEVELOPMENT-BUILD.txt
+
+      - name: Enforce complete installer matrix before checksums
+        run: >-
+          python scripts/release/verify_snapshot_artifacts.py snapshot/dist
+          --version "${{ needs.quality.outputs.version }}"
+          --commit "${{ needs.quality.outputs.commit_sha }}"
+
+      - name: Generate checksums only after every native target succeeds
+        run: python scripts/release/generate_checksums.py snapshot/dist
+
+      - name: Reverify exact snapshot matrix and checksums
+        run: >-
+          python scripts/release/verify_snapshot_artifacts.py snapshot/dist
+          --version "${{ needs.quality.outputs.version }}"
+          --commit "${{ needs.quality.outputs.commit_sha }}"
+          --with-checksums
+
+      - name: Secret-scan complete development candidate upload
+        run: python scripts/security/check_no_secrets.py --path snapshot/dist
+
+      - name: Upload complete development release candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: development-snapshot-${{ needs.quality.outputs.commit_sha }}
+          path: snapshot/dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish verified rolling development prerelease
+    needs: [quality, aggregate]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      SNAPSHOT_TAG: development-snapshot-${{ github.run_number }}
+      SNAPSHOT_COMMIT: ${{ needs.quality.outputs.commit_sha }}
+    steps:
+      - name: Check out immutable snapshot scanner without persisted credentials
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.quality.outputs.commit_sha }}
+
+      - name: Install build-time Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.13"
+
+      - name: Download complete development candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: development-snapshot-${{ needs.quality.outputs.commit_sha }}
+          path: snapshot/dist
+
+      - name: Reverify development candidate before staging
+        run: >-
+          python scripts/release/verify_snapshot_artifacts.py snapshot/dist
+          --version "${{ needs.quality.outputs.version }}"
+          --commit "${{ needs.quality.outputs.commit_sha }}"
+          --with-checksums
+
+      - name: Clear only a stale draft from this workflow run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          if gh release view "${SNAPSHOT_TAG}" >/dev/null 2>&1; then
+            if test "$(gh release view "${SNAPSHOT_TAG}" --json isDraft --jq .isDraft)" != true; then
+              echo "snapshot ${SNAPSHOT_TAG} is already published and will not be overwritten" >&2
+              exit 2
+            fi
+            gh release delete "${SNAPSHOT_TAG}" --cleanup-tag --yes
+          fi
+
+      - name: Secret-scan development draft creation
+        run: python scripts/security/check_no_secrets.py --path snapshot/dist
+
+      - name: Create unpublished development prerelease draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "${SNAPSHOT_TAG}"
+          --target "${SNAPSHOT_COMMIT}"
+          --draft
+          --prerelease
+          --title "AudiobookAI Development Snapshot #${{ github.run_number }}"
+          --notes-file snapshot/dist/DEVELOPMENT-BUILD.txt
+
+      - name: Secret-scan development draft asset upload
+        run: python scripts/security/check_no_secrets.py --path snapshot/dist
+
+      - name: Upload complete candidate to development draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${SNAPSHOT_TAG}" snapshot/dist/*
+
+      - name: Download development draft assets for byte verification
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "${SNAPSHOT_TAG}" --dir snapshot/uploaded
+
+      - name: Verify every uploaded development asset byte-for-byte
+        run: |
+          python scripts/release/verify_release_upload.py snapshot/dist snapshot/uploaded
+          python scripts/release/verify_snapshot_artifacts.py snapshot/uploaded \
+            --version "${{ needs.quality.outputs.version }}" \
+            --commit "${{ needs.quality.outputs.commit_sha }}" \
+            --with-checksums
+
+      - name: Secret-scan verified development draft before publication
+        run: python scripts/security/check_no_secrets.py --path snapshot/uploaded
+
+      - name: Publish verified development prerelease draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "${SNAPSHOT_TAG}" --draft=false --prerelease
+
+      - name: Prune superseded workflow-owned snapshots after successful publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          mapfile -t stale_tags < <(
+            gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+              --jq '.[] | select(.tag_name | startswith("development-snapshot-")) | .tag_name'
+          )
+          for tag in "${stale_tags[@]}"; do
+            if test "${tag}" != "${SNAPSHOT_TAG}"; then
+              gh release delete "${tag}" --cleanup-tag --yes || \
+                echo "::warning::Could not prune superseded snapshot ${tag}"
+            fi
+          done
