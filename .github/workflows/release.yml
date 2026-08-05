@@ -1,0 +1,607 @@
+name: Native desktop release
+
+on:
+  push:
+    tags: ["v[1-9]*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing signed stable tag, for example v1.0.0
+        required: true
+        type: string
+      publish:
+        description: Publish the already validated candidate to GitHub Releases
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stable-release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  AUDIOBOOKAI_LIVE_PROVIDER_TESTS: "0"
+
+jobs:
+  quality:
+    name: Credential-free locked quality gates
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    outputs:
+      version: ${{ steps.metadata.outputs.version }}
+      source_date_epoch: ${{ steps.metadata.outputs.source_date_epoch }}
+    steps:
+      - name: Check out the requested tag without persisted credentials
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Install pinned pnpm
+        uses: pnpm/action-setup@9fd676a19091d4595eefd76e4bd31c97133911f1 # v4.2.0
+        with:
+          version: 11.18.0
+          run_install: false
+
+      - name: Install pinned Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 26.0.0
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install build-time Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.13"
+
+      - name: Install Linux desktop build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            patchelf
+
+      - name: Resolve pinned Rust toolchain
+        run: rustup show
+
+      - name: Derive immutable release metadata
+        id: metadata
+        shell: bash
+        run: |
+          version="${RELEASE_TAG#v}"
+          source_date_epoch="$(git show -s --format=%ct HEAD)"
+          echo "version=${version}" >>"${GITHUB_OUTPUT}"
+          echo "source_date_epoch=${source_date_epoch}" >>"${GITHUB_OUTPUT}"
+
+      - name: Require an annotated tag that resolves to the checked-out commit
+        shell: bash
+        run: |
+          test "$(git cat-file -t "${RELEASE_TAG}")" = tag
+          test "$(git rev-parse "${RELEASE_TAG}^{commit}")" = "$(git rev-parse HEAD)"
+
+      - name: Validate scripts, versions, workflow policy, and repository history
+        run: |
+          python -m unittest discover -s scripts/release/tests
+          python -m unittest scripts/security/test_check_no_secrets.py
+          python scripts/security/check_no_secrets.py --current --history
+          python scripts/release/validate_workflow.py
+          python scripts/release/check_versions.py --tag "${RELEASE_TAG}"
+          python scripts/release/sidecars.py manifest --allow-unresolved
+
+      - name: Install locked frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Type-check and build dashboard
+        run: |
+          pnpm --dir web typecheck
+          pnpm --dir web test
+          pnpm --dir web build
+
+      - name: Test and lint locked Rust workspace
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets --all-features --locked
+          cargo test --workspace --all-targets --all-features --locked
+
+  release-authorized:
+    name: Verify stable tag on owner-controlled release host
+    needs: quality
+    runs-on: [self-hosted, audiobookai-release, linux, x64]
+    timeout-minutes: 10
+    environment: stable-release
+    steps:
+      - name: Check out the requested tag without persisted credentials
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Reject credentials in source and history
+        run: python3 scripts/security/check_no_secrets.py --current --history
+
+      - name: Require the locally trusted release-tag signer
+        run: >-
+          python3 scripts/release/verify_release_tag.py
+          --tag "${RELEASE_TAG}"
+          --expected-fingerprint "${RELEASE_TAG_SIGNING_FINGERPRINT}"
+
+  verified-sidecars:
+    name: Verify public sidecars ${{ matrix.target }}
+    needs: [quality, release-authorized]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-pc-windows-msvc
+          - universal-apple-darwin
+          - x86_64-unknown-linux-gnu
+    steps:
+      - name: Check out verified release tag without persisted credentials
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Install build-time Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.13"
+
+      - name: Install OpenPGP verifier
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends gnupg
+
+      - name: Enforce stable version and finalized sidecar manifest
+        run: python scripts/release/check_versions.py --tag "${RELEASE_TAG}" --release
+
+      - name: Require public sidecar verification key
+        run: >-
+          python scripts/release/require_release_inputs.py
+          --file packaging/sidecar-release-key.asc
+
+      - name: Fetch public and cryptographically verify sidecar archive
+        run: >-
+          python scripts/release/sidecars.py fetch
+          "${{ matrix.target }}"
+          "packaging/runtime/${{ matrix.target }}"
+
+      - name: Secret-scan verified sidecar upload
+        run: >-
+          python scripts/security/check_no_secrets.py
+          --path "packaging/runtime/${{ matrix.target }}"
+
+      - name: Upload verified sidecar tree
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: verified-sidecars-${{ matrix.target }}
+          path: packaging/runtime/${{ matrix.target }}/*
+          if-no-files-found: error
+          retention-days: 1
+
+  native-package:
+    name: Package ${{ matrix.name }} on owner-controlled host
+    needs: [quality, release-authorized, verified-sidecars]
+    environment: stable-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            runner_os: windows
+            runner_arch: x64
+            target: x86_64-pc-windows-msvc
+            rust_targets: x86_64-pc-windows-msvc
+            tauri_target: x86_64-pc-windows-msvc
+            bundles: nsis
+            evidence_args: ""
+          - name: macOS universal
+            runner_os: macos
+            runner_arch: arm64
+            target: universal-apple-darwin
+            rust_targets: aarch64-apple-darwin x86_64-apple-darwin
+            tauri_target: universal-apple-darwin
+            bundles: dmg
+            evidence_args: --macos-uv
+          - name: Linux x64
+            runner_os: linux
+            runner_arch: x64
+            target: x86_64-unknown-linux-gnu
+            rust_targets: x86_64-unknown-linux-gnu
+            tauri_target: x86_64-unknown-linux-gnu
+            bundles: appimage,deb
+            evidence_args: --linux-espeak
+    runs-on: [self-hosted, audiobookai-release, "${{ matrix.runner_os }}", "${{ matrix.runner_arch }}"]
+    timeout-minutes: 120
+    env:
+      AUDIOBOOKAI_UPDATER_ENDPOINT: https://github.com/${{ github.repository }}/releases/latest/download/latest.json
+    steps:
+      - name: Check out verified release tag without persisted credentials
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Install pinned pnpm
+        uses: pnpm/action-setup@9fd676a19091d4595eefd76e4bd31c97133911f1 # v4.2.0
+        with:
+          version: 11.18.0
+          run_install: false
+
+      - name: Install pinned Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 26.0.0
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install build-time Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.13"
+
+      - name: Install Linux packaging dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential \
+            desktop-file-utils \
+            file \
+            libayatana-appindicator3-dev \
+            libfuse2 \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            patchelf
+
+      - name: Resolve pinned Rust targets
+        run: rustup target add ${{ matrix.rust_targets }}
+
+      - name: Reject credentials in source and history before local credentials are used
+        run: python scripts/security/check_no_secrets.py --current --history
+
+      - name: Enforce stable version and finalized sidecars
+        run: python scripts/release/check_versions.py --tag "${RELEASE_TAG}" --release
+
+      - name: Download cryptographically verified sidecars
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: verified-sidecars-${{ matrix.target }}
+          path: packaging/runtime/${{ matrix.target }}
+
+      - name: Reverify critical sidecar hashes on native host
+        run: >-
+          python scripts/release/sidecars.py verify
+          "${{ matrix.target }}"
+          "packaging/runtime/${{ matrix.target }}"
+
+      - name: Require locally provisioned updater signer
+        run: |
+          python scripts/release/verify_local_updater_signer.py
+          python scripts/release/require_release_inputs.py \
+            --env TAURI_SIGNING_PUBLIC_KEY \
+            --env AUDIOBOOKAI_UPDATER_ENDPOINT \
+            --file packaging/sidecar-release-key.asc
+
+      - name: Verify locally installed Windows signing identity
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/signing/verify_windows_identity.ps1
+
+      - name: Verify local Apple signing identity and notary profile
+        if: runner.os == 'macOS'
+        shell: bash
+        run: ./scripts/signing/verify_apple_identity.sh
+
+      - name: Verify Windows sidecar Authenticode signatures
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $expected = $env:WINDOWS_CERTIFICATE_THUMBPRINT.Replace(" ", "").ToUpperInvariant()
+          Get-ChildItem "packaging/runtime/${{ matrix.target }}/bin" -Filter "*.exe" | ForEach-Object {
+            $signature = Get-AuthenticodeSignature $_.FullName
+            if ($signature.Status -ne "Valid") { throw "Invalid sidecar signature: $($_.Name)" }
+            if ($signature.SignerCertificate.Thumbprint.ToUpperInvariant() -ne $expected) {
+              throw "Sidecar signer does not match the locally selected release certificate: $($_.Name)"
+            }
+          }
+
+      - name: Verify universal Apple sidecar signatures
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          for executable in \
+            "packaging/runtime/${{ matrix.target }}/bin/ffmpeg" \
+            "packaging/runtime/${{ matrix.target }}/bin/ffprobe"; do
+            lipo -verify_arch arm64 x86_64 "${executable}"
+            codesign --verify --strict --verbose=2 "${executable}"
+            codesign -dv --verbose=4 "${executable}" 2>&1 | grep -Fq "Authority=${APPLE_SIGNING_IDENTITY}"
+          done
+
+      - name: Capture sidecar capability and provenance evidence
+        run: >-
+          python scripts/release/capture_sidecar_evidence.py
+          "packaging/runtime/${{ matrix.target }}"
+          "release/evidence/${{ matrix.target }}-sidecars.txt"
+          --provenance-output "release/evidence/${{ matrix.target }}-provenance.json"
+          ${{ matrix.evidence_args }}
+
+      - name: Install locked frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build embedded dashboard
+        run: pnpm --dir web build
+
+      - name: Generate credential-free Tauri release overlay
+        run: >-
+          python scripts/release/prepare_tauri_config.py
+          --target "${{ matrix.target }}"
+          --sidecars "packaging/runtime/${{ matrix.target }}"
+          --output apps/desktop/src-tauri/tauri.release.generated.json
+
+      - name: Build, sign, and bundle desktop application locally
+        run: >-
+          pnpm --dir web tauri build
+          --target "${{ matrix.tauri_target }}"
+          --bundles "${{ matrix.bundles }}"
+          --config tauri.release.generated.json
+          --ci
+
+      - name: Collect expected native artifacts
+        run: >-
+          python scripts/release/collect_native_artifacts.py
+          "${{ matrix.target }}"
+          "target/${{ matrix.tauri_target }}/release/bundle"
+          "release/native/${{ matrix.target }}"
+
+      - name: Notarize and staple Apple disk image with local keychain profile
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          dmg="$(find "release/native/${{ matrix.target }}" -name '*.dmg' -type f -print -quit)"
+          test -n "${dmg}"
+          xcrun notarytool submit "${dmg}" \
+            --keychain-profile "${APPLE_NOTARY_PROFILE}" \
+            --wait \
+            --output-format json >/dev/null
+          xcrun stapler staple "${dmg}" >/dev/null
+
+      - name: Verify Windows installer signature
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $expected = $env:WINDOWS_CERTIFICATE_THUMBPRINT.Replace(" ", "").ToUpperInvariant()
+          Get-ChildItem "release/native/${{ matrix.target }}" -Filter "*.exe" | ForEach-Object {
+            $signature = Get-AuthenticodeSignature $_.FullName
+            if ($signature.Status -ne "Valid") { throw "Invalid installer signature: $($_.Name)" }
+            if ($signature.SignerCertificate.Thumbprint.ToUpperInvariant() -ne $expected) {
+              throw "Installer signer does not match the locally selected release certificate: $($_.Name)"
+            }
+          }
+
+      - name: Verify Apple notarization and stapling
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          dmg="$(find "release/native/${{ matrix.target }}" -name '*.dmg' -type f -print -quit)"
+          test -n "${dmg}"
+          spctl --assess --verbose=2 --type install "${dmg}"
+          xcrun stapler validate "${dmg}"
+
+      - name: Secret-scan native package upload
+        run: >-
+          python scripts/security/check_no_secrets.py
+          --path "release/native/${{ matrix.target }}"
+
+      - name: Upload native package candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-native-${{ matrix.target }}
+          path: release/native/${{ matrix.target }}/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Secret-scan sidecar evidence upload
+        run: python scripts/security/check_no_secrets.py --path release/evidence
+
+      - name: Upload sidecar evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-evidence-${{ matrix.target }}
+          path: release/evidence/*
+          if-no-files-found: error
+          retention-days: 14
+
+  aggregate:
+    name: Sign and attest candidate on owner-controlled host
+    needs: [quality, release-authorized, native-package]
+    runs-on: [self-hosted, audiobookai-release, linux, x64]
+    timeout-minutes: 45
+    environment: stable-release
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      SOURCE_DATE_EPOCH: ${{ needs.quality.outputs.source_date_epoch }}
+    steps:
+      - name: Check out verified release tag without persisted credentials
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Install pinned pnpm
+        uses: pnpm/action-setup@9fd676a19091d4595eefd76e4bd31c97133911f1 # v4.2.0
+        with:
+          version: 11.18.0
+          run_install: false
+
+      - name: Install pinned Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 26.0.0
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install build-time Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.13"
+
+      - name: Require local checksum signing keyring
+        run: >-
+          python scripts/release/require_release_inputs.py
+          --env RELEASE_GPG_KEY_ID
+
+      - name: Install locked dependencies for license inventory
+        run: |
+          rustup show
+          pnpm install --frozen-lockfile
+
+      - name: Download native candidates and evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: release-*
+          path: release/dist
+          merge-multiple: true
+
+      - name: Reject credentials in downloaded candidates
+        run: python scripts/security/check_no_secrets.py --path release/dist
+
+      - name: Generate SBOM, notices, source, and updater metadata
+        run: |
+          python scripts/release/generate_sbom.py "release/dist/AudiobookAI-${{ needs.quality.outputs.version }}.cdx.json"
+          python scripts/release/generate_notices.py \
+            "release/dist/AudiobookAI-${{ needs.quality.outputs.version }}.cdx.json" \
+            release/dist/THIRD_PARTY_NOTICES.md
+          python scripts/release/build_source_bundle.py \
+            "release/dist/AudiobookAI-${{ needs.quality.outputs.version }}-corresponding-source.tar.gz"
+          cp packaging/sidecars.lock.json release/dist/sidecars.lock.json
+          cp LICENSE release/dist/LICENSE
+          python scripts/release/generate_updater_manifest.py release/dist \
+            --tag "${RELEASE_TAG}" \
+            --repository "${{ github.repository }}" \
+            --output release/dist/latest.json
+
+      - name: Enforce complete desktop-only artifact matrix
+        run: >-
+          python scripts/release/verify_artifacts.py release/dist
+          --version "${{ needs.quality.outputs.version }}"
+
+      - name: Generate and sign checksums with local keyring
+        run: |
+          python scripts/release/generate_checksums.py release/dist
+          ./scripts/signing/sign_checksums.sh release/dist/SHA256SUMS
+
+      - name: Verify signed checksums independently
+        shell: bash
+        run: |
+          verification_home="$(mktemp -d)"
+          export GNUPGHOME="${verification_home}"
+          gpg --batch --quiet --import release/dist/RELEASE_KEY.asc
+          gpg --batch --verify release/dist/SHA256SUMS.asc release/dist/SHA256SUMS
+          (cd release/dist && sha256sum --check SHA256SUMS)
+          rm -rf "${verification_home}"
+
+      - name: Secret-scan build-provenance attestation subjects
+        run: python scripts/security/check_no_secrets.py --path release/dist
+
+      - name: Attest candidate build provenance
+        uses: actions/attest-build-provenance@62fc1d596301d0ab9914e1fec14dc5c8d93f65cd # v3.2.0
+        with:
+          subject-path: release/dist/*
+
+      - name: Secret-scan signed candidate upload
+        run: python scripts/security/check_no_secrets.py --path release/dist
+
+      - name: Upload signed release candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-candidate-${{ env.RELEASE_TAG }}
+          path: release/dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Publish approved stable desktop release
+    if: github.event_name == 'workflow_dispatch' && inputs.publish == true
+    needs: [quality, aggregate]
+    runs-on: ubuntu-22.04
+    environment: stable-publish
+    permissions:
+      contents: write
+    steps:
+      - name: Check out scanner from the immutable release tag
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Install checksum verification tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends gnupg
+
+      - name: Download immutable signed candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-candidate-${{ env.RELEASE_TAG }}
+          path: release/dist
+
+      - name: Reject credentials in downloaded publication candidate
+        run: python3 scripts/security/check_no_secrets.py --path release/dist
+
+      - name: Reverify detached signature and checksums
+        shell: bash
+        run: |
+          verification_home="$(mktemp -d)"
+          export GNUPGHOME="${verification_home}"
+          gpg --batch --quiet --import release/dist/RELEASE_KEY.asc
+          gpg --batch --verify release/dist/SHA256SUMS.asc release/dist/SHA256SUMS
+          (cd release/dist && sha256sum --check SHA256SUMS)
+          rm -rf "${verification_home}"
+
+      - name: Refuse to overwrite an existing release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            echo "release ${RELEASE_TAG} already exists; immutable releases are never overwritten" >&2
+            exit 2
+          fi
+
+      - name: Secret-scan final GitHub Release upload
+        run: python3 scripts/security/check_no_secrets.py --path release/dist
+
+      - name: Publish signed stable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "${RELEASE_TAG}"
+          release/dist/*
+          --verify-tag
+          --title "AudiobookAI ${RELEASE_TAG}"
+          --generate-notes

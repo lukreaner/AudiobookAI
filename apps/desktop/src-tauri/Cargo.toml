@@ -1,0 +1,37 @@
+[package]
+name = "audiobookai-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Native desktop host for AudiobookAI"
+publish = false
+
+[lib]
+name = "audiobookai_desktop"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[[bin]]
+name = "AudiobookAI"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "=2.6.3", features = [] }
+
+[dependencies]
+audiobookai-service = { path = "../../../crates/service", features = ["embedded-dashboard"] }
+tauri = { version = "=2.11.5", features = ["tray-icon"] }
+tauri-plugin-dialog = "=2.7.2"
+tauri-plugin-opener = "=2.5.4"
+tauri-plugin-process = "=2.3.1"
+tauri-plugin-single-instance = "=2.4.3"
+tauri-plugin-updater = "=2.10.1"
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

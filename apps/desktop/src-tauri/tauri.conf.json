@@ -1,0 +1,63 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "AudiobookAI",
+  "version": "0.1.0",
+  "identifier": "ai.audiobook.desktop",
+  "build": {
+    "beforeDevCommand": "pnpm --dir ../../web dev",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": "pnpm --dir ../../web build",
+    "frontendDist": "../../../web/dist"
+  },
+  "app": {
+    "windows": [],
+    "security": {
+      "csp": "default-src 'self' customprotocol: asset:; connect-src 'self' http://127.0.0.1:* ws://127.0.0.1:*; img-src 'self' asset: http://asset.localhost data: blob:; media-src 'self' http://127.0.0.1:* blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+    },
+    "withGlobalTauri": false
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "category": "Music",
+    "shortDescription": "Turn EPUB books into expressive audiobooks",
+    "longDescription": "A private, desktop-first audiobook studio with configurable text-to-speech and character detection providers.",
+    "copyright": "Copyright AudiobookAI contributors",
+    "license": "GPL-3.0-only",
+    "fileAssociations": [
+      {
+        "ext": ["epub"],
+        "name": "EPUB eBook",
+        "description": "EPUB eBook",
+        "mimeType": "application/epub+zip",
+        "role": "Viewer"
+      }
+    ],
+    "createUpdaterArtifacts": false,
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "displayLanguageSelector": true
+      },
+      "webviewInstallMode": {
+        "type": "offlineInstaller",
+        "silent": true
+      }
+    },
+    "macOS": {
+      "minimumSystemVersion": "13.0"
+    },
+    "linux": {
+      "appimage": {
+        "bundleMediaFramework": true
+      }
+    }
+  }
+}

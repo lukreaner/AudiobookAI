@@ -1,0 +1,81 @@
+[workspace]
+members = [
+  "crates/core",
+  "crates/storage",
+  "crates/providers",
+  "crates/media",
+  "crates/epub",
+  "crates/service",
+  "apps/desktop/src-tauri",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "GPL-3.0-only"
+repository = "https://github.com/lukreaner/AudiobookAI"
+authors = ["AudiobookAI contributors"]
+
+[workspace.dependencies]
+aes-gcm = "0.10"
+ammonia = "4"
+anyhow = "1"
+argon2 = "0.5"
+async-stream = "0.3"
+async-trait = "0.1"
+axum = { version = "0.8", features = ["http2", "json", "macros", "multipart", "tokio", "ws"] }
+axum-server = { version = "0.8", default-features = false, features = ["tls-rustls-no-provider"] }
+base64 = "0.22"
+blake3 = "1"
+bytes = "1"
+chrono = { version = "0.4", features = ["serde"] }
+directories = "6"
+fs2 = "0.4"
+futures = "0.3"
+http = "1"
+keyring = "4.1"
+mime_guess = "2"
+rand = "0.9"
+rcgen = "0.14"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }
+rbook = { version = "0.7.10", default-features = false, features = ["threadsafe"] }
+rust-embed = { version = "8", features = ["axum", "mime-guess"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+scraper = "0.27"
+secrecy = { version = "0.10", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sqlx = { version = "0.9", default-features = false, features = ["chrono", "json", "macros", "migrate", "runtime-tokio", "sqlite", "uuid"] }
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["catch-panic", "compression-gzip", "cors", "fs", "limit", "request-id", "sensitive-headers", "set-header", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+url = { version = "2", features = ["serde"] }
+uuid = { version = "1", features = ["serde", "v4", "v7"] }
+zeroize = { version = "1", features = ["derive", "serde"] }
+zip = { version = "4.6.1", default-features = false, features = ["deflate"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+opt-level = "s"
+panic = "abort"
+strip = "symbols"

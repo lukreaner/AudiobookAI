@@ -1,0 +1,199 @@
+{
+  "schemaVersion": 1,
+  "releaseReady": false,
+  "sidecarSigningKey": {
+    "path": "packaging/sidecar-release-key.asc",
+    "fingerprint": "REQUIRED_40_HEX_OPENPGP_FINGERPRINT"
+  },
+  "ffmpeg": {
+    "version": "8.1.1",
+    "license": "LGPL-2.1-or-later",
+    "source": {
+      "url": "https://ffmpeg.org/releases/ffmpeg-8.1.1.tar.xz",
+      "signatureUrl": "https://ffmpeg.org/releases/ffmpeg-8.1.1.tar.xz.asc",
+      "sha256": "b6863adde98898f42602017462871b5f6333e65aec803fdd7a6308639c52edf3"
+    },
+    "configureFlags": [
+      "--disable-autodetect",
+      "--disable-debug",
+      "--disable-doc",
+      "--disable-ffplay",
+      "--disable-gpl",
+      "--disable-network",
+      "--disable-nonfree",
+      "--disable-sdl2",
+      "--disable-shared",
+      "--enable-static",
+      "--enable-ffmpeg",
+      "--enable-ffprobe",
+      "--enable-libmp3lame"
+    ],
+    "requiredFeatures": {
+      "encoders": ["aac", "flac", "libmp3lame", "pcm_f32le", "pcm_s16le"],
+      "filters": [
+        "afade",
+        "aformat",
+        "alimiter",
+        "amix",
+        "aresample",
+        "atrim",
+        "loudnorm",
+        "sidechaincompress",
+        "volume"
+      ],
+      "muxers": ["flac", "ipod", "mp3", "mp4", "wav"]
+    }
+  },
+  "libmp3lame": {
+    "version": "3.100",
+    "license": "LGPL-2.0-or-later",
+    "source": {
+      "url": "https://downloads.sourceforge.net/project/lame/lame/3.100/lame-3.100.tar.gz",
+      "sha256": "ddfe36cab873794038ae2c1210557ad34857a4b6bdc515785d1da9e175b1da1e"
+    }
+  },
+  "espeakNg": {
+    "version": "1.52.0",
+    "license": "GPL-3.0-or-later",
+    "source": {
+      "gitUrl": "https://github.com/espeak-ng/espeak-ng.git",
+      "commit": "4870adfa25b1a32b4361592f1be8a40337c58d6c"
+    },
+    "platforms": ["x86_64-unknown-linux-gnu"]
+  },
+  "uv": {
+    "version": "0.12.1",
+    "license": "Apache-2.0 OR MIT",
+    "platforms": ["universal-apple-darwin"],
+    "source": {
+      "url": "https://github.com/astral-sh/uv/archive/refs/tags/0.12.1.tar.gz",
+      "sha256": "REQUIRED_64_HEX_SHA256"
+    }
+  },
+  "mlxAudioInstaller": {
+    "package": "mlx-audio[tts,server]",
+    "version": "0.4.6",
+    "target": "aarch64-apple-darwin",
+    "bundleLayout": {
+      "uvExecutable": "bin/uv",
+      "pythonExecutable": "share/mlx-audio-installer/python/bin/python3",
+      "installerLock": "share/mlx-audio-installer/installer.lock.json",
+      "requirementsLock": "share/mlx-audio-installer/requirements.lock",
+      "wheelhouse": "share/mlx-audio-installer/wheelhouse"
+    },
+    "managedPython": {
+      "implementation": "cpython",
+      "version": "REQUIRED_EXACT_PYTHON_VERSION",
+      "url": "REQUIRED_HTTPS_URL",
+      "sha256": "REQUIRED_64_HEX_SHA256"
+    },
+    "artifactLock": {
+      "format": "audiobookai-python-artifact-lock-v1",
+      "path": "packaging/mlx-audio-installer.lock.json",
+      "sha256": "REQUIRED_64_HEX_SHA256",
+      "artifactCount": "REQUIRED_POSITIVE_INTEGER",
+      "completeTransitiveClosure": false
+    }
+  },
+  "bundles": {
+    "x86_64-pc-windows-msvc": {
+      "archive": {
+        "format": "zip",
+        "url": "REQUIRED_HTTPS_URL",
+        "sha256": "REQUIRED_64_HEX_SHA256",
+        "signatureUrl": "REQUIRED_HTTPS_URL",
+        "signatureSha256": "REQUIRED_64_HEX_SHA256"
+      },
+      "architecture": "x86_64",
+      "minimumOs": "Windows 10",
+      "requiredFiles": [
+        {
+          "path": "bin/ffmpeg.exe",
+          "sha256": "REQUIRED_64_HEX_SHA256",
+          "executable": true
+        },
+        {
+          "path": "bin/ffprobe.exe",
+          "sha256": "REQUIRED_64_HEX_SHA256",
+          "executable": true
+        }
+      ]
+    },
+    "universal-apple-darwin": {
+      "archive": {
+        "format": "tar.gz",
+        "url": "REQUIRED_HTTPS_URL",
+        "sha256": "REQUIRED_64_HEX_SHA256",
+        "signatureUrl": "REQUIRED_HTTPS_URL",
+        "signatureSha256": "REQUIRED_64_HEX_SHA256"
+      },
+      "architecture": "universal2",
+      "minimumOs": "macOS 13.0",
+      "requiredFiles": [
+        {
+          "path": "bin/ffmpeg",
+          "sha256": "REQUIRED_64_HEX_SHA256",
+          "executable": true
+        },
+        {
+          "path": "bin/ffprobe",
+          "sha256": "REQUIRED_64_HEX_SHA256",
+          "executable": true
+        },
+        {
+          "path": "bin/uv",
+          "sha256": "REQUIRED_64_HEX_SHA256",
+          "executable": true
+        },
+        {
+          "path": "share/mlx-audio-installer/python/bin/python3",
+          "sha256": "REQUIRED_64_HEX_SHA256",
+          "executable": true
+        },
+        {
+          "path": "share/mlx-audio-installer/installer.lock.json",
+          "sha256": "REQUIRED_64_HEX_SHA256",
+          "executable": false
+        },
+        {
+          "path": "share/mlx-audio-installer/requirements.lock",
+          "sha256": "REQUIRED_64_HEX_SHA256",
+          "executable": false
+        }
+      ]
+    },
+    "x86_64-unknown-linux-gnu": {
+      "archive": {
+        "format": "tar.gz",
+        "url": "REQUIRED_HTTPS_URL",
+        "sha256": "REQUIRED_64_HEX_SHA256",
+        "signatureUrl": "REQUIRED_HTTPS_URL",
+        "signatureSha256": "REQUIRED_64_HEX_SHA256"
+      },
+      "architecture": "x86_64",
+      "minimumOs": "Ubuntu 22.04 / Debian-compatible",
+      "requiredFiles": [
+        {
+          "path": "bin/ffmpeg",
+          "sha256": "REQUIRED_64_HEX_SHA256",
+          "executable": true
+        },
+        {
+          "path": "bin/ffprobe",
+          "sha256": "REQUIRED_64_HEX_SHA256",
+          "executable": true
+        },
+        {
+          "path": "bin/espeak-ng",
+          "sha256": "REQUIRED_64_HEX_SHA256",
+          "executable": true
+        },
+        {
+          "path": "share/espeak-ng-data/voices/en",
+          "sha256": "REQUIRED_64_HEX_SHA256",
+          "executable": false
+        }
+      ]
+    }
+  }
+}

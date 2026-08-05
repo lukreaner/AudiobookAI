@@ -1,0 +1,63 @@
+[package]
+name = "audiobookai-service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+embedded-dashboard = ["dep:rust-embed", "dep:mime_guess"]
+
+[dependencies]
+aes-gcm.workspace = true
+anyhow.workspace = true
+argon2.workspace = true
+async-trait.workspace = true
+async-stream.workspace = true
+axum.workspace = true
+axum-server.workspace = true
+base64.workspace = true
+blake3.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+directories.workspace = true
+futures.workspace = true
+fs2.workspace = true
+http.workspace = true
+keyring.workspace = true
+mime_guess = { workspace = true, optional = true }
+rand.workspace = true
+regex.workspace = true
+rust-embed = { workspace = true, optional = true }
+rustls.workspace = true
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tempfile.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+
+audiobookai-core = { path = "../core" }
+audiobookai-epub = { path = "../epub" }
+audiobookai-media = { path = "../media" }
+audiobookai-providers = { path = "../providers" }
+audiobookai-storage = { path = "../storage" }
+
+[dev-dependencies]
+rcgen.workspace = true
+reqwest.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

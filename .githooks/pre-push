@@ -1,0 +1,22 @@
+#!/bin/sh
+set -eu
+
+# Last local boundary before repository bytes can leave this machine. Inspect both named local
+# history and the exact object IDs Git says it is about to send, covering direct detached-object
+# pushes too. Matched values are never printed by the scanner.
+set -- --current --history
+while read -r _local_ref local_object _remote_ref _remote_object; do
+    case "${local_object}" in
+        0000000000000000000000000000000000000000|0000000000000000000000000000000000000000000000000000000000000000)
+            ;;
+        *[!0-9A-Fa-f]*|"")
+            echo "pre-push secret scan refused a malformed Git object ID" >&2
+            exit 2
+            ;;
+        *)
+            set -- "$@" --revision "${local_object}"
+            ;;
+    esac
+done
+
+exec python3 scripts/security/check_no_secrets.py "$@"
