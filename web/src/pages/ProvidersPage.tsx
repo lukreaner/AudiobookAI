@@ -4,7 +4,7 @@ import { Activity, Cloud, Cpu, Download, HardDrive, KeyRound, Laptop, LoaderCirc
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../api/client";
-import type { MlxManagedModel, ProviderKind, ProviderModel, ProviderProfile } from "../api/types";
+import type { MlxManagedModel, MlxManagement, ProviderKind, ProviderModel, ProviderProfile } from "../api/types";
 import { EmptyState, ErrorState, LoadingState } from "../components/StateViews";
 import { Badge, Button, Card, Dialog, Field, Input, PageHeading, Select, Textarea } from "../components/ui";
 
@@ -72,6 +72,16 @@ function formatBytes(value?: number): string {
   if (value < 1024 * 1024 * 1024) return `${(value / (1024 * 1024)).toFixed(1)} MiB`;
   return `${(value / (1024 * 1024 * 1024)).toFixed(2)} GiB`;
 }
+
+const installerStatusKeys: Record<MlxManagement["installerStatus"], string> = {
+  ready: "providers.mlxInstallerReady",
+  unsupported_platform: "providers.mlxInstallerUnsupported",
+  not_bundled: "providers.mlxInstallerNotBundled",
+  payload_missing: "providers.mlxInstallerPayloadMissing",
+  unsafe_filesystem: "providers.mlxInstallerUnsafe",
+  invalid_metadata: "providers.mlxInstallerInvalid",
+  incomplete: "providers.mlxInstallerIncomplete",
+};
 
 export function ProvidersPage() {
   const { t } = useTranslation();
@@ -202,6 +212,18 @@ export function ProvidersPage() {
   }, [lastProviderModelOperation?.id, lastProviderModelOperation?.state]);
 
   const closeDialog = () => { setAddOpen(false); setEditing(undefined); setForm(emptyProviderForm()); };
+  const configureDeveloperMlx = () => {
+    setEditing(undefined);
+    setForm({
+      ...emptyProviderForm(),
+      name: "MLX-audio (developer install)",
+      kind: "mlx_audio",
+      mode: "managed_child",
+      endpoint: "http://127.0.0.1:8000/",
+      argumentsText: "--host\n127.0.0.1\n--port\n8000",
+    });
+    setAddOpen(true);
+  };
   const openEdit = (provider: ProviderProfile) => { setEditing(provider); setForm({ name: provider.name, kind: provider.kind, mode: provider.mode, endpoint: provider.endpoint ?? "", executablePath: provider.executablePath ?? "", workingDirectory: provider.workingDirectory ?? "", argumentsText: provider.arguments.join("\n"), credential: "", model: provider.model ?? "" }); };
   const requestDelete = (provider: ProviderProfile) => {
     closeDialog();
@@ -238,6 +260,8 @@ export function ProvidersPage() {
   const managedMlxProfiles = providers.data?.items.filter((provider) => provider.kind === "mlx_audio" && provider.mode === "managed_child") ?? [];
   const managedMlxProfile = managedMlxProfiles.length === 1 ? managedMlxProfiles[0] : undefined;
   const activeProviderModelOperation = providerModels.data?.operations.find((operation) => ["running", "cancelling"].includes(operation.state));
+  const mlxInstallerUnavailable = Boolean(mlx.data && !mlx.data.installed && mlx.data.installerStatus !== "ready");
+  const mlxDeveloperFallback = mlx.data?.supported && ["not_bundled", "payload_missing"].includes(mlx.data.installerStatus);
 
   if (providers.isLoading) return <LoadingState label={t("state.loadingProviders")} />;
   if (providers.isError) return <ErrorState error={providers.error} onRetry={() => void providers.refetch()} />;
@@ -249,9 +273,13 @@ export function ProvidersPage() {
         <div className="mlx-management-head">
           <span className="provider-logo"><PackageOpen size={21} /></span>
           <div><h2>{t("providers.mlxManagerTitle")}</h2><p>{t("providers.mlxManagerDetail")}</p></div>
-          <Badge tone={mlx.data.installed ? "positive" : mlx.data.supported ? "neutral" : "warning"}>{mlx.data.installed ? t("providers.mlxInstalled", { version: mlx.data.installedVersion }) : t(mlx.data.supported ? "providers.mlxNotInstalled" : "providers.mlxUnsupported")}</Badge>
+          <Badge tone={mlx.data.installed ? "positive" : mlxInstallerUnavailable ? "warning" : "neutral"}>{mlx.data.installed ? t("providers.mlxInstalled", { version: mlx.data.installedVersion }) : t(mlxInstallerUnavailable ? "providers.mlxInstallerUnavailableBadge" : "providers.mlxNotInstalled")}</Badge>
         </div>
-        <p className="mlx-support-detail">{mlx.data.supportDetail} {t("providers.mlxUvRequirement", { version: mlx.data.requiredUvVersion })}</p>
+        <p id="mlx-installer-status" className={mlxInstallerUnavailable ? "provider-form-warning" : "mlx-support-detail"}>{t(installerStatusKeys[mlx.data.installerStatus])} {t("providers.mlxUvRequirement", { version: mlx.data.requiredUvVersion })}</p>
+        {mlxDeveloperFallback ? <details className="mlx-developer-setup">
+          <summary>{t("providers.mlxDeveloperSetup")}</summary>
+          <p>{t("providers.mlxDeveloperSetupDetail")}</p>
+        </details> : null}
         {mlx.data.activeOperation ? <div className="mlx-operation" aria-live="polite">
           <div className="space-between"><strong>{mlx.data.activeOperation.message}</strong><span>{mlx.data.activeOperation.progressPercent}%</span></div>
           <progress max={100} value={mlx.data.activeOperation.progressPercent} />
@@ -265,7 +293,8 @@ export function ProvidersPage() {
         </details> : null}
         {mlx.data.profileActionRequired ? <p className="provider-form-warning">{t("providers.mlxProfileActionRequired")}</p> : null}
         <div className="mlx-management-actions">
-          {!mlx.data.installed ? <Button disabled={!mlx.data.supported || !mlx.data.installerPayloadAvailable || Boolean(mlx.data.activeOperation) || installMlx.isPending} onClick={() => installMlx.mutate()}>{installMlx.isPending ? <LoaderCircle className="spin" size={16} /> : <Download size={16} />}{t("providers.mlxInstall")}</Button> : null}
+          {!mlx.data.installed ? <Button aria-describedby="mlx-installer-status" disabled={!mlx.data.supported || !mlx.data.installerPayloadAvailable || Boolean(mlx.data.activeOperation) || installMlx.isPending} onClick={() => installMlx.mutate()}>{installMlx.isPending ? <LoaderCircle className="spin" size={16} /> : <Download size={16} />}{t("providers.mlxInstall")}</Button> : null}
+          {mlxDeveloperFallback ? <Button variant="secondary" onClick={configureDeveloperMlx}>{t("providers.mlxConfigureExisting")}</Button> : null}
           {mlx.data.installed ? <Button variant="danger" disabled={Boolean(mlx.data.activeOperation) || managedMlxProfiles.length > 0 || uninstallMlx.isPending} onClick={() => setConfirmingUninstall(true)}><Trash2 size={16} />{t("providers.mlxUninstall")}</Button> : null}
           <Button variant="ghost" size="sm" onClick={() => void mlx.refetch()}><RefreshCw size={14} />{t("common.refresh")}</Button>
         </div>

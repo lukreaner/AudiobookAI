@@ -1,4 +1,11 @@
-use std::{collections::BTreeMap, fmt, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use audiobookai_providers::{
     CancellationFlag, CharacterProvider, ModelDownloadProgressSink, ModelDownloadRequest,
@@ -31,6 +38,8 @@ pub enum RuntimeError {
     NotNativeTts(ProviderId),
     #[error("provider runtime profile {0} has no TTS adapter")]
     TtsUnavailable(ProviderId),
+    #[error("the provider runtime is shutting down and cannot start another process")]
+    ShuttingDown,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -83,6 +92,7 @@ impl fmt::Debug for RuntimeEntry {
 pub struct ProviderRuntime {
     factory: ProviderAdapterFactory,
     entries: Arc<RwLock<BTreeMap<ProviderId, Arc<RuntimeEntry>>>>,
+    accepting_process_starts: Arc<AtomicBool>,
 }
 
 impl ProviderRuntime {
@@ -90,6 +100,7 @@ impl ProviderRuntime {
         Self {
             factory,
             entries: Arc::new(RwLock::new(BTreeMap::new())),
+            accepting_process_starts: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -168,6 +179,7 @@ impl ProviderRuntime {
     }
 
     pub async fn start(&self, id: &ProviderId) -> Result<OwnedProcessHandle, RuntimeError> {
+        self.ensure_accepting_process_starts()?;
         let entry = self.entry(id).await?;
         let control = process_control(&entry, id)?;
         let spec = entry
@@ -175,6 +187,7 @@ impl ProviderRuntime {
             .clone()
             .ok_or_else(|| RuntimeError::ProcessControlUnavailable(id.clone()))?;
         let mut owned = entry.owned_handle.lock().await;
+        self.ensure_accepting_process_starts()?;
         if let Some(handle) = owned.as_ref() {
             let status = control.status(handle).await?;
             if matches!(status.state, ProcessState::Running | ProcessState::Starting) {
@@ -216,9 +229,11 @@ impl ProviderRuntime {
     }
 
     pub async fn restart(&self, id: &ProviderId) -> Result<OwnedProcessHandle, RuntimeError> {
+        self.ensure_accepting_process_starts()?;
         let entry = self.entry(id).await?;
         let control = process_control(&entry, id)?;
         let mut owned = entry.owned_handle.lock().await;
+        self.ensure_accepting_process_starts()?;
         if let Some(handle) = owned.as_ref() {
             let restarted = control.restart(handle).await?;
             *owned = Some(restarted.clone());
@@ -333,6 +348,8 @@ impl ProviderRuntime {
 
     /// Stops every child for which this runtime still holds the ownership handle.
     pub async fn shutdown_owned(&self) -> ShutdownReport {
+        self.accepting_process_starts
+            .store(false, Ordering::Release);
         let entries = self
             .entries
             .read()
@@ -363,6 +380,14 @@ impl ProviderRuntime {
             }
         }
         report
+    }
+
+    fn ensure_accepting_process_starts(&self) -> Result<(), RuntimeError> {
+        if self.accepting_process_starts.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(RuntimeError::ShuttingDown)
+        }
     }
 
     async fn entry(&self, id: &ProviderId) -> Result<Arc<RuntimeEntry>, RuntimeError> {
@@ -465,6 +490,30 @@ mod tests {
         assert!(matches!(
             runtime.register(profile, Some(&credential)).await,
             Err(RuntimeError::ProfileExists(existing)) if existing == id
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_permanently_closes_the_managed_process_start_gate() {
+        let runtime = ProviderRuntime::new(ProviderAdapterFactory::default());
+        let id = ProviderId::new("managed-shutdown-test").unwrap();
+        let mut profile = RuntimeProfile::new(
+            id.clone(),
+            "Managed shutdown test",
+            RuntimeAdapterKind::LocalAi,
+            ProviderKind::ManagedChild,
+        );
+        profile.endpoint = Some(Url::parse("http://127.0.0.1:19092/").unwrap());
+        profile.executable = Some(PathBuf::from("/bin/sh"));
+        profile.arguments = vec!["-c".to_owned(), "sleep 30".to_owned()];
+        runtime.register(profile, None).await.unwrap();
+
+        let report = runtime.shutdown_owned().await;
+        assert_eq!(report.already_stopped, 1);
+        assert!(matches!(
+            runtime.start(&id).await,
+            Err(RuntimeError::ShuttingDown)
         ));
     }
 }

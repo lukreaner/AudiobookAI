@@ -91,6 +91,9 @@ pub struct AppState {
     pub mlx: crate::mlx_management::MlxManager,
     /// Serializes model deletion with every operation that can create a new model reference.
     pub model_lifecycle: Arc<Mutex<()>>,
+    /// Read guards admit work that must be visible to the shutdown checkpoint. Shutdown takes the
+    /// write guard once, then permanently closes admission before it snapshots durable jobs.
+    shutdown_admission: Arc<RwLock<bool>>,
 }
 
 impl AppState {
@@ -151,6 +154,7 @@ impl AppState {
             provider_models,
             mlx,
             model_lifecycle: Arc::new(Mutex::new(())),
+            shutdown_admission: Arc::new(RwLock::new(false)),
             config,
             events,
             runtime: Arc::new(RwLock::new(runtime)),
@@ -179,6 +183,23 @@ impl AppState {
         }
         state.bootstrap_provider_runtime().await;
         Ok(state)
+    }
+
+    pub(crate) async fn admit_shutdown_sensitive_work(
+        &self,
+    ) -> Result<tokio::sync::RwLockReadGuard<'_, bool>, crate::ServiceError> {
+        let admission = self.shutdown_admission.read().await;
+        if *admission {
+            Err(crate::ServiceError::Conflict(
+                "new work is unavailable while AudiobookAI is shutting down".to_owned(),
+            ))
+        } else {
+            Ok(admission)
+        }
+    }
+
+    pub(crate) async fn close_shutdown_admission(&self) {
+        *self.shutdown_admission.write().await = true;
     }
 
     async fn bootstrap_provider_runtime(&self) {
@@ -292,7 +313,69 @@ fn runtime_profile_from_view(
         .working_directory
         .as_ref()
         .map(std::path::PathBuf::from);
+    if matches!(mode, ProviderKind::ManagedChild) {
+        configure_isolated_managed_environment(&mut runtime, profile.id, config)?;
+    }
     Ok(runtime)
+}
+
+fn configure_isolated_managed_environment(
+    runtime: &mut crate::runtime::RuntimeProfile,
+    profile_id: Uuid,
+    config: &ServiceConfig,
+) -> Result<(), crate::ServiceError> {
+    let root = config
+        .data_dir
+        .join("provider-runtime")
+        .join(profile_id.to_string());
+    let home = root.join("home");
+    let cache = root.join("cache");
+    let configuration = root.join("config");
+    let data = root.join("data");
+    let hugging_face = cache.join("huggingface");
+    for directory in [&home, &cache, &configuration, &data, &hugging_face] {
+        std::fs::create_dir_all(directory).map_err(|error| {
+            crate::ServiceError::InvalidRequest(format!(
+                "could not prepare isolated managed-provider storage: {error}"
+            ))
+        })?;
+    }
+
+    let path_value = |path: &std::path::Path| path.to_string_lossy().into_owned();
+    runtime
+        .environment
+        .insert("HOME".to_owned(), path_value(&home));
+    runtime
+        .environment
+        .insert("USERPROFILE".to_owned(), path_value(&home));
+    runtime
+        .environment
+        .insert("APPDATA".to_owned(), path_value(&configuration));
+    runtime
+        .environment
+        .insert("LOCALAPPDATA".to_owned(), path_value(&cache));
+    runtime
+        .environment
+        .insert("XDG_CACHE_HOME".to_owned(), path_value(&cache));
+    runtime
+        .environment
+        .insert("XDG_CONFIG_HOME".to_owned(), path_value(&configuration));
+    runtime
+        .environment
+        .insert("XDG_DATA_HOME".to_owned(), path_value(&data));
+    runtime
+        .environment
+        .insert("HF_HOME".to_owned(), path_value(&hugging_face));
+    runtime
+        .environment
+        .insert("HF_HUB_DISABLE_IMPLICIT_TOKEN".to_owned(), "1".to_owned());
+    runtime
+        .environment
+        .insert("HF_HUB_DISABLE_TELEMETRY".to_owned(), "1".to_owned());
+    runtime
+        .environment
+        .insert("DO_NOT_TRACK".to_owned(), "1".to_owned());
+    Ok(())
 }
 
 fn local_default_endpoint(adapter: crate::runtime::RuntimeAdapterKind) -> Option<url::Url> {
@@ -2215,6 +2298,34 @@ mod tests {
             Some(working_directory.as_path())
         );
         assert_eq!(runtime.arguments, profile.arguments);
+        let isolated_root = config
+            .data_dir
+            .join("provider-runtime")
+            .join(profile.id.to_string());
+        assert_eq!(
+            runtime.environment.get("HOME"),
+            Some(&isolated_root.join("home").to_string_lossy().into_owned())
+        );
+        assert_eq!(
+            runtime.environment.get("HF_HOME"),
+            Some(
+                &isolated_root
+                    .join("cache")
+                    .join("huggingface")
+                    .to_string_lossy()
+                    .into_owned()
+            )
+        );
+        assert_eq!(
+            runtime.environment.get("HF_HUB_DISABLE_IMPLICIT_TOKEN"),
+            Some(&"1".to_owned())
+        );
+        assert_eq!(
+            runtime.environment.get("HF_HUB_DISABLE_TELEMETRY"),
+            Some(&"1".to_owned())
+        );
+        assert!(isolated_root.join("home").is_dir());
+        assert!(isolated_root.join("cache").join("huggingface").is_dir());
     }
 
     // This integration fixture intentionally seeds the complete related record

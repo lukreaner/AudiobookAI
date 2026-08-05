@@ -1,4 +1,12 @@
-use std::{collections::BTreeMap, fmt, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use audiobookai_providers::{
@@ -104,6 +112,7 @@ pub struct ProviderModelManager {
     providers: ProviderRuntime,
     events: EventHub,
     operations: Arc<RwLock<BTreeMap<Uuid, OperationEntry>>>,
+    accepting_operations: Arc<AtomicBool>,
 }
 
 impl ProviderModelManager {
@@ -112,6 +121,7 @@ impl ProviderModelManager {
             providers,
             events,
             operations: Arc::new(RwLock::new(BTreeMap::new())),
+            accepting_operations: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -162,6 +172,12 @@ impl ProviderModelManager {
         provider_id: Uuid,
         request: ModelDownloadRequest,
     ) -> Result<ProviderModelOperationView, ServiceError> {
+        if !self.accepting_operations.load(Ordering::Acquire) {
+            return Err(ServiceError::Conflict(
+                "provider model operations are unavailable while AudiobookAI is shutting down"
+                    .to_owned(),
+            ));
+        }
         let runtime_id = runtime_provider_id(provider_id)?;
         let cancellation = CancellationFlag::default();
         let operation = ProviderModelOperationView {
@@ -179,6 +195,12 @@ impl ProviderModelManager {
         };
         {
             let mut operations = self.operations.write().await;
+            if !self.accepting_operations.load(Ordering::Acquire) {
+                return Err(ServiceError::Conflict(
+                    "provider model operations are unavailable while AudiobookAI is shutting down"
+                        .to_owned(),
+                ));
+            }
             if operations.values().any(|entry| {
                 entry.view.provider_profile_id == provider_id && !entry.view.state.is_terminal()
             }) {
@@ -228,6 +250,40 @@ impl ProviderModelManager {
         };
         self.publish(&updated);
         Ok(updated)
+    }
+
+    /// Cancels every model-download operation initiated by this service.
+    pub async fn shutdown_owned(&self) -> usize {
+        self.accepting_operations.store(false, Ordering::Release);
+        {
+            let mut operations = self.operations.write().await;
+            for entry in operations.values_mut() {
+                if !entry.view.state.is_terminal() {
+                    entry.cancellation.cancel();
+                    entry.view.state = ProviderModelOperationState::Cancelling;
+                    entry.view.detail_code = Some("shutdown_requested".to_owned());
+                }
+            }
+        }
+        for _ in 0..100 {
+            let remaining = self
+                .operations
+                .read()
+                .await
+                .values()
+                .filter(|entry| !entry.view.state.is_terminal())
+                .count();
+            if remaining == 0 {
+                return 0;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        self.operations
+            .read()
+            .await
+            .values()
+            .filter(|entry| !entry.view.state.is_terminal())
+            .count()
     }
 
     pub async fn delete_model(
@@ -510,5 +566,47 @@ mod tests {
         assert_eq!(progress_percent(&status), Some(100));
         status.total_size_bytes = None;
         assert_eq!(progress_percent(&status), None);
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_every_app_owned_model_operation() {
+        let manager = ProviderModelManager::new(
+            ProviderRuntime::new(crate::runtime::ProviderAdapterFactory::default()),
+            EventHub::new(8),
+        );
+        let operation_id = Uuid::new_v4();
+        let provider_id = Uuid::new_v4();
+        let cancellation = CancellationFlag::default();
+        manager.operations.write().await.insert(
+            operation_id,
+            OperationEntry {
+                view: ProviderModelOperationView {
+                    id: operation_id,
+                    provider_profile_id: provider_id,
+                    model: "public-model".to_owned(),
+                    state: ProviderModelOperationState::Running,
+                    downloaded_bytes: None,
+                    total_size_bytes: None,
+                    bytes_per_second: None,
+                    progress_percent: None,
+                    detail_code: None,
+                    started_at: Utc::now(),
+                    finished_at: None,
+                },
+                cancellation: cancellation.clone(),
+            },
+        );
+        let completion = manager.clone();
+        tokio::spawn(async move {
+            while !cancellation.is_cancelled() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            completion.finish_cancelled(operation_id).await;
+        });
+
+        assert_eq!(manager.shutdown_owned().await, 0);
+        assert!(!manager.accepting_operations.load(Ordering::Acquire));
+        let operations = manager.operations(provider_id).await;
+        assert_eq!(operations[0].state, ProviderModelOperationState::Cancelled);
     }
 }

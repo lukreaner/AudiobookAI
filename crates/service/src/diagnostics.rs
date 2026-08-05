@@ -45,6 +45,11 @@ const SAFE_MESSAGES: &[&str] = &[
     "persisted LAN settings were rejected; using loopback-only recovery mode",
     "persisted LAN listener failed to start; using loopback-only recovery mode",
     "some owned provider children did not stop cleanly",
+    "active jobs were checkpointed for shutdown",
+    "one or more active jobs could not be checkpointed before shutdown",
+    "an app-owned MLX-audio operation did not stop before the shutdown deadline",
+    "some app-owned provider model operations did not stop before the shutdown deadline",
+    "the local service exceeded its graceful shutdown deadline",
     "character detection failed",
     "service request failed",
     "skipping corrupt optional persisted record",
@@ -93,6 +98,26 @@ const SAFE_EVENT_CODES: &[(&str, &str)] = &[
     (
         "provider.shutdown.partial",
         "some owned provider children did not stop cleanly",
+    ),
+    (
+        "jobs.shutdown.checkpointed",
+        "active jobs were checkpointed for shutdown",
+    ),
+    (
+        "jobs.shutdown.checkpoint_failed",
+        "one or more active jobs could not be checkpointed before shutdown",
+    ),
+    (
+        "mlx.management.shutdown.timeout",
+        "an app-owned MLX-audio operation did not stop before the shutdown deadline",
+    ),
+    (
+        "provider.model.shutdown.timeout",
+        "some app-owned provider model operations did not stop before the shutdown deadline",
+    ),
+    (
+        "service.shutdown.timeout",
+        "the local service exceeded its graceful shutdown deadline",
     ),
     ("detection.failed", "character detection failed"),
     ("service.request.failed", "service request failed"),

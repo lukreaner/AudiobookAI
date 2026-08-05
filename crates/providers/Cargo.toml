@@ -10,6 +10,7 @@ audiobookai-core = { path = "../core" }
 async-trait.workspace = true
 bytes.workspace = true
 chrono.workspace = true
+command-group.workspace = true
 futures.workspace = true
 reqwest.workspace = true
 secrecy.workspace = true

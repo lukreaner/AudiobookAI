@@ -49,6 +49,19 @@ fn set_close_to_tray(state: tauri::State<'_, DesktopState>, enabled: bool) {
     state.close_to_tray.store(enabled, Ordering::SeqCst);
 }
 
+fn begin_quit(app: &AppHandle) {
+    if let Some(state) = app.try_state::<DesktopState>() {
+        state.quitting.store(true, Ordering::SeqCst);
+    }
+    app.exit(0);
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+fn quit_application(app: AppHandle) {
+    begin_quit(&app);
+}
+
 fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
@@ -82,12 +95,7 @@ fn create_tray(app: &AppHandle) -> tauri::Result<()> {
                 show_main_window(app);
                 let _ = app.emit("audiobookai://show-import", ());
             }
-            "quit" => {
-                if let Some(state) = app.try_state::<DesktopState>() {
-                    state.quitting.store(true, Ordering::SeqCst);
-                }
-                app.exit(0);
-            }
+            "quit" => begin_quit(app),
             _ => {}
         });
 
@@ -153,7 +161,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .invoke_handler(tauri::generate_handler![set_close_to_tray])
+        .invoke_handler(tauri::generate_handler![quit_application, set_close_to_tray])
         .setup(|app| {
             let mut loopback_config = ServiceConfig::desktop_default()?;
             loopback_config.bundled_sidecar_dir =
@@ -237,8 +245,7 @@ pub fn run() {
                     }
                     CloseAction::Exit => {
                         api.prevent_close();
-                        state.quitting.store(true, Ordering::SeqCst);
-                        window.app_handle().exit(0);
+                        begin_quit(window.app_handle());
                     }
                 }
             }

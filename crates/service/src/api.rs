@@ -1035,6 +1035,7 @@ async fn start_character_detection(
     Path(project_id): Path<Uuid>,
     Json(input): Json<DetectionInput>,
 ) -> Result<(StatusCode, Json<JobView>), ServiceError> {
+    let _shutdown_admission = state.admit_shutdown_sensitive_work().await?;
     let _model_lifecycle_guard = state.model_lifecycle.lock().await;
     let mut catalog = state.catalog.write().await;
     let provider = catalog
@@ -6003,10 +6004,12 @@ async fn inspect_media_tools(state: &AppState) -> (bool, String) {
     }
     let ffmpeg = tokio::process::Command::new(executable("ffmpeg"))
         .args(["-hide_banner", "-version"])
+        .kill_on_drop(true)
         .output()
         .await;
     let ffprobe = tokio::process::Command::new(executable("ffprobe"))
         .args(["-hide_banner", "-version"])
+        .kill_on_drop(true)
         .output()
         .await;
     let valid = ffmpeg.as_ref().is_ok_and(|output| output.status.success())

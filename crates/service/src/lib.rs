@@ -72,14 +72,55 @@ impl ServiceHandle {
     ///
     /// Returns an error when the server task or an underlying I/O operation fails.
     pub async fn shutdown(mut self) -> Result<(), ServiceError> {
+        self.state.close_shutdown_admission().await;
+        if let Some(sender) = self.shutdown.take() {
+            let _ = sender.send(());
+        }
+        match conversion::checkpoint_jobs_for_shutdown(Arc::clone(&self.state)).await {
+            Ok(checkpointed_jobs) if checkpointed_jobs > 0 => {
+                tracing::info!(
+                    diagnostic_code = "jobs.shutdown.checkpointed",
+                    checkpointed_jobs,
+                    "active jobs were checkpointed for shutdown"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(
+                    diagnostic_code = "jobs.shutdown.checkpoint_failed",
+                    %error,
+                    "one or more active jobs could not be checkpointed before shutdown"
+                );
+            }
+        }
+        if !self.state.mlx.shutdown_owned().await {
+            tracing::warn!(
+                diagnostic_code = "mlx.management.shutdown.timeout",
+                "an app-owned MLX-audio operation did not stop before the shutdown deadline"
+            );
+        }
+        let remaining_model_operations = self.state.provider_models.shutdown_owned().await;
+        if remaining_model_operations > 0 {
+            tracing::warn!(
+                diagnostic_code = "provider.model.shutdown.timeout",
+                remaining_model_operations,
+                "some app-owned provider model operations did not stop before the shutdown deadline"
+            );
+        }
         let report = self.state.providers.shutdown_owned().await;
         if !report.failures.is_empty() {
             tracing::warn!(diagnostic_code = "provider.shutdown.partial", failures = ?report.failures, "some owned provider children did not stop cleanly");
         }
-        if let Some(sender) = self.shutdown.take() {
-            let _ = sender.send(());
+        if let Ok(result) = tokio::time::timeout(Duration::from_secs(15), &mut self.task).await {
+            result??;
+        } else {
+            tracing::warn!(
+                diagnostic_code = "service.shutdown.timeout",
+                "the local service exceeded its graceful shutdown deadline"
+            );
+            self.task.abort();
+            let _ = self.task.await;
         }
-        self.task.await??;
         Ok(())
     }
 
@@ -248,6 +289,9 @@ fn build_router(state: &Arc<AppState>) -> Router {
 
 #[cfg(test)]
 mod tests {
+    use audiobookai_core::{BookId, Job, JobId, JobKind, JobState, ProjectId};
+    use chrono::Utc;
+
     use super::*;
 
     #[tokio::test]
@@ -284,6 +328,91 @@ mod tests {
         .expect("service starts");
         assert!(handle.address().ip().is_loopback());
         handle.shutdown().await.expect("clean shutdown");
+    }
+
+    #[tokio::test]
+    async fn shutdown_persists_an_explicit_resume_checkpoint_for_active_jobs() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let handle = start(ServiceConfig {
+            bind: "127.0.0.1:0".parse().expect("address"),
+            data_dir: directory.path().to_path_buf(),
+            bundled_sidecar_dir: None,
+            tls: None,
+            lan_hostnames: Vec::new(),
+            allow_insecure_lan: false,
+            desktop_bootstrap: true,
+        })
+        .await
+        .expect("service starts");
+        let database = handle.state().database.clone();
+        let state = Arc::clone(handle.state());
+        let now = Utc::now();
+        let book_id = BookId::new();
+        let project_id = ProjectId::new();
+        sqlx::query(
+            "INSERT INTO books (id, managed_epub_path, source_hash, imported_at, payload) VALUES (?, ?, ?, ?, '{}')",
+        )
+        .bind(book_id.to_string())
+        .bind(directory.path().join("fixture.epub").to_string_lossy().into_owned())
+        .bind("synthetic-source-hash")
+        .bind(now.to_rfc3339())
+        .execute(database.pool())
+        .await
+        .expect("book ownership fixture");
+        sqlx::query(
+            "INSERT INTO projects (id, book_id, name, status, created_at, updated_at, revision, payload) VALUES (?, ?, ?, 'draft', ?, ?, 0, '{}')",
+        )
+        .bind(project_id.to_string())
+        .bind(book_id.to_string())
+        .bind("Shutdown fixture")
+        .bind(now.to_rfc3339())
+        .bind(now.to_rfc3339())
+        .execute(database.pool())
+        .await
+        .expect("project ownership fixture");
+        let job = Job {
+            id: JobId::new(),
+            project_id,
+            kind: JobKind::Conversion,
+            state: JobState::Running,
+            export_profile_id: None,
+            reservation_id: None,
+            progress_completed: 0,
+            progress_total: 1,
+            status_message: Some("Synthetic active job".to_owned()),
+            allow_budget_override: false,
+            created_at: now,
+            started_at: Some(now),
+            finished_at: None,
+            updated_at: now,
+            revision: 0,
+        };
+        database
+            .repositories()
+            .jobs
+            .insert(&job)
+            .await
+            .expect("active job fixture");
+
+        handle.shutdown().await.expect("clean shutdown");
+
+        assert!(matches!(
+            state.admit_shutdown_sensitive_work().await,
+            Err(ServiceError::Conflict(message)) if message.contains("shutting down")
+        ));
+
+        let persisted = database
+            .repositories()
+            .jobs
+            .get(job.id)
+            .await
+            .expect("read checkpoint")
+            .expect("persisted job");
+        assert_eq!(persisted.state, JobState::Pausing);
+        assert_eq!(
+            persisted.status_message.as_deref(),
+            Some("Checkpointed for application shutdown")
+        );
     }
 
     #[cfg(unix)]

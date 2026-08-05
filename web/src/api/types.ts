@@ -307,6 +307,7 @@ export interface MlxManagedModel {
 export interface MlxManagement {
   supported: boolean;
   supportDetail: string;
+  installerStatus: "ready" | "unsupported_platform" | "not_bundled" | "payload_missing" | "unsafe_filesystem" | "invalid_metadata" | "incomplete";
   uvAvailable: boolean;
   requiredUvVersion: string;
   installerPayloadAvailable: boolean;

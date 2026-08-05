@@ -41,6 +41,18 @@ const MAX_TOOL_DIAGNOSTICS: usize = 16;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
+pub enum MlxInstallerStatus {
+    Ready,
+    UnsupportedPlatform,
+    NotBundled,
+    PayloadMissing,
+    UnsafeFilesystem,
+    InvalidMetadata,
+    Incomplete,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MlxOperationKind {
     Install,
     Uninstall,
@@ -117,6 +129,7 @@ pub struct MlxModelView {
 pub struct MlxManagementView {
     pub supported: bool,
     pub support_detail: String,
+    pub installer_status: MlxInstallerStatus,
     pub uv_available: bool,
     pub required_uv_version: &'static str,
     pub installer_payload_available: bool,
@@ -207,6 +220,15 @@ impl InstallerPayloadError {
             Self::Incomplete => {
                 "The bundled offline installer payload does not contain its complete locked wheel set."
             }
+        }
+    }
+
+    const fn installer_status(self) -> MlxInstallerStatus {
+        match self {
+            Self::Missing => MlxInstallerStatus::PayloadMissing,
+            Self::UnsafeFilesystem => MlxInstallerStatus::UnsafeFilesystem,
+            Self::InvalidMetadata => MlxInstallerStatus::InvalidMetadata,
+            Self::Incomplete => MlxInstallerStatus::Incomplete,
         }
     }
 }
@@ -476,10 +498,12 @@ pub struct MlxManager {
     bundled_sidecar_bin: Option<PathBuf>,
     uv_available: bool,
     installer_payload_available: bool,
+    installer_status: MlxInstallerStatus,
     installer_support_detail: Arc<str>,
     supported: bool,
     runner: Arc<dyn ToolRunner>,
     state: Arc<Mutex<ManagerState>>,
+    accepting_operations: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for MlxManager {
@@ -507,31 +531,39 @@ impl MlxManager {
         } else {
             false
         };
-        let (installer_payload_available, installer_support_detail) = if let Some(directory) =
-            &bundled_sidecar_bin
-        {
-            match validate_installer_payload(directory, false).await {
-                Ok(_) => (
-                    true,
-                    "The complete hash-locked offline installer payload is available.".to_owned(),
-                ),
-                Err(error) => (false, error.support_detail().to_owned()),
-            }
-        } else {
-            (
-                false,
-                InstallerPayloadError::Missing.support_detail().to_owned(),
-            )
-        };
+        let (installer_payload_available, installer_status, installer_support_detail) =
+            if let Some(directory) = &bundled_sidecar_bin {
+                match validate_installer_payload(directory, false).await {
+                    Ok(_) => (
+                        true,
+                        MlxInstallerStatus::Ready,
+                        "The complete hash-locked offline installer payload is available."
+                            .to_owned(),
+                    ),
+                    Err(error) => (
+                        false,
+                        error.installer_status(),
+                        error.support_detail().to_owned(),
+                    ),
+                }
+            } else {
+                (
+                    false,
+                    MlxInstallerStatus::NotBundled,
+                    InstallerPayloadError::Missing.support_detail().to_owned(),
+                )
+            };
         let manager = Self {
             root: Arc::new(config.data_dir.join("managed-providers").join("mlx-audio")),
             bundled_sidecar_bin,
             uv_available,
             installer_payload_available,
+            installer_status,
             installer_support_detail: Arc::from(installer_support_detail),
             supported: cfg!(all(target_os = "macos", target_arch = "aarch64")),
             runner: Arc::new(ProcessToolRunner),
             state: Arc::new(Mutex::new(ManagerState::default())),
+            accepting_operations: Arc::new(AtomicBool::new(true)),
         };
         manager.hydrate().await?;
         Ok(manager)
@@ -547,23 +579,30 @@ impl MlxManager {
             bundled_regular_file(&bundled_sidecar_bin, &bundled_sidecar_bin.join("uv"))
                 .await
                 .is_ok();
-        let (installer_payload_available, installer_support_detail) =
+        let (installer_payload_available, installer_status, installer_support_detail) =
             match validate_installer_payload(&bundled_sidecar_bin, false).await {
                 Ok(_) => (
                     true,
+                    MlxInstallerStatus::Ready,
                     "The complete hash-locked offline installer payload is available.".to_owned(),
                 ),
-                Err(error) => (false, error.support_detail().to_owned()),
+                Err(error) => (
+                    false,
+                    error.installer_status(),
+                    error.support_detail().to_owned(),
+                ),
             };
         let manager = Self {
             root: Arc::new(root),
             bundled_sidecar_bin: Some(bundled_sidecar_bin),
             uv_available,
             installer_payload_available,
+            installer_status,
             installer_support_detail: Arc::from(installer_support_detail),
             supported: true,
             runner,
             state: Arc::new(Mutex::new(ManagerState::default())),
+            accepting_operations: Arc::new(AtomicBool::new(true)),
         };
         manager.hydrate().await?;
         Ok(manager)
@@ -584,6 +623,11 @@ impl MlxManager {
                     "Managed installation is disabled. {}",
                     self.installer_support_detail
                 )
+            },
+            installer_status: if self.supported {
+                self.installer_status
+            } else {
+                MlxInstallerStatus::UnsupportedPlatform
             },
             uv_available: self.uv_available,
             required_uv_version: UV_VERSION,
@@ -721,6 +765,29 @@ impl MlxManager {
         Ok(active.view.clone())
     }
 
+    /// Cancels an app-owned installer or model process and waits briefly for its child to exit.
+    pub async fn shutdown_owned(&self) -> bool {
+        self.accepting_operations.store(false, Ordering::Release);
+        {
+            let mut state = self.state.lock().await;
+            let Some(active) = state.active.as_mut() else {
+                return true;
+            };
+            active.cancel.store(true, Ordering::Release);
+            active.view.state = MlxOperationState::Cancelling;
+            "cancelling".clone_into(&mut active.view.phase);
+            "Cancelling the app-owned operation before shutdown."
+                .clone_into(&mut active.view.message);
+        }
+        for _ in 0..100 {
+            if self.state.lock().await.active.is_none() {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        false
+    }
+
     pub async fn remove_model(&self, id: Uuid) -> Result<(), ServiceError> {
         {
             let state = self.state.lock().await;
@@ -810,7 +877,17 @@ impl MlxManager {
         kind: MlxOperationKind,
         model_id: Option<Uuid>,
     ) -> Result<MlxOperationView, ServiceError> {
+        if !self.accepting_operations.load(Ordering::Acquire) {
+            return Err(ServiceError::Conflict(
+                "MLX-audio management is unavailable while AudiobookAI is shutting down".to_owned(),
+            ));
+        }
         let mut state = self.state.lock().await;
+        if !self.accepting_operations.load(Ordering::Acquire) {
+            return Err(ServiceError::Conflict(
+                "MLX-audio management is unavailable while AudiobookAI is shutting down".to_owned(),
+            ));
+        }
         ensure_idle(&state)?;
         let view = MlxOperationView {
             id: Uuid::new_v4(),
@@ -2179,6 +2256,9 @@ mod tests {
         specs: Mutex<Vec<CommandSpec>>,
     }
 
+    #[derive(Debug, Default)]
+    struct CancellationRunner;
+
     #[async_trait]
     impl ToolRunner for SanitizingFailureRunner {
         async fn run(
@@ -2197,6 +2277,20 @@ mod tests {
                 exit_code: Some(23),
                 diagnostics,
             }))
+        }
+    }
+
+    #[async_trait]
+    impl ToolRunner for CancellationRunner {
+        async fn run(
+            &self,
+            _spec: CommandSpec,
+            cancel: Arc<AtomicBool>,
+        ) -> Result<ToolRunReport, ToolRunError> {
+            while !cancel.load(Ordering::Acquire) {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            Err(ToolRunError::Cancelled(ToolRunReport::default()))
         }
     }
 
@@ -2395,6 +2489,32 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("fake managed operation did not finish");
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_an_active_app_owned_installer_process() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let sidecar_bin = create_offline_installer_fixture(temporary.path()).await;
+        let manager = MlxManager::for_test(
+            temporary.path().join("management"),
+            sidecar_bin,
+            Arc::new(CancellationRunner),
+        )
+        .await
+        .expect("manager");
+        manager.start_install().await.expect("start install");
+
+        assert!(manager.shutdown_owned().await);
+        let view = manager.view().await;
+        assert!(view.active_operation.is_none());
+        assert_eq!(
+            view.last_operation.expect("cancelled operation").state,
+            MlxOperationState::Cancelled
+        );
+        assert!(matches!(
+            manager.start_install().await,
+            Err(ServiceError::Conflict(message)) if message.contains("shutting down")
+        ));
     }
 
     // Keeping the two command specifications in one test makes the no-network and

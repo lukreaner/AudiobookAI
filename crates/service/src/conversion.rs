@@ -153,6 +153,7 @@ pub async fn start_conversion(
     input: StartJobInput,
 ) -> Result<JobView, ServiceError> {
     validate_export_input(&input.export)?;
+    let _shutdown_admission = state.admit_shutdown_sensitive_work().await?;
     let job_id = JobId::new();
     let (export_profile, music_path) =
         create_export_profile(&state, job_id, input.project_id, &input.export).await?;
@@ -252,6 +253,73 @@ pub async fn resume_durable_conversions(state: Arc<AppState>) -> Result<(), Serv
         }
     }
     Ok(())
+}
+
+/// Persists a pause boundary for every active durable job before desktop shutdown.
+pub async fn checkpoint_jobs_for_shutdown(state: Arc<AppState>) -> Result<usize, ServiceError> {
+    let active = state
+        .database
+        .repositories()
+        .jobs
+        .list_active()
+        .await
+        .map_err(storage_error)?;
+    let mut checkpointed = 0_usize;
+    for job in active {
+        if !matches!(job.kind, JobKind::Conversion | JobKind::CharacterDetection) {
+            continue;
+        }
+        match job.state {
+            JobState::Queued => {
+                transition_job(
+                    &state,
+                    job.id,
+                    JobState::Running,
+                    "Preparing shutdown checkpoint",
+                )
+                .await?;
+                transition_job(
+                    &state,
+                    job.id,
+                    JobState::Pausing,
+                    "Checkpointed for application shutdown",
+                )
+                .await?;
+                if job.kind == JobKind::CharacterDetection {
+                    crate::workflows::spawn_character_detection(
+                        Arc::clone(&state),
+                        job.id.as_uuid(),
+                    );
+                }
+                checkpointed = checkpointed.saturating_add(1);
+            }
+            JobState::Running => {
+                transition_job(
+                    &state,
+                    job.id,
+                    JobState::Pausing,
+                    "Checkpointed for application shutdown",
+                )
+                .await?;
+                if job.kind == JobKind::CharacterDetection {
+                    crate::workflows::spawn_character_detection(
+                        Arc::clone(&state),
+                        job.id.as_uuid(),
+                    );
+                }
+                checkpointed = checkpointed.saturating_add(1);
+            }
+            JobState::Pausing => {
+                checkpointed = checkpointed.saturating_add(1);
+            }
+            JobState::Paused
+            | JobState::Cancelling
+            | JobState::Cancelled
+            | JobState::Failed
+            | JobState::Completed => {}
+        }
+    }
+    Ok(checkpointed)
 }
 
 fn storage_error(error: impl std::fmt::Display) -> ServiceError {
@@ -1971,6 +2039,7 @@ fn spawn_stream_playback_decoder(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
+        .kill_on_drop(true)
         .spawn()
         .map_err(|error| ProviderError::Transport(error.to_string()))?;
     let mut stdin = child.stdin.take().ok_or_else(|| {
@@ -2640,6 +2709,7 @@ async fn decode_flac_pcm(sidecars: &SidecarPair, path: &Path) -> Result<Bytes, S
         .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-i"])
         .arg(path)
         .args(["-vn", "-ar", "48000", "-ac", "1", "-f", "f32le", "pipe:1"])
+        .kill_on_drop(true)
         .output()
         .await?;
     if !output.status.success() {
@@ -3384,6 +3454,7 @@ async fn run_process_capture(
 async fn ffmpeg_build_description(sidecars: &SidecarPair) -> Result<String, ServiceError> {
     let output = Command::new(&sidecars.ffmpeg)
         .args(["-hide_banner", "-version"])
+        .kill_on_drop(true)
         .output()
         .await?;
     if !output.status.success() {
@@ -3409,6 +3480,7 @@ async fn probe_duration_ms(sidecars: &SidecarPair, path: &Path) -> Result<u64, S
             "default=noprint_wrappers=1:nokey=1",
         ])
         .arg(path)
+        .kill_on_drop(true)
         .output()
         .await?;
     if !output.status.success() {

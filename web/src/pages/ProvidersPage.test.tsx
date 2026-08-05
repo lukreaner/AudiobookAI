@@ -41,6 +41,7 @@ const managedProvider: ProviderProfile = {
 const mlxManagement: MlxManagement = {
   supported: true,
   supportDetail: "MLX-audio app management is available on Apple Silicon.",
+  installerStatus: "ready",
   uvAvailable: true,
   requiredUvVersion: "0.12.1",
   installerPayloadAvailable: true,
@@ -168,6 +169,7 @@ describe("managed provider configuration", () => {
     vi.mocked(api.mlxManagement).mockResolvedValue({
       ...structuredClone(mlxManagement),
       supportDetail: "Managed installation is disabled. The complete bundled offline installer payload is unavailable.",
+      installerStatus: "not_bundled",
       installerPayloadAvailable: false,
       lastOperation: {
         id: "operation-failed",
@@ -185,10 +187,17 @@ describe("managed provider configuration", () => {
     renderProviders();
 
     expect(await screen.findByRole("button", { name: "Install MLX-audio" })).toBeDisabled();
-    expect(screen.getByText(/complete bundled offline installer payload is unavailable/)).toBeInTheDocument();
+    expect(screen.getByText(/does not include the verified offline MLX-audio installer/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Install MLX-audio" })).toHaveAttribute("aria-describedby", "mlx-installer-status");
+    const configure = screen.getByRole("button", { name: "Configure isolated MLX-audio" });
+    expect(configure).toBeEnabled();
     await userEvent.setup().click(screen.getByText("Safe installer diagnostics"));
     expect(screen.getByText("Installer exit code: 23")).toBeInTheDocument();
     expect(screen.getByText("The bundled artifact failed hash verification.")).toBeInTheDocument();
+    await userEvent.setup().click(configure);
+    expect(screen.getByLabelText("Connection mode")).toHaveValue("managed_child");
+    expect(screen.getByLabelText(/^Endpoint URL/)).toHaveValue("http://127.0.0.1:8000/");
+    expect(screen.getByLabelText(/^Launch arguments/)).toHaveValue("--host\n127.0.0.1\n--port\n8000");
   });
 
   it("requires confirmation before removing an app-owned MLX model", async () => {

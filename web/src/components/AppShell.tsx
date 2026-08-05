@@ -1,4 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import { clsx } from "clsx";
 import {
   AudioLines,
@@ -11,6 +12,7 @@ import {
   FileSearch,
   Menu,
   Plus,
+  Power,
   Settings,
   SlidersHorizontal,
   X,
@@ -19,7 +21,7 @@ import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
 import { api } from "../api/client";
-import { Badge, Button, IconButton } from "./ui";
+import { Badge, Button, Dialog, IconButton } from "./ui";
 
 const navigation = [
   { to: "/library", label: "nav.library", icon: BookOpen },
@@ -35,6 +37,10 @@ export function AppShell() {
   const navigate = useNavigate();
   const [collapsed, setCollapsed] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
+  const [quitOpen, setQuitOpen] = useState(false);
+  const [quitting, setQuitting] = useState(false);
+  const [quitError, setQuitError] = useState(false);
+  const desktop = isTauri();
   const health = useQuery({ queryKey: ["health"], queryFn: api.health, retry: 2, refetchInterval: 15_000 });
   const status = health.isError ? "offline" : health.data?.status ?? "starting";
   const statusLabel = status === "ready"
@@ -57,6 +63,17 @@ export function AppShell() {
     if (initialEpub) navigate("/import", { state: { sourcePath: initialEpub } });
     return () => { unlistenImport?.(); unlistenEpub?.(); };
   }, [navigate]);
+
+  const quitApplication = async () => {
+    setQuitting(true);
+    setQuitError(false);
+    try {
+      await invoke("quit_application");
+    } catch {
+      setQuitting(false);
+      setQuitError(true);
+    }
+  };
 
   const nav = (
     <>
@@ -139,12 +156,27 @@ export function AppShell() {
             <Badge tone={status === "ready" ? "positive" : status === "degraded" ? "warning" : "neutral"}>
               <span className="service-dot" />{statusLabel}
             </Badge>
+            {desktop ? <Button size="sm" variant="ghost" onClick={() => setQuitOpen(true)}><Power size={16} />{t("shell.quit")}</Button> : null}
           </div>
         </header>
         <main id="main-content" className="main-content" tabIndex={-1}>
           <Outlet />
         </main>
       </div>
+      {desktop ? <Dialog
+        open={quitOpen}
+        onOpenChange={(open) => { if (!quitting) { setQuitOpen(open); setQuitError(false); } }}
+        title={t("shell.quitTitle")}
+        description={t("shell.quitDetail")}
+        size="sm"
+        footer={<>
+          <Button variant="secondary" disabled={quitting} onClick={() => setQuitOpen(false)}>{t("common.cancel")}</Button>
+          <Button variant="danger" disabled={quitting} onClick={() => void quitApplication()}><Power size={16} />{quitting ? t("shell.quitting") : t("shell.quitConfirm")}</Button>
+        </>}
+      >
+        <p className="quit-safety-note">{t("shell.quitSafety")}</p>
+        {quitError ? <p className="provider-form-warning" role="alert">{t("shell.quitFailed")}</p> : null}
+      </Dialog> : null}
     </div>
   );
 }

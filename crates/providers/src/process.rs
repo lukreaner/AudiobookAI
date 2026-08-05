@@ -2,14 +2,15 @@ use std::{
     collections::{HashMap, VecDeque},
     process::Stdio,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
 use chrono::Utc;
+use command_group::{AsyncCommandGroup, AsyncGroupChild};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
-    process::{Child, Command},
+    process::Command,
     sync::Mutex,
 };
 use uuid::Uuid;
@@ -41,15 +42,28 @@ const SAFE_INHERITED_ENVIRONMENT: &[&str] = &[
 struct ManagedEntry {
     ownership_token: Uuid,
     spec: ProcessSpec,
-    child: Child,
+    child: AsyncGroupChild,
     logs: Arc<Mutex<VecDeque<ProcessLogLine>>>,
     exit_code: Option<i32>,
+}
+
+impl Drop for ManagedEntry {
+    fn drop(&mut self) {
+        // This is a process-group kill on Unix and terminates the Job Object on Windows. It is a
+        // final safety net for runtime teardown or an I/O failure; ordinary stops still wait below
+        // so successful removal means the complete app-owned tree has exited.
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let _ = self.child.start_kill();
+        }
+    }
 }
 
 /// Supervises only processes spawned through this instance.
 ///
 /// An operating-system PID is never accepted as authority. Every mutating operation requires the
-/// unguessable ownership token returned by [`start`](Self::start).
+/// unguessable ownership token returned by [`start`](Self::start). Each launch receives an isolated
+/// POSIX process group or Windows Job Object, so stopping that owned handle also stops descendants
+/// without scanning or accepting arbitrary system PIDs.
 #[derive(Clone, Debug, Default)]
 pub struct ManagedProcessSupervisor {
     entries: Arc<Mutex<HashMap<Uuid, ManagedEntry>>>,
@@ -64,7 +78,7 @@ impl ManagedProcessSupervisor {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(false);
+            .kill_on_drop(true);
         // A desktop process can inherit developer, shell, proxy, and release credentials. A
         // managed provider must never receive those implicitly. Only process mechanics are copied;
         // provider-specific values must come from the explicit, encrypted configuration path.
@@ -80,10 +94,12 @@ impl ManagedProcessSupervisor {
         command.envs(&spec.environment);
 
         let mut child = command
+            .group()
+            .kill_on_drop(true)
             .spawn()
             .map_err(|error| ProviderError::Process(error.to_string()))?;
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
+        let stdout = child.inner().stdout.take();
+        let stderr = child.inner().stderr.take();
         let logs = Arc::new(Mutex::new(VecDeque::new()));
         if let Some(stdout) = stdout {
             spawn_log_reader(stdout, ProcessLogStream::Stdout, Arc::clone(&logs));
@@ -132,41 +148,38 @@ impl ManagedProcessSupervisor {
     }
 
     pub async fn stop(&self, handle: &OwnedProcessHandle) -> Result<()> {
-        let mut entry = {
-            let mut entries = self.entries.lock().await;
-            let entry = owned_entry_mut(&mut entries, handle)?;
-            // Verify authority before removing the only record that proves ownership.
-            if entry.ownership_token != handle.ownership_token {
-                return Err(ProviderError::NotOwned);
-            }
-            entries
-                .remove(&handle.process_id)
-                .ok_or(ProviderError::ProcessNotFound)?
-        };
-
+        let mut entries = self.entries.lock().await;
+        let entry = owned_entry_mut(&mut entries, handle)?;
         if entry
             .child
             .try_wait()
             .map_err(|error| ProviderError::Process(error.to_string()))?
             .is_some()
         {
+            entries.remove(&handle.process_id);
             return Ok(());
         }
         entry
             .child
             .start_kill()
             .map_err(|error| ProviderError::Process(error.to_string()))?;
-        match tokio::time::timeout(Duration::from_secs(10), entry.child.wait()).await {
-            Ok(Ok(_)) => Ok(()),
-            Ok(Err(error)) => Err(ProviderError::Process(error.to_string())),
-            Err(_) => {
-                entry
-                    .child
-                    .kill()
-                    .await
-                    .map_err(|error| ProviderError::Process(error.to_string()))?;
-                Ok(())
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if entry
+                .child
+                .try_wait()
+                .map_err(|error| ProviderError::Process(error.to_string()))?
+                .is_some()
+            {
+                entries.remove(&handle.process_id);
+                return Ok(());
             }
+            if Instant::now() >= deadline {
+                return Err(ProviderError::Process(
+                    "timed out waiting for the managed provider process group to stop".to_owned(),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
 
@@ -655,6 +668,8 @@ impl ProviderControl for ManagedProcessController {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    #[cfg(unix)]
+    use std::process::Command as StdCommand;
 
     use super::*;
 
@@ -839,6 +854,60 @@ mod tests {
         let logs = supervisor.logs(&handle, 10).await.unwrap();
         assert!(logs.iter().any(|line| line.line == "ready"));
         supervisor.stop(&handle).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stopping_owned_child_terminates_its_descendants() {
+        let supervisor = ManagedProcessSupervisor::default();
+        let spec = ProcessSpec {
+            executable: Path::new("/bin/sh").to_path_buf(),
+            arguments: vec![
+                "-c".to_owned(),
+                "sleep 30 & descendant=$!; echo $descendant; wait".to_owned(),
+            ],
+            working_directory: None,
+            environment: Default::default(),
+        };
+        let handle = supervisor.start(spec).await.unwrap();
+        let descendant_pid = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(pid) = supervisor
+                    .logs(&handle, 10)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .find_map(|line| line.line.parse::<u32>().ok())
+                {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("descendant PID was not reported");
+        assert!(process_exists(descendant_pid));
+
+        supervisor.stop(&handle).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while process_exists(descendant_pid) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("owned descendant survived process-group shutdown");
+    }
+
+    #[cfg(unix)]
+    fn process_exists(pid: u32) -> bool {
+        StdCommand::new("/bin/kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
     }
 
     #[test]
