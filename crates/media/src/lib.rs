@@ -11,9 +11,11 @@
 pub mod cache;
 pub mod error;
 pub mod export;
+pub mod qc;
 pub mod sidecar;
 
 pub use cache::{CacheFingerprint, CacheKey, CachePruneReport, ContentAddressedCache};
 pub use error::{MediaError, Result};
 pub use export::*;
+pub use qc::*;
 pub use sidecar::{SidecarChecksums, SidecarPair, SidecarResolver};

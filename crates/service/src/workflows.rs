@@ -35,7 +35,7 @@ use crate::{
 
 const DETECTION_BATCH_PARAGRAPHS: usize = 24;
 const DETECTION_CONTEXT_OVERLAP: usize = 2;
-const DETECTION_JOB_SCHEMA_VERSION: u32 = 2;
+const DETECTION_JOB_SCHEMA_VERSION: u32 = 4;
 
 static ACTIVE_DETECTION_WORKERS: OnceLock<StdMutex<BTreeSet<Uuid>>> = OnceLock::new();
 
@@ -71,9 +71,15 @@ struct DetectionJobConfig {
     provider_profile_id: Uuid,
     model: String,
     provider_endpoint: Option<String>,
+    #[serde(default)]
+    provider_mode: Option<ProviderModeView>,
+    #[serde(default)]
+    provider_snapshot_id: Option<Uuid>,
     temperature: Temperature,
     reasoning: ReasoningControl,
     detection_run_id: DetectionRunId,
+    #[serde(default)]
+    base_character_revision: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -121,7 +127,7 @@ enum DetectionPermission {
 }
 
 /// Creates the complete durable detection graph before the first provider request is dispatched.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn persist_detection_job(
     state: &AppState,
     view: &JobView,
@@ -130,6 +136,7 @@ pub async fn persist_detection_job(
     provider_endpoint: Option<String>,
     temperature: Temperature,
     reasoning: ReasoningControl,
+    base_character_revision: u64,
 ) -> Result<JobView, ServiceError> {
     let project = state
         .database
@@ -146,15 +153,40 @@ pub async fn persist_detection_job(
         ));
     }
     let batches = paragraph_batches(&paragraphs);
+    let provider_mode = state
+        .catalog
+        .read()
+        .await
+        .providers
+        .get(&provider_id)
+        .map(|provider| provider.mode)
+        .ok_or_else(|| ServiceError::Conflict("detection provider was removed".to_owned()))?;
+    let provider_snapshot_id = state
+        .database
+        .repositories()
+        .providers
+        .get(ProviderProfileId::from_uuid(provider_id))
+        .await
+        .map_err(storage_error)?
+        .and_then(|provider| provider.capability_snapshot)
+        .map(|snapshot| snapshot.id.as_uuid())
+        .ok_or_else(|| {
+            ServiceError::Conflict(
+                "detection provider has no durable capability snapshot".to_owned(),
+            )
+        })?;
     let detection_run_id = DetectionRunId::new();
     let config = DetectionJobConfig {
         schema_version: DETECTION_JOB_SCHEMA_VERSION,
         provider_profile_id: provider_id,
         model: model.clone(),
         provider_endpoint,
+        provider_mode: Some(provider_mode),
+        provider_snapshot_id: Some(provider_snapshot_id),
         temperature,
         reasoning,
         detection_run_id,
+        base_character_revision,
     };
     let now = view.updated_at;
     let mut job = Job {
@@ -512,7 +544,15 @@ async fn run_character_detection_inner(
         config.detection_run_id,
         &previous_characters,
     );
-    persist_detection_results(state, &detection_run, &characters, &combined, &paragraphs).await?;
+    let character_revision = persist_detection_results(
+        state,
+        &detection_run,
+        &characters,
+        &combined,
+        &paragraphs,
+        config.base_character_revision,
+    )
+    .await?;
     let previous_assignments = state
         .catalog
         .read()
@@ -536,14 +576,10 @@ async fn run_character_detection_inner(
         catalog.characters.insert(project_id, views);
         if let Some(project) = catalog.projects.get_mut(&project_id) {
             project.character_review_status = ReviewStatus::NeedsReview;
+            project.character_revision = character_revision;
             project.summary.updated_at = Utc::now();
         }
     }
-    let mut stored_project = domain_project;
-    stored_project.status = ProjectStatus::NeedsCharacterReview;
-    stored_project.character_reviewed_at = None;
-    stored_project.updated_at = Utc::now();
-    update_domain_project(state, &stored_project).await?;
     detection_run.status = DetectionRunStatus::Completed;
     detection_run.completed_at = Some(Utc::now());
     update_detection_run(state, &detection_run).await?;
@@ -667,10 +703,20 @@ pub async fn resume_durable_detections(state: Arc<AppState>) -> Result<(), Servi
         .list_active()
         .await
         .map_err(storage_error)?;
+    let mut claimed_projects = BTreeSet::new();
     for job in active
         .into_iter()
         .filter(|job| job.kind == JobKind::CharacterDetection)
     {
+        if !claimed_projects.insert(job.project_id) {
+            fail_job(
+                &state,
+                job.id.as_uuid(),
+                "duplicate character-detection job recovered; it was not redispatched",
+            )
+            .await;
+            continue;
+        }
         match job.state {
             JobState::Cancelling => {
                 cancel_detection_job(&state, job.id).await?;
@@ -697,6 +743,40 @@ pub async fn resume_durable_detections(state: Arc<AppState>) -> Result<(), Servi
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// Applies character-detection crash accounting before terminalizing a legacy job that conflicts
+/// with another active production job. This is called by conversion recovery before any project
+/// worker is spawned, so an in-flight paid detection is never silently redispatched or released as
+/// zero usage.
+pub(crate) async fn fail_recovered_production_conflict(
+    state: &AppState,
+    job: &Job,
+    detail: &str,
+) -> Result<(), ServiceError> {
+    if job.kind != JobKind::CharacterDetection {
+        return Err(ServiceError::Internal(
+            "character-detection recovery received another job kind".to_owned(),
+        ));
+    }
+    if recover_detection_job(state, job).await? {
+        fail_job(state, job.id.as_uuid(), detail).await;
+    }
+    let recovered = state
+        .database
+        .repositories()
+        .jobs
+        .get(job.id)
+        .await
+        .map_err(storage_error)?
+        .ok_or(ServiceError::NotFound)?;
+    if !recovered.state.is_terminal() {
+        return Err(ServiceError::Conflict(format!(
+            "recovered character-detection job {} could not be terminalized safely",
+            job.id
+        )));
     }
     Ok(())
 }
@@ -731,6 +811,213 @@ pub async fn reset_detection_units_for_restart(
     Ok(())
 }
 
+/// Resets only detection batches that can redispatch and returns the exact worst-case estimates
+/// for their fresh manual-retry budget cycle.
+pub(crate) async fn prepare_detection_retry_units(
+    state: &AppState,
+    job_id: JobId,
+) -> Result<Vec<crate::accounting::RatedUsageEstimate>, ServiceError> {
+    let job = state
+        .database
+        .repositories()
+        .jobs
+        .get(job_id)
+        .await
+        .map_err(storage_error)?
+        .ok_or(ServiceError::NotFound)?;
+    let project = state
+        .database
+        .repositories()
+        .projects
+        .get_project(job.project_id)
+        .await
+        .map_err(storage_error)?
+        .ok_or(ServiceError::NotFound)?;
+    let maximum_attempts = project
+        .settings
+        .reliability
+        .max_transient_retries
+        .saturating_add(1);
+    let multiplier = usize::from(maximum_attempts).saturating_mul(2);
+    let mut estimates = Vec::new();
+    for mut unit in detection_units(state, job_id).await? {
+        if matches!(
+            unit.state,
+            JobUnitState::Completed | JobUnitState::Cancelled
+        ) {
+            continue;
+        }
+        if unit
+            .payload
+            .get("uncertainUsageUnresolved")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            return Err(ServiceError::ConflictDetails {
+                code: "retry_usage_unresolved",
+                detail:
+                    "this detection job has unresolved provider usage and cannot be retried safely"
+                        .to_owned(),
+                meta: serde_json::json!({"jobId": job_id}),
+            });
+        }
+        let config = detection_config(&unit)?;
+        let estimate = crate::accounting::rate_usage_estimate(
+            state,
+            ProviderProfileId::from_uuid(config.provider_profile_id),
+            UsageWorkload::CharacterDetection,
+            Some(config.model),
+            detection_unit_estimate(&unit)?,
+        )
+        .await?;
+        unit.payload.remove("requestId");
+        unit.payload.insert(
+            "dispatchState".to_owned(),
+            serde_json::json!("explicit_retry"),
+        );
+        unit.payload.insert(
+            "rateCardId".to_owned(),
+            serde_json::to_value(estimate.rate_card_id)
+                .map_err(|error| ServiceError::Internal(error.to_string()))?,
+        );
+        mark_detection_unit(state, &mut unit, JobUnitState::Ready, None).await?;
+        for _ in 0..multiplier {
+            estimates.push(estimate.clone());
+        }
+    }
+    Ok(estimates)
+}
+
+/// Prevents an explicit retry from applying results to a character set or source text that was
+/// edited after the failed attempt.
+#[allow(clippy::too_many_lines)]
+pub async fn validate_detection_retry(state: &AppState, job_id: JobId) -> Result<(), ServiceError> {
+    let job = state
+        .database
+        .repositories()
+        .jobs
+        .get(job_id)
+        .await
+        .map_err(storage_error)?
+        .ok_or(ServiceError::NotFound)?;
+    let config = consistent_detection_config(&detection_units(state, job_id).await?)?;
+    let revision =
+        sqlx::query_scalar::<_, i64>("SELECT character_revision FROM projects WHERE id = ?")
+            .bind(job.project_id.to_string())
+            .fetch_one(state.database.pool())
+            .await
+            .map_err(storage_error)?;
+    if u64::try_from(revision).ok() != Some(config.base_character_revision) {
+        return Err(ServiceError::Conflict(
+            "character review changed after this detection failed; start a new detection job"
+                .to_owned(),
+        ));
+    }
+    let project = state
+        .database
+        .repositories()
+        .projects
+        .get_project(job.project_id)
+        .await
+        .map_err(storage_error)?
+        .ok_or(ServiceError::NotFound)?;
+    let profile = {
+        let catalog = state.catalog.read().await;
+        catalog
+            .providers
+            .get(&config.provider_profile_id)
+            .cloned()
+            .ok_or_else(|| {
+                ServiceError::Conflict(
+                    "the detection provider was removed; start a new detection job".to_owned(),
+                )
+            })?
+    };
+    validate_detection_profile(&profile, &config)?;
+    if !crate::api::provider_capabilities_are_fresh(&profile)
+        || !profile
+            .capabilities
+            .as_ref()
+            .is_some_and(|capabilities| capabilities.character_detection)
+    {
+        return Err(ServiceError::Conflict(
+            "the detection provider is no longer ready; refresh it and start a new detection job"
+                .to_owned(),
+        ));
+    }
+    if matches!(profile.mode, ProviderModeView::CloudRemote) && !project.cloud_consent.book_text {
+        return Err(ServiceError::Conflict(
+            "cloud-text consent was revoked; grant consent and start a new detection job"
+                .to_owned(),
+        ));
+    }
+    let current_snapshot_id = state
+        .database
+        .repositories()
+        .providers
+        .get(ProviderProfileId::from_uuid(config.provider_profile_id))
+        .await
+        .map_err(storage_error)?
+        .and_then(|provider| provider.capability_snapshot)
+        .map(|snapshot| snapshot.id.as_uuid());
+    if config.provider_snapshot_id.is_none() || current_snapshot_id != config.provider_snapshot_id {
+        return Err(ServiceError::Conflict(
+            "the detection provider capability or credential snapshot changed; start a new detection job"
+                .to_owned(),
+        ));
+    }
+    let runtime_id = audiobookai_providers::ProviderId::new(config.provider_profile_id.to_string())
+        .map_err(|error| ServiceError::Internal(error.to_string()))?;
+    let runtime = state.providers.character(&runtime_id).await.map_err(|_| {
+        ServiceError::Conflict(
+            "the durable detection provider runtime is unavailable; start a new detection job"
+                .to_owned(),
+        )
+    })?;
+    config
+        .temperature
+        .validate(runtime.capabilities().temperature)
+        .map_err(|_| {
+            ServiceError::Conflict(
+                "the detection provider capabilities changed; start a new detection job".to_owned(),
+            )
+        })?;
+    if runtime.descriptor().id != runtime_id
+        || config
+            .provider_mode
+            .is_none_or(|mode| !detection_runtime_mode_matches(mode, runtime.descriptor().kind))
+    {
+        return Err(ServiceError::Conflict(
+            "the detection provider runtime identity changed; start a new detection job".to_owned(),
+        ));
+    }
+    config
+        .reasoning
+        .validate(runtime.capabilities())
+        .map_err(|_| {
+            ServiceError::Conflict(
+                "the detection provider capabilities changed; start a new detection job".to_owned(),
+            )
+        })?;
+    let current_hashes = selected_paragraphs(state, &project)
+        .await?
+        .into_iter()
+        .map(|paragraph| paragraph.hash)
+        .collect::<Vec<_>>();
+    let run = load_detection_run(state, config.detection_run_id).await?;
+    if run.project_id != job.project_id
+        || run.provider_profile_id.as_uuid() != config.provider_profile_id
+        || run.model != config.model
+        || current_hashes != run.paragraph_hashes
+    {
+        return Err(ServiceError::Conflict(
+            "selected source text or detection routing changed after this job failed; start a new detection job"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 async fn recover_detection_job(state: &AppState, job: &Job) -> Result<bool, ServiceError> {
     let units = detection_units(state, job.id).await?;
     if let Err(error) = consistent_detection_config(&units) {
@@ -752,6 +1039,14 @@ async fn recover_detection_job(state: &AppState, job: &Job) -> Result<bool, Serv
             RecoveryDecision::FailUncertain => {
                 if let Some(attempt) = latest.as_ref() {
                     append_recovered_uncertain_detection_usage(state, job, &unit, attempt).await?;
+                } else {
+                    // Legacy rows can prove that dispatch might have started without retaining an
+                    // attempt/request snapshot. Preserve that unknown as durable state so failure
+                    // handling does not release the reservation as if usage were zero.
+                    unit.payload.insert(
+                        "uncertainUsageUnresolved".to_owned(),
+                        serde_json::json!(true),
+                    );
                 }
                 let detail = "A character-detection request was in flight when the app stopped and may have been charged. Retry this batch explicitly.";
                 mark_detection_unit(state, &mut unit, JobUnitState::Failed, Some(detail)).await?;
@@ -1066,7 +1361,8 @@ async fn sync_detection_job_view(state: &AppState, job: &Job) {
         view.status = match job.state {
             JobState::Queued => JobStatusView::Queued,
             JobState::Running => JobStatusView::Running,
-            JobState::Pausing | JobState::Cancelling => JobStatusView::Pausing,
+            JobState::Pausing => JobStatusView::Pausing,
+            JobState::Cancelling => JobStatusView::Cancelling,
             JobState::Paused => JobStatusView::Paused,
             JobState::Cancelled => JobStatusView::Cancelled,
             JobState::Failed => JobStatusView::Failed,
@@ -1090,7 +1386,7 @@ fn progress_fraction(completed: u64, total: u64) -> f32 {
         .unwrap_or_default()
         .min(SCALE);
     let scaled = u16::try_from(scaled).unwrap_or(10_000);
-    f32::from(scaled) / 10_000.0
+    f32::from(scaled) / 100.0
 }
 
 fn detection_request(
@@ -1221,7 +1517,7 @@ fn detection_unit_view(unit: &JobUnit) -> JobUnitView {
             JobUnitState::Completed => JobUnitStatusView::Complete,
         },
         progress: if unit.state == JobUnitState::Completed {
-            1.0
+            100.0
         } else {
             unit.payload
                 .get("progress")
@@ -1229,6 +1525,7 @@ fn detection_unit_view(unit: &JobUnit) -> JobUnitView {
                 .and_then(|value| serde_json::from_value::<f32>(value).ok())
                 .unwrap_or_default()
                 .clamp(0.0, 1.0)
+                * 100.0
         },
         attempt: u32::from(unit.attempt_count),
         last_error: unit
@@ -1259,7 +1556,7 @@ fn detection_config(unit: &JobUnit) -> Result<DetectionJobConfig, ServiceError> 
     let config: DetectionJobConfig = serde_json::from_value(config).map_err(|error| {
         ServiceError::Conflict(format!("invalid detection job config: {error}"))
     })?;
-    if config.schema_version != DETECTION_JOB_SCHEMA_VERSION {
+    if !matches!(config.schema_version, 2 | 3 | DETECTION_JOB_SCHEMA_VERSION) {
         return Err(ServiceError::Conflict(format!(
             "unsupported detection job schema version {}",
             config.schema_version
@@ -1311,6 +1608,7 @@ fn validate_detection_profile(
     if profile.id != config.provider_profile_id
         || profile.model.as_deref() != Some(config.model.as_str())
         || profile.endpoint != config.provider_endpoint
+        || Some(profile.mode) != config.provider_mode
     {
         return Err(ServiceError::Conflict(
             "the detection provider endpoint or model changed; start a new detection run"
@@ -1328,6 +1626,28 @@ fn validate_detection_profile(
         ));
     }
     Ok(())
+}
+
+fn detection_runtime_mode_matches(
+    mode: ProviderModeView,
+    runtime: audiobookai_providers::ProviderKind,
+) -> bool {
+    matches!(
+        (mode, runtime),
+        (
+            ProviderModeView::CloudRemote,
+            audiobookai_providers::ProviderKind::CloudRemote
+        ) | (
+            ProviderModeView::ExternalEndpoint,
+            audiobookai_providers::ProviderKind::ExternalEndpoint
+        ) | (
+            ProviderModeView::ManagedChild,
+            audiobookai_providers::ProviderKind::ManagedChild
+        ) | (
+            ProviderModeView::Native,
+            audiobookai_providers::ProviderKind::Native
+        )
+    )
 }
 
 async fn detection_units(state: &AppState, job_id: JobId) -> Result<Vec<JobUnit>, ServiceError> {
@@ -1589,6 +1909,7 @@ async fn execute_detection_batch(
             },
         };
         let durable_job_id = unit.job_id;
+        let dispatch_consent_lock = state.dispatch_consent_lifecycle_lock(project_id).await;
         let execution = execute_with_retry(policy, &journal, |attempt| {
             let state = Arc::clone(state);
             let provider = Arc::clone(provider);
@@ -1596,7 +1917,9 @@ async fn execute_detection_batch(
             let config = config.clone();
             let journal = journal.clone();
             let dispatch_estimate = dispatch_estimate.clone();
+            let dispatch_consent_lock = Arc::clone(&dispatch_consent_lock);
             async move {
+                let _dispatch_consent_guard = dispatch_consent_lock.read().await;
                 detection_dispatch_guard(&state, &config, durable_job_id, &dispatch_estimate)
                     .await?;
                 journal
@@ -1676,7 +1999,13 @@ async fn detection_dispatch_guard(
         .ok_or_else(|| ProviderError::Configuration("detection provider was removed".to_owned()))?;
     if profile.model.as_deref() != Some(config.model.as_str())
         || profile.endpoint != config.provider_endpoint
+        || Some(profile.mode) != config.provider_mode
         || !matches!(profile.status, ProviderStatusView::Online)
+        || !crate::api::provider_capabilities_are_fresh(profile)
+        || !profile
+            .capabilities
+            .as_ref()
+            .is_some_and(|capabilities| capabilities.character_detection)
     {
         return Err(ProviderError::Configuration(
             "detection provider configuration changed while the job was active".to_owned(),
@@ -1697,6 +2026,21 @@ async fn detection_dispatch_guard(
         }
     }
     drop(catalog);
+    let current_snapshot_id = state
+        .database
+        .repositories()
+        .providers
+        .get(ProviderProfileId::from_uuid(config.provider_profile_id))
+        .await
+        .map_err(|error| ProviderError::Process(error.to_string()))?
+        .and_then(|provider| provider.capability_snapshot)
+        .map(|snapshot| snapshot.id.as_uuid());
+    if config.provider_snapshot_id.is_none() || current_snapshot_id != config.provider_snapshot_id {
+        return Err(ProviderError::Configuration(
+            "detection provider capability or credential snapshot changed while the job was active"
+                .to_owned(),
+        ));
+    }
     crate::accounting::verify_dispatch_is_reserved(state, job_id, dispatch_estimate)
         .await
         .map_err(|_| {
@@ -2005,7 +2349,7 @@ fn merge_characters(
         .entry("narrator".to_owned())
         .or_insert(("Narrator".to_owned(), Vec::new(), 1.0));
     let now = Utc::now();
-    merged
+    let mut output = merged
         .into_values()
         .map(|(detected_name, detected_aliases, confidence)| {
             let previous = previous_characters.get(&detected_name.to_lowercase());
@@ -2013,6 +2357,11 @@ fn merge_characters(
             Character {
                 id: previous.map_or_else(CharacterId::new, |character| character.id),
                 project_id: ProjectId::from_uuid(project_id),
+                role: if detected_name.eq_ignore_ascii_case("narrator") {
+                    audiobookai_core::CharacterRole::Narrator
+                } else {
+                    audiobookai_core::CharacterRole::Character
+                },
                 canonical_name: previous
                     .filter(|_| preserve_identity)
                     .map_or(detected_name, |character| character.canonical_name.clone()),
@@ -2027,24 +2376,39 @@ fn merge_characters(
                 updated_at: now,
             }
         })
-        .collect()
+        .collect::<Vec<_>>();
+    let mut retained_ids = output
+        .iter()
+        .map(|character| character.id)
+        .collect::<BTreeSet<_>>();
+    for previous in previous_characters.values() {
+        if previous.manually_created && retained_ids.insert(previous.id) {
+            output.push(previous.clone());
+        }
+    }
+    output
 }
 
 async fn load_previous_characters(
     state: &AppState,
     project_id: Uuid,
 ) -> Result<BTreeMap<String, Character>, ServiceError> {
-    let payloads = sqlx::query_scalar::<_, String>(
-        "SELECT payload FROM characters WHERE project_id = ? ORDER BY updated_at DESC",
+    let payloads = sqlx::query_as::<_, (String, String)>(
+        "SELECT role, payload FROM characters WHERE project_id = ? ORDER BY updated_at DESC",
     )
     .bind(project_id.to_string())
     .fetch_all(state.database.pool())
     .await
     .map_err(|error| ServiceError::Storage(error.to_string()))?;
     let mut mapped = BTreeMap::new();
-    for payload in payloads {
-        let character: Character = serde_json::from_str(&payload)
+    for (role, payload) in payloads {
+        let mut character: Character = serde_json::from_str(&payload)
             .map_err(|error| ServiceError::Internal(error.to_string()))?;
+        character.role = if role == "narrator" {
+            audiobookai_core::CharacterRole::Narrator
+        } else {
+            audiobookai_core::CharacterRole::Character
+        };
         for name in std::iter::once(&character.canonical_name).chain(character.aliases.iter()) {
             mapped
                 .entry(name.to_lowercase())
@@ -2102,6 +2466,7 @@ fn character_views(
                 .collect::<Vec<_>>();
             CharacterView {
                 id: character.id.as_uuid(),
+                role: character.role,
                 canonical_name: character.canonical_name.clone(),
                 aliases: character.aliases.clone(),
                 confidence: character.confidence.unwrap_or_default(),
@@ -2225,7 +2590,8 @@ async fn persist_detection_results(
     characters: &[Character],
     result: &CharacterDetectionResult,
     paragraphs: &[DetectionSourceParagraph],
-) -> Result<(), ServiceError> {
+    base_character_revision: u64,
+) -> Result<u64, ServiceError> {
     let mut transaction = state
         .database
         .pool()
@@ -2234,13 +2600,18 @@ async fn persist_detection_results(
         .map_err(|error| ServiceError::Storage(error.to_string()))?;
     for character in characters {
         sqlx::query(
-            "INSERT INTO characters (id, project_id, canonical_name, updated_at, payload) \
-             VALUES (?, ?, ?, ?, ?) \
-             ON CONFLICT(id) DO UPDATE SET canonical_name = excluded.canonical_name, \
-             updated_at = excluded.updated_at, payload = excluded.payload",
+            "INSERT INTO characters (id, project_id, role, canonical_name, updated_at, payload) \
+             VALUES (?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(id) DO UPDATE SET role = excluded.role, \
+             canonical_name = excluded.canonical_name, updated_at = excluded.updated_at, \
+             payload = excluded.payload",
         )
         .bind(character.id.to_string())
         .bind(character.project_id.to_string())
+        .bind(match character.role {
+            audiobookai_core::CharacterRole::Narrator => "narrator",
+            audiobookai_core::CharacterRole::Character => "character",
+        })
         .bind(&character.canonical_name)
         .bind(character.updated_at.to_rfc3339())
         .bind(
@@ -2324,11 +2695,57 @@ async fn persist_detection_results(
         .await
         .map_err(|error| ServiceError::Storage(error.to_string()))?;
     }
+    let (project_revision, stored_character_revision, project_payload) =
+        sqlx::query_as::<_, (i64, i64, String)>(
+            "SELECT revision, character_revision, payload FROM projects WHERE id = ?",
+        )
+        .bind(run.project_id.to_string())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(storage_error)?
+        .ok_or(ServiceError::NotFound)?;
+    if u64::try_from(stored_character_revision).ok() != Some(base_character_revision) {
+        return Err(ServiceError::Conflict(
+            "character review changed while detection was running; start a new detection job"
+                .to_owned(),
+        ));
+    }
+    let mut project: audiobookai_core::Project = serde_json::from_str(&project_payload)
+        .map_err(|error| ServiceError::Internal(error.to_string()))?;
+    project.status = ProjectStatus::NeedsCharacterReview;
+    project.character_reviewed_at = None;
+    project.updated_at = Utc::now();
+    let next_character_revision = base_character_revision.saturating_add(1);
+    let next_project_revision = project_revision.saturating_add(1);
+    let updated = sqlx::query(
+        "UPDATE projects SET status = 'needs_character_review', updated_at = ?, revision = ?, \
+         character_revision = ?, payload = ? WHERE id = ? AND revision = ? \
+         AND character_revision = ?",
+    )
+    .bind(project.updated_at.to_rfc3339())
+    .bind(next_project_revision)
+    .bind(i64::try_from(next_character_revision).unwrap_or(i64::MAX))
+    .bind(
+        serde_json::to_string(&project)
+            .map_err(|error| ServiceError::Internal(error.to_string()))?,
+    )
+    .bind(run.project_id.to_string())
+    .bind(project_revision)
+    .bind(i64::try_from(base_character_revision).unwrap_or(i64::MAX))
+    .execute(&mut *transaction)
+    .await
+    .map_err(|error| ServiceError::Storage(error.to_string()))?;
+    if updated.rows_affected() != 1 {
+        return Err(ServiceError::Conflict(
+            "character review changed while detection was running; start a new detection job"
+                .to_owned(),
+        ));
+    }
     transaction
         .commit()
         .await
         .map_err(|error| ServiceError::Storage(error.to_string()))?;
-    Ok(())
+    Ok(next_character_revision)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2497,29 +2914,6 @@ async fn ensure_detection_usage_row(
     });
 }
 
-async fn update_domain_project(
-    state: &AppState,
-    project: &audiobookai_core::Project,
-) -> Result<(), ServiceError> {
-    let revision = sqlx::query_scalar::<_, i64>("SELECT revision FROM projects WHERE id = ?")
-        .bind(project.id.to_string())
-        .fetch_one(state.database.pool())
-        .await
-        .map_err(|error| ServiceError::Storage(error.to_string()))?;
-    state
-        .database
-        .repositories()
-        .projects
-        .update_project(
-            project,
-            u64::try_from(revision)
-                .map_err(|_| ServiceError::Internal("invalid project revision".to_owned()))?,
-        )
-        .await
-        .map_err(|error| ServiceError::Storage(error.to_string()))?;
-    Ok(())
-}
-
 async fn update_job_progress(
     state: &AppState,
     job_id: Uuid,
@@ -2623,7 +3017,21 @@ async fn fail_job(state: &AppState, job_id: Uuid, detail: &str) {
         "job.failed",
         serde_json::json!({ "jobId": job_id, "detail": detail }),
     );
-    if let Err(error) = crate::accounting::finalize_job_reservation(state, id).await {
+    let retain_unknown_reservation = match detection_units(state, id).await {
+        Ok(units) => units.iter().any(|unit| {
+            unit.payload
+                .get("uncertainUsageUnresolved")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        }),
+        Err(error) => {
+            tracing::warn!(%job_id, %error, "could not verify character-detection usage during failure; reservation retained");
+            true
+        }
+    };
+    if retain_unknown_reservation {
+        tracing::warn!(diagnostic_code = "detection.recovery.usage_unresolved", %job_id, "character-detection usage is unresolved; reservation retained");
+    } else if let Err(error) = crate::accounting::finalize_job_reservation(state, id).await {
         tracing::warn!(%job_id, %error, "could not finalize character-detection budget reservation");
     }
 }
@@ -2640,9 +3048,12 @@ mod tests {
             provider_profile_id: Uuid::new_v4(),
             model: "model".to_owned(),
             provider_endpoint: Some("http://127.0.0.1:1234".to_owned()),
+            provider_mode: Some(ProviderModeView::ExternalEndpoint),
+            provider_snapshot_id: Some(Uuid::new_v4()),
             temperature: Temperature::Default,
             reasoning: ReasoningControl::Inherit,
             detection_run_id: DetectionRunId::new(),
+            base_character_revision: 0,
         }
     }
 
@@ -2706,8 +3117,51 @@ mod tests {
     #[test]
     fn displayed_detection_progress_is_bounded_without_lossy_integer_casts() {
         assert!(progress_fraction(0, 0).abs() < f32::EPSILON);
-        assert!((progress_fraction(1, 2) - 0.5).abs() < f32::EPSILON);
-        assert!((progress_fraction(2, 1) - 1.0).abs() < f32::EPSILON);
+        assert!((progress_fraction(1, 2) - 50.0).abs() < f32::EPSILON);
+        assert!((progress_fraction(2, 1) - 100.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn a_new_detection_run_retains_manual_characters_absent_from_the_model_result() {
+        let project_id = Uuid::new_v4();
+        let manual_id = CharacterId::new();
+        let now = Utc::now();
+        let manual = Character {
+            id: manual_id,
+            project_id: ProjectId::from_uuid(project_id),
+            role: audiobookai_core::CharacterRole::Character,
+            canonical_name: "Archivist".to_owned(),
+            aliases: vec!["The Keeper".to_owned()],
+            description: Some("Manually curated".to_owned()),
+            confidence: Some(1.0),
+            detection_run_id: None,
+            manually_created: true,
+            created_at: now,
+            updated_at: now,
+        };
+        let previous = BTreeMap::from([("archivist".to_owned(), manual)]);
+        let result = CharacterDetectionResult {
+            characters: vec![DetectedCharacter {
+                canonical_name: "Visitor".to_owned(),
+                aliases: Vec::new(),
+                confidence: 0.8,
+            }],
+            dialogue: Vec::new(),
+            usage: ProviderUsage::default(),
+        };
+
+        let merged = merge_characters(&result, &[], project_id, DetectionRunId::new(), &previous);
+
+        let retained = merged
+            .iter()
+            .find(|character| character.id == manual_id)
+            .expect("manual character is retained");
+        assert_eq!(retained.canonical_name, "Archivist");
+        assert!(retained.manually_created);
+        assert!(merged.iter().any(|character| {
+            character.role == audiobookai_core::CharacterRole::Narrator
+                && character.canonical_name == "Narrator"
+        }));
     }
 
     #[test]
@@ -2787,6 +3241,41 @@ mod tests {
                 .is_some()
         );
         assert_eq!(detection_unit_estimate(&unit).expect("estimate"), estimate);
+    }
+
+    #[test]
+    fn detection_retry_profile_rejects_model_endpoint_or_mode_drift() {
+        let config = config();
+        let profile = ProviderProfileView {
+            id: config.provider_profile_id,
+            name: "Detection provider".to_owned(),
+            kind: crate::models::ProviderKindView::OpenaiCompatible,
+            mode: ProviderModeView::ExternalEndpoint,
+            endpoint: config.provider_endpoint.clone(),
+            executable_path: None,
+            working_directory: None,
+            arguments: Vec::new(),
+            status: ProviderStatusView::Online,
+            model: Some(config.model.clone()),
+            credential_configured: true,
+            capabilities: None,
+            capability_source: None,
+            capability_updated_at: Some(Utc::now()),
+            last_error: None,
+        };
+        validate_detection_profile(&profile, &config).expect("matching durable profile");
+
+        let mut changed_model = profile.clone();
+        changed_model.model = Some("different-model".to_owned());
+        assert!(validate_detection_profile(&changed_model, &config).is_err());
+
+        let mut changed_endpoint = profile.clone();
+        changed_endpoint.endpoint = Some("http://127.0.0.1:9999".to_owned());
+        assert!(validate_detection_profile(&changed_endpoint, &config).is_err());
+
+        let mut changed_mode = profile;
+        changed_mode.mode = ProviderModeView::CloudRemote;
+        assert!(validate_detection_profile(&changed_mode, &config).is_err());
     }
 
     #[test]

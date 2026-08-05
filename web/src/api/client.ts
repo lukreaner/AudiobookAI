@@ -4,11 +4,20 @@ import type {
   BookSummary,
   Budget,
   Character,
+  CharacterPage,
+  CharacterMutationResult,
+  CharacterDetectionStatus,
   CharacterDetectionInput,
   CharacterIdentityInput,
   DiagnosticPage,
   DiagnosticQuery,
   DryRunResult,
+  DistributionMetadata,
+  DistributionMetadataView,
+  DistributionPackageView,
+  DistributionPolicyView,
+  DistributionQualityRun,
+  DistributionTarget,
   Estimate,
   ExportArtifact,
   HealthStatus,
@@ -17,6 +26,16 @@ import type {
   LanApiToken,
   PageResponse,
   PreviewResult,
+  ProofingSegmentPage,
+  ProofingSegmentQuery,
+  ProofingSegmentView,
+  ProofingSummary,
+  QualityReport,
+  RegenerationEstimate,
+  SegmentReviewState,
+  SegmentSelectionInput,
+  SegmentTake,
+  SegmentUpdateInput,
   ProjectDetail,
   PronunciationPreviewInput,
   PronunciationPreviewResult,
@@ -33,6 +52,8 @@ import type {
   SecretStatus,
   UsageSummary,
   Voice,
+  VoiceAuditionInput,
+  VoiceAuditionResponse,
   VoiceAssignment,
   VoiceCloneInput,
   SpeakerOverrideInput,
@@ -95,21 +116,24 @@ function csrfToken(): string | undefined {
     ?.split("=")[1];
 }
 
-async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+type RequestOptions = RequestInit & { idempotencyKey?: string };
+
+async function request<T>(path: string, init: RequestOptions = {}): Promise<T> {
   if (!["/api/v1/health", "/api/v1/auth/bootstrap", "/api/v1/auth/login"].includes(path)) await ensureDesktopSession();
   const method = init.method?.toUpperCase() ?? "GET";
   const headers = new Headers(init.headers);
   headers.set("Accept", "application/json");
   if (init.body && !(init.body instanceof FormData)) headers.set("Content-Type", "application/json");
   if (!["GET", "HEAD"].includes(method)) {
-    headers.set("Idempotency-Key", crypto.randomUUID());
+    headers.set("Idempotency-Key", init.idempotencyKey ?? crypto.randomUUID());
     const csrf = csrfToken();
     if (csrf) headers.set("X-CSRF-Token", decodeURIComponent(csrf));
   }
 
   let response: Response;
   try {
-    response = await fetch(`${baseUrl}${path}`, { ...init, headers, credentials: "include" });
+    const { idempotencyKey: _idempotencyKey, ...fetchInit } = init;
+    response = await fetch(`${baseUrl}${path}`, { ...fetchInit, headers, credentials: "include" });
   } catch (cause) {
     throw new ApiError({
       type: "urn:audiobookai:problem:offline",
@@ -145,6 +169,19 @@ function diagnosticQueryString(query: DiagnosticQuery = {}): string {
   if (query.target?.trim()) parameters.set("target", query.target.trim());
   if (query.search?.trim()) parameters.set("search", query.search.trim());
   if (query.after != null) parameters.set("after", String(query.after));
+  if (query.limit != null) parameters.set("limit", String(query.limit));
+  const value = parameters.toString();
+  return value ? `?${value}` : "";
+}
+
+function proofingQueryString(query: ProofingSegmentQuery = {}): string {
+  const parameters = new URLSearchParams();
+  if (query.chapterId) parameters.set("chapterId", query.chapterId);
+  if (query.state) parameters.set("state", query.state);
+  if (query.issuesOnly) parameters.set("issuesOnly", "true");
+  if (query.staleOnly) parameters.set("staleOnly", "true");
+  if (query.search?.trim()) parameters.set("search", query.search.trim());
+  if (query.cursor) parameters.set("cursor", query.cursor);
   if (query.limit != null) parameters.set("limit", String(query.limit));
   const value = parameters.toString();
   return value ? `?${value}` : "";
@@ -195,35 +232,57 @@ export const api = {
       body: json({ chapterIds }),
     }),
   characters: (projectId: string) =>
-    request<PageResponse<Character>>(`/api/v1/projects/${projectId}/characters`),
-  detectCharacters: (projectId: string, input: CharacterDetectionInput) =>
+    request<CharacterPage>(`/api/v1/projects/${projectId}/characters`),
+  characterDetectionStatus: (projectId: string) =>
+    request<CharacterDetectionStatus>(`/api/v1/projects/${projectId}/character-detection`),
+  detectCharacters: (projectId: string, input: CharacterDetectionInput, idempotencyKey?: string) =>
     request<Job>(`/api/v1/projects/${projectId}/character-detection`, {
       method: "POST",
       body: json(input),
+      idempotencyKey,
     }),
-  approveCharacters: (projectId: string) =>
-    request<void>(`/api/v1/projects/${projectId}/character-review`, {
+  approveCharacters: (projectId: string, expectedCharacterRevision: number) =>
+    request<{ reviewStatus: string; characterRevision: number }>(`/api/v1/projects/${projectId}/character-review`, {
       method: "PUT",
-      body: json({ approved: true }),
+      body: json({ approved: true, expectedCharacterRevision }),
     }),
-  assignVoice: (projectId: string, characterId: string, assignment: VoiceAssignment) =>
-    request<Character>(`/api/v1/projects/${projectId}/characters/${characterId}/voice`, {
+  assignVoice: (projectId: string, characterId: string, assignment: VoiceAssignment, expectedCharacterRevision: number) =>
+    request<CharacterMutationResult>(`/api/v1/projects/${projectId}/characters/${characterId}/voice`, {
       method: "PUT",
-      body: json(assignment),
+      body: json({ ...assignment, expectedCharacterRevision }),
     }),
   updateCharacter: (projectId: string, characterId: string, identity: CharacterIdentityInput) =>
-    request<Character>(`/api/v1/projects/${projectId}/characters/${characterId}`, {
+    request<CharacterMutationResult>(`/api/v1/projects/${projectId}/characters/${characterId}`, {
       method: "PATCH",
       body: json(identity),
     }),
-  setSpeakerOverride: (projectId: string, paragraphId: string, input: SpeakerOverrideInput) =>
-    request<void>(`/api/v1/projects/${projectId}/speaker-overrides/${paragraphId}`, {
-      method: "PUT",
-      body: json(input),
+  createCharacter: (projectId: string, identity: CharacterIdentityInput, idempotencyKey?: string) =>
+    request<CharacterMutationResult>(`/api/v1/projects/${projectId}/characters`, {
+      method: "POST",
+      body: json(identity),
+      idempotencyKey,
     }),
-  deleteSpeakerOverride: (projectId: string, paragraphId: string) =>
-    request<void>(`/api/v1/projects/${projectId}/speaker-overrides/${paragraphId}`, {
+  mergeCharacter: (projectId: string, sourceId: string, targetCharacterId: string, expectedCharacterRevision: number, idempotencyKey?: string) =>
+    request<CharacterMutationResult>(`/api/v1/projects/${projectId}/characters/${sourceId}/actions/merge`, {
+      method: "POST",
+      body: json({ targetCharacterId, expectedCharacterRevision }),
+      idempotencyKey,
+    }),
+  deleteCharacter: (projectId: string, characterId: string, expectedCharacterRevision: number, idempotencyKey?: string) =>
+    request<CharacterMutationResult>(`/api/v1/projects/${projectId}/characters/${characterId}/actions/delete`, {
+      method: "POST",
+      body: json({ expectedCharacterRevision }),
+      idempotencyKey,
+    }),
+  setSpeakerOverride: (projectId: string, paragraphId: string, input: SpeakerOverrideInput, expectedCharacterRevision: number) =>
+    request<{ characterRevision: number }>(`/api/v1/projects/${projectId}/speaker-overrides/${paragraphId}`, {
+      method: "PUT",
+      body: json({ ...input, expectedCharacterRevision }),
+    }),
+  deleteSpeakerOverride: (projectId: string, paragraphId: string, startOffset: number, endOffset: number, expectedCharacterRevision: number) =>
+    request<{ characterRevision: number }>(`/api/v1/projects/${projectId}/speaker-overrides/${paragraphId}`, {
       method: "DELETE",
+      body: json({ startOffset, endOffset, expectedCharacterRevision }),
     }),
   voices: (providerProfileId?: string) =>
     request<PageResponse<Voice>>(
@@ -321,6 +380,71 @@ export const api = {
       method: "POST",
       body: json({ text }),
     }),
+  voiceAuditions: (projectId: string, input: VoiceAuditionInput, idempotencyKey?: string) =>
+    request<VoiceAuditionResponse>(`/api/v1/projects/${projectId}/voice-auditions`, {
+      method: "POST",
+      body: json(input),
+      idempotencyKey,
+    }),
+  proofingSummary: (projectId: string) =>
+    request<ProofingSummary>(`/api/v1/projects/${projectId}/proofing`),
+  proofingSegments: (projectId: string, query: ProofingSegmentQuery = {}) =>
+    request<ProofingSegmentPage>(`/api/v1/projects/${projectId}/proofing/segments${proofingQueryString(query)}`),
+  updateProofingSegment: (projectId: string, segmentId: string, input: SegmentUpdateInput) =>
+    request<ProofingSegmentView>(`/api/v1/projects/${projectId}/proofing/segments/${segmentId}`, {
+      method: "PATCH",
+      body: json(input),
+    }),
+  updateProofingReview: (projectId: string, segmentId: string, state: SegmentReviewState, expectedRevision: number) =>
+    request<ProofingSegmentView>(`/api/v1/projects/${projectId}/proofing/segments/${segmentId}/review`, {
+      method: "PUT",
+      body: json({ state, expectedRevision }),
+    }),
+  proofingTakes: (projectId: string, segmentId: string) =>
+    request<SegmentTake[]>(`/api/v1/projects/${projectId}/proofing/segments/${segmentId}/takes`),
+  selectProofingTake: (projectId: string, segmentId: string, input: SegmentSelectionInput) =>
+    request<ProofingSegmentView>(`/api/v1/projects/${projectId}/proofing/segments/${segmentId}/selection`, {
+      method: "PUT",
+      body: json(input),
+    }),
+  proofingRegenerationEstimate: (projectId: string, segmentId: string, expectedSegmentRevision: number) =>
+    request<RegenerationEstimate>(`/api/v1/projects/${projectId}/proofing/segments/${segmentId}/regeneration-estimate`, {
+      method: "POST",
+      body: json({ expectedSegmentRevision }),
+    }),
+  startProofingRegeneration: (projectId: string, segmentId: string, expectedSegmentRevision: number, estimateToken: string, allowBudgetOverride = false) =>
+    request<Job>(`/api/v1/projects/${projectId}/proofing/segments/${segmentId}/regenerations`, {
+      method: "POST",
+      body: json({ expectedSegmentRevision, estimateToken, allowBudgetOverride }),
+    }),
+  startProofingExport: (projectId: string, strictRetailer: boolean, exportSettings: StartJobRequest["export"]) =>
+    request<Job>(`/api/v1/projects/${projectId}/proofing/exports`, {
+      method: "POST",
+      body: json({ strictRetailer, export: exportSettings }),
+    }),
+  distributionPolicies: () =>
+    request<{ items: DistributionPolicyView[] }>("/api/v1/distribution/policies"),
+  distributionMetadata: (projectId: string) =>
+    request<DistributionMetadataView>(`/api/v1/projects/${projectId}/distribution/metadata`),
+  updateDistributionMetadata: (projectId: string, expectedRevision: number, metadata: DistributionMetadata) =>
+    request<DistributionMetadataView>(`/api/v1/projects/${projectId}/distribution/metadata`, {
+      method: "PUT",
+      body: json({ expectedRevision, metadata }),
+    }),
+  distributionPackages: (projectId: string) =>
+    request<{ items: DistributionPackageView[] }>(`/api/v1/projects/${projectId}/distribution/packages`),
+  createDistributionPackage: (projectId: string, target: DistributionTarget, uploadArtifactIds: string[], reviewArtifactIds: string[] = []) =>
+    request<DistributionPackageView>(`/api/v1/projects/${projectId}/distribution/packages`, {
+      method: "POST",
+      body: json({ target, uploadArtifactIds, reviewArtifactIds }),
+    }),
+  distributionReports: (packageId: string) =>
+    request<{ items: QualityReport[] }>(`/api/v1/distribution/packages/${packageId}/reports`),
+  runDistributionQualityControl: (packageId: string) =>
+    request<DistributionQualityRun>(`/api/v1/distribution/packages/${packageId}/reports`, {
+      method: "POST",
+      body: json({}),
+    }),
   startJob: (input: StartJobRequest) =>
     request<Job>("/api/v1/jobs", { method: "POST", body: json(input) }),
   jobs: () => request<PageResponse<Job>>("/api/v1/jobs"),
@@ -367,4 +491,12 @@ export function playbackSocketUrl(jobId: string): string {
   const url = new URL(`/api/v1/jobs/${jobId}/playback`, origin);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
   return url.toString();
+}
+
+export function artifactUrl(artifactId: string): string {
+  return `${baseUrl}/api/v1/artifacts/${artifactId}`;
+}
+
+export function distributionReportHtmlUrl(reportId: string): string {
+  return `${baseUrl}/api/v1/distribution/reports/${reportId}/html`;
 }

@@ -14,6 +14,8 @@ pub struct UsageFilter {
     pub project_id: Option<ProjectId>,
     pub job_id: Option<JobId>,
     pub provider_profile_id: Option<ProviderProfileId>,
+    /// Excludes ledger rows at or before this append-only sequence boundary.
+    pub sequence_after: Option<u64>,
     pub from: Option<DateTime<Utc>>,
     pub until: Option<DateTime<Utc>>,
     pub limit: Option<u32>,
@@ -34,10 +36,10 @@ impl UsageRepository {
         event.validate()?;
         let result = sqlx::query(
             "INSERT INTO usage_ledger \
-             (id, occurred_at, workload, project_id, job_id, attempt_id, provider_id, \
+             (id, occurred_at, workload, project_id, job_id, attempt_id, provider_id, proof_segment_id, \
               characters, audio_milliseconds, input_tokens, output_tokens, provider_credits, \
               cost_micros, currency, uncertain_charge, payload) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(event.id.to_string())
         .bind(event.occurred_at.to_rfc3339())
@@ -46,6 +48,7 @@ impl UsageRepository {
         .bind(event.job_id.map(|id| id.to_string()))
         .bind(event.attempt_id.map(|id| id.to_string()))
         .bind(event.provider_profile_id.to_string())
+        .bind(event.segment_id.map(|id| id.to_string()))
         .bind(unsigned(event.quantities.characters, "characters")?)
         .bind(unsigned(
             event.quantities.audio_milliseconds,
@@ -97,6 +100,11 @@ impl UsageRepository {
             query
                 .push(" AND provider_id = ")
                 .push_bind(provider_id.to_string());
+        }
+        if let Some(sequence) = filter.sequence_after {
+            query
+                .push(" AND sequence > ")
+                .push_bind(i64::try_from(sequence).unwrap_or(i64::MAX));
         }
         if let Some(from) = filter.from {
             query

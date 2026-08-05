@@ -8,6 +8,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use audiobookai_core::PerformanceSettings;
+
 use crate::{MediaError, Result};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -21,6 +23,8 @@ pub struct CacheFingerprint {
     pub model: Option<String>,
     pub voice: String,
     pub reference_audio_hashes: Vec<String>,
+    #[serde(default, skip_serializing_if = "PerformanceSettings::is_empty")]
+    pub performance: PerformanceSettings,
     pub settings: BTreeMap<String, serde_json::Value>,
     pub dictionary_revision: String,
     pub normalization_version: String,
@@ -266,6 +270,7 @@ mod tests {
             model: Some("kokoro".to_owned()),
             voice: "af_sky".to_owned(),
             reference_audio_hashes: Vec::new(),
+            performance: PerformanceSettings::default(),
             settings: BTreeMap::new(),
             dictionary_revision: "d1".to_owned(),
             normalization_version: "n1".to_owned(),
@@ -282,6 +287,17 @@ mod tests {
             fingerprint("one").key().unwrap(),
             fingerprint("two").key().unwrap()
         );
+    }
+
+    #[test]
+    fn fingerprint_tracks_performance_but_omits_default_controls() {
+        let default = fingerprint("one");
+        let serialized = serde_json::to_value(&default).unwrap();
+        assert!(serialized.get("performance").is_none());
+
+        let mut faster = fingerprint("one");
+        faster.performance.speed = Some(1.1);
+        assert_ne!(default.key().unwrap(), faster.key().unwrap());
     }
 
     #[test]

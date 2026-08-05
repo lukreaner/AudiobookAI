@@ -140,7 +140,8 @@ impl ReqwestTransport {
 #[async_trait]
 impl HttpTransport for ReqwestTransport {
     async fn execute(&self, request: HttpRequest) -> Result<HttpResponse> {
-        let method = match request.method {
+        let request_method = request.method;
+        let method = match request_method {
             HttpMethod::Get => reqwest::Method::GET,
             HttpMethod::Post => reqwest::Method::POST,
             HttpMethod::Put => reqwest::Method::PUT,
@@ -169,9 +170,10 @@ impl HttpTransport for ReqwestTransport {
                     .map(|value| (name.as_str().to_owned(), value.to_owned()))
             })
             .collect();
-        let body = response.bytes().await.map_err(|_| {
-            ProviderError::Transport("provider response could not be read".to_owned())
-        })?;
+        let body = response
+            .bytes()
+            .await
+            .map_err(|_| response_body_read_error(request_method, status))?;
         Ok(HttpResponse {
             status,
             headers,
@@ -210,9 +212,10 @@ impl HttpTransport for ReqwestTransport {
             })
             .collect();
         if !(200..300).contains(&status) {
-            let body = response.bytes().await.map_err(|_| {
-                ProviderError::Transport("provider response could not be read".to_owned())
-            })?;
+            let body = response
+                .bytes()
+                .await
+                .map_err(|_| ProviderError::from_status(status, &[]))?;
             return Err(ProviderError::from_status(status, &body));
         }
         let body = response.bytes_stream().map(|chunk| {
@@ -236,6 +239,19 @@ fn safe_request_error(error: &reqwest::Error) -> ProviderError {
     } else {
         ProviderError::Transport("provider request failed".to_owned())
     }
+}
+
+fn response_body_read_error(method: HttpMethod, status: u16) -> ProviderError {
+    if !(200..300).contains(&status) {
+        return ProviderError::from_status(status, &[]);
+    }
+    if !matches!(method, HttpMethod::Get) {
+        // The provider accepted a potentially billable or otherwise state-changing request, but
+        // its successful response could not be consumed. Retrying would risk repeating the side
+        // effect, so surface the same fail-closed classification as an after-dispatch timeout.
+        return ProviderError::UncertainCharge;
+    }
+    ProviderError::Transport("provider response could not be read".to_owned())
 }
 
 #[cfg(test)]
@@ -270,5 +286,21 @@ mod tests {
         let debug = format!("{response:?}");
         assert!(!debug.contains(&response_header));
         assert!(!debug.contains(&response_body));
+    }
+
+    #[test]
+    fn successful_mutating_response_interruption_is_an_uncertain_charge() {
+        assert!(matches!(
+            response_body_read_error(HttpMethod::Post, 200),
+            ProviderError::UncertainCharge
+        ));
+        assert!(matches!(
+            response_body_read_error(HttpMethod::Get, 200),
+            ProviderError::Transport(_)
+        ));
+        assert!(matches!(
+            response_body_read_error(HttpMethod::Post, 429),
+            ProviderError::RateLimited { .. }
+        ));
     }
 }

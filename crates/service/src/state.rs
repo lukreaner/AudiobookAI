@@ -91,12 +91,36 @@ pub struct AppState {
     pub mlx: crate::mlx_management::MlxManager,
     /// Serializes model deletion with every operation that can create a new model reference.
     pub model_lifecycle: Arc<Mutex<()>>,
+    /// Serializes character-review and detection lifecycle changes per project. The database is
+    /// process-exclusive; this closes the remaining in-process check-then-write race.
+    character_lifecycle: Arc<Mutex<HashMap<Uuid, Arc<Mutex<()>>>>>,
+    /// Allows concurrent paid provider calls while serializing project consent changes against
+    /// their final validation-and-dispatch boundary.
+    dispatch_consent_lifecycle: Arc<Mutex<HashMap<Uuid, Arc<RwLock<()>>>>>,
     /// Read guards admit work that must be visible to the shutdown checkpoint. Shutdown takes the
     /// write guard once, then permanently closes admission before it snapshots durable jobs.
     shutdown_admission: Arc<RwLock<bool>>,
 }
 
 impl AppState {
+    pub async fn character_lifecycle_lock(&self, project_id: Uuid) -> Arc<Mutex<()>> {
+        self.character_lifecycle
+            .lock()
+            .await
+            .entry(project_id)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    pub async fn dispatch_consent_lifecycle_lock(&self, project_id: Uuid) -> Arc<RwLock<()>> {
+        self.dispatch_consent_lifecycle
+            .lock()
+            .await
+            .entry(project_id)
+            .or_insert_with(|| Arc::new(RwLock::new(())))
+            .clone()
+    }
+
     /// Builds application state from the persisted database and initializes provider runtimes.
     ///
     /// # Errors
@@ -154,6 +178,8 @@ impl AppState {
             provider_models,
             mlx,
             model_lifecycle: Arc::new(Mutex::new(())),
+            character_lifecycle: Arc::new(Mutex::new(HashMap::new())),
+            dispatch_consent_lifecycle: Arc::new(Mutex::new(HashMap::new())),
             shutdown_admission: Arc::new(RwLock::new(false)),
             config,
             events,
@@ -296,6 +322,11 @@ fn runtime_profile_from_view(
         ProviderModeView::Native => ProviderKind::Native,
     };
     let mut runtime = RuntimeProfile::new(runtime_id, profile.name.clone(), adapter, mode);
+    runtime.model_performance = profile
+        .capabilities
+        .as_ref()
+        .map(|capabilities| capabilities.model_performance.clone())
+        .unwrap_or_default();
     runtime.endpoint = profile
         .endpoint
         .as_deref()
@@ -605,6 +636,9 @@ async fn hydrate_providers(
                     .map(|value| reasoning_names(&value.reasoning))
                     .unwrap_or_default(),
                 max_concurrency: values.recommended_concurrency,
+                model_performance: tts
+                    .map(|value| value.model_performance.clone())
+                    .unwrap_or_default(),
             }
         });
         if let Some(secret_id) = profile.credential_secret_id {
@@ -656,6 +690,7 @@ fn reasoning_names(capability: &audiobookai_core::ReasoningCapability) -> Vec<St
     names
 }
 
+#[allow(clippy::too_many_lines)]
 async fn hydrate_projects(
     database: &Database,
     catalog: &mut Catalog,
@@ -667,6 +702,15 @@ async fn hydrate_projects(
         .await
         .map_err(|error| crate::ServiceError::Storage(error.to_string()))?;
     for project in projects {
+        let character_revision =
+            sqlx::query_scalar::<_, i64>("SELECT character_revision FROM projects WHERE id = ?")
+                .bind(project.id.to_string())
+                .fetch_one(database.pool())
+                .await
+                .map_err(storage_error)?;
+        let character_revision = u64::try_from(character_revision).map_err(|_| {
+            crate::ServiceError::Internal("stored character revision is invalid".to_owned())
+        })?;
         let Some(book) = repositories
             .projects
             .get_book(project.book_id)
@@ -750,6 +794,7 @@ async fn hydrate_projects(
                 } else {
                     crate::models::ReviewStatus::NotStarted
                 },
+                character_revision,
                 output_name: Some(project.settings.output_name_template.clone()),
             },
         );
@@ -841,7 +886,7 @@ async fn hydrate_characters(
     }
 
     let character_rows = sqlx::query(
-        "SELECT id, project_id, canonical_name, payload FROM characters \
+        "SELECT id, project_id, role, canonical_name, payload FROM characters \
          ORDER BY project_id, canonical_name, id",
     )
     .fetch_all(database.pool())
@@ -865,6 +910,14 @@ async fn hydrate_characters(
         let Some(mut character) = decode_optional::<Character>(&payload, "character", &row_id)
         else {
             continue;
+        };
+        character.role = match row.get::<String, _>("role").as_str() {
+            "narrator" => audiobookai_core::CharacterRole::Narrator,
+            "character" => audiobookai_core::CharacterRole::Character,
+            _ => {
+                warn_skipped("character", &row_id, "unknown relational character role");
+                continue;
+            }
         };
         if character.id.as_uuid() != character_id
             || character.project_id.as_uuid() != project_id
@@ -900,6 +953,7 @@ async fn hydrate_characters(
             .or_default()
             .push(CharacterView {
                 id: character_id,
+                role: character.role,
                 canonical_name: character.canonical_name,
                 aliases: character.aliases,
                 confidence: character.confidence.unwrap_or_default(),
@@ -1322,7 +1376,14 @@ async fn hydrate_voices(
             continue;
         }
         let target_id = match &assignment.speaker {
-            Speaker::Narrator => active_character_by_name(catalog, project_id, "narrator"),
+            Speaker::Narrator => catalog.characters.get(&project_id).and_then(|characters| {
+                characters
+                    .iter()
+                    .find(|character| {
+                        matches!(character.role, audiobookai_core::CharacterRole::Narrator)
+                    })
+                    .map(|character| character.id)
+            }),
             Speaker::Character(character_id) => catalog
                 .characters
                 .get(&project_id)
@@ -1362,6 +1423,8 @@ async fn hydrate_voices(
                 voice_id,
                 voice_name: voice.name.clone(),
                 model: assignment.model.clone().or_else(|| profile.model.clone()),
+                performance: assignment.performance.clone(),
+                timing: assignment.timing.clone(),
             });
         }
     }
@@ -1569,7 +1632,8 @@ async fn hydrate_jobs(
     catalog: &mut Catalog,
 ) -> Result<(), crate::ServiceError> {
     use crate::models::{
-        JobStageView, JobStatusView, JobUnitStatusView, JobUnitView, ProjectDisplayStatus,
+        JobKindView, JobStageView, JobStatusView, JobUnitStatusView, JobUnitView,
+        ProjectDisplayStatus,
     };
     use audiobookai_core::{
         Job, JobAttempt, JobState, JobUnit, JobUnitKind, JobUnitState, Validate,
@@ -1745,6 +1809,7 @@ async fn hydrate_jobs(
                         JobUnitKind::MusicMix => JobStageView::Mix,
                         JobUnitKind::Normalization => JobStageView::Normalize,
                         JobUnitKind::FinalExport => JobStageView::Export,
+                        JobUnitKind::QualityControl => JobStageView::QualityControl,
                     },
                     status: match unit.state {
                         JobUnitState::Blocked | JobUnitState::Ready | JobUnitState::Retrying => {
@@ -1757,7 +1822,7 @@ async fn hydrate_jobs(
                         JobUnitState::Completed => JobUnitStatusView::Complete,
                     },
                     progress: if unit.state == JobUnitState::Completed {
-                        1.0
+                        100.0
                     } else {
                         unit.payload
                             .get("progress")
@@ -1765,6 +1830,7 @@ async fn hydrate_jobs(
                             .and_then(|value| value.to_string().parse::<f32>().ok())
                             .unwrap_or_default()
                             .clamp(0.0, 1.0)
+                            * 100.0
                     },
                     attempt: u32::from(unit.attempt_count),
                     last_error: unit
@@ -1795,16 +1861,17 @@ async fn hydrate_jobs(
         let status = match job.state {
             JobState::Queued => JobStatusView::Queued,
             JobState::Running => JobStatusView::Running,
-            JobState::Pausing | JobState::Cancelling => JobStatusView::Pausing,
+            JobState::Pausing => JobStatusView::Pausing,
+            JobState::Cancelling => JobStatusView::Cancelling,
             JobState::Paused => JobStatusView::Paused,
             JobState::Cancelled => JobStatusView::Cancelled,
             JobState::Failed => JobStatusView::Failed,
             JobState::Completed => JobStatusView::Complete,
         };
         let progress = if job.state == JobState::Completed {
-            1.0
+            100.0
         } else {
-            domain_progress.max(unit_progress)
+            domain_progress.max(unit_progress) * 100.0
         };
         let current_stage = job.status_message.clone().or_else(|| {
             units
@@ -1826,6 +1893,19 @@ async fn hydrate_jobs(
                 id,
                 project_id,
                 project_title: project.summary.title.clone(),
+                kind: match job.kind {
+                    audiobookai_core::JobKind::CharacterDetection => {
+                        JobKindView::CharacterDetection
+                    }
+                    audiobookai_core::JobKind::Preview => JobKindView::Preview,
+                    audiobookai_core::JobKind::Conversion => JobKindView::Conversion,
+                    audiobookai_core::JobKind::SegmentRegeneration => {
+                        JobKindView::SegmentRegeneration
+                    }
+                    audiobookai_core::JobKind::Export => JobKindView::Export,
+                    audiobookai_core::JobKind::QualityControl => JobKindView::QualityControl,
+                    audiobookai_core::JobKind::CacheCleanup => JobKindView::CacheCleanup,
+                },
                 status,
                 progress,
                 current_stage,
@@ -1857,7 +1937,8 @@ async fn hydrate_jobs(
             JobStatusView::Queued
             | JobStatusView::Running
             | JobStatusView::Pausing
-            | JobStatusView::Paused => ProjectDisplayStatus::Processing,
+            | JobStatusView::Paused
+            | JobStatusView::Cancelling => ProjectDisplayStatus::Processing,
             JobStatusView::Complete => ProjectDisplayStatus::Completed,
             JobStatusView::Failed => ProjectDisplayStatus::Failed,
             JobStatusView::Cancelled => project.summary.status,
@@ -2055,6 +2136,7 @@ fn job_unit_title(unit: &audiobookai_core::JobUnit, catalog: &Catalog) -> String
         JobUnitKind::MusicMix => "Mix background music".to_owned(),
         JobUnitKind::Normalization => "Normalize audio".to_owned(),
         JobUnitKind::FinalExport => "Export audiobook".to_owned(),
+        JobUnitKind::QualityControl => "Quality control".to_owned(),
     }
 }
 
@@ -2204,6 +2286,7 @@ fn native_provider() -> ProviderProfileView {
             temperature: "unsupported".to_owned(),
             reasoning: Vec::new(),
             max_concurrency: Some(1),
+            model_performance: Vec::new(),
         }),
         capability_source: Some("native_runtime".to_owned()),
         capability_updated_at: Some(Utc::now()),
@@ -2458,11 +2541,15 @@ mod tests {
 
     async fn insert_character(database: &Database, character: &Character) {
         sqlx::query(
-            "INSERT INTO characters (id, project_id, canonical_name, updated_at, payload) \
-             VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO characters (id, project_id, role, canonical_name, updated_at, payload) \
+             VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(character.id.to_string())
         .bind(character.project_id.to_string())
+        .bind(match character.role {
+            audiobookai_core::CharacterRole::Narrator => "narrator",
+            audiobookai_core::CharacterRole::Character => "character",
+        })
         .bind(&character.canonical_name)
         .bind(character.updated_at.to_rfc3339())
         .bind(serde_json::to_string(character).expect("serialize character"))
@@ -2519,6 +2606,7 @@ mod tests {
         let old_character = Character {
             id: CharacterId::new(),
             project_id: ids.project,
+            role: audiobookai_core::CharacterRole::Character,
             canonical_name: "Alice".to_owned(),
             aliases: Vec::new(),
             description: None,
@@ -2531,6 +2619,7 @@ mod tests {
         let alice = Character {
             id: CharacterId::new(),
             project_id: ids.project,
+            role: audiobookai_core::CharacterRole::Character,
             canonical_name: "Alice".to_owned(),
             aliases: vec!["Al".to_owned()],
             description: None,
@@ -2543,6 +2632,7 @@ mod tests {
         let narrator = Character {
             id: CharacterId::new(),
             project_id: ids.project,
+            role: audiobookai_core::CharacterRole::Narrator,
             canonical_name: "Narrator".to_owned(),
             aliases: Vec::new(),
             description: None,
@@ -2678,6 +2768,8 @@ mod tests {
             voice_profile_id: voice_profile.id,
             provider_profile_id: ids.provider,
             model: Some("tts-model".to_owned()),
+            performance: audiobookai_core::PerformanceSettings::default(),
+            timing: audiobookai_core::TimingSettings::default(),
             settings: BTreeMap::new(),
             created_at: now,
             updated_at: now,
@@ -2910,7 +3002,7 @@ mod tests {
             restored_job.status,
             crate::models::JobStatusView::Running
         ));
-        assert!((restored_job.progress - 0.5).abs() < f32::EPSILON);
+        assert!((restored_job.progress - 50.0).abs() < f32::EPSILON);
         assert!(restored_job.uncertain_charge);
         assert_eq!(
             restored_job.units[0].last_error.as_deref(),
@@ -2948,6 +3040,7 @@ mod tests {
         let old_character = Character {
             id: CharacterId::new(),
             project_id: ids.project,
+            role: audiobookai_core::CharacterRole::Character,
             canonical_name: "Stale".to_owned(),
             aliases: Vec::new(),
             description: None,

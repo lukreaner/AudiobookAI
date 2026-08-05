@@ -14,6 +14,7 @@ import {
   LoaderCircle,
   MessageSquareQuote,
   Mic2,
+  PackageCheck,
   Pencil,
   Play,
   Plus,
@@ -29,22 +30,34 @@ import {
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { api } from "../api/client";
+import { ApiError, api, jobEventsUrl } from "../api/client";
 import type { Character, CharacterDetectionInput, DetectionReasoning, DetectionTemperature, DialogueEvidence, ExportFormat, PronunciationRule, ProviderProfile, Voice, VoiceAssignment } from "../api/types";
 import { ErrorState, EmptyState, LoadingState } from "../components/StateViews";
 import { Badge, Button, Card, Dialog, Field, Input, PageHeading, ProgressBar, Select, Stat, SwitchField, Textarea } from "../components/ui";
 import { DEFAULT_EXPORT_SETTINGS, requiresMusicOwnership, toJobExportSettings, type ExportFormState } from "../features/exportSettings";
 import { formatBytes, formatCount, formatDuration, formatMoney } from "../lib/format";
 import { AUTO_SPEAKER, NARRATOR_SPEAKER, paragraphIdFor, parseAliases, speakerOverrideInput, storedSpeakerSelection } from "../features/characterReview";
+import { DistributionPanel } from "../features/DistributionPanel";
+import { ProofingWorkbench } from "../features/ProofingWorkbench";
+import { VoiceAuditionPanel } from "../features/VoiceAuditionPanel";
 
-type ProjectTab = "chapters" | "characters" | "pronunciation" | "preflight";
+type ProjectTab = "chapters" | "characters" | "auditions" | "pronunciation" | "preflight" | "proofing" | "distribution";
 
 const tabs: { id: ProjectTab; label: string; icon: typeof BookOpen }[] = [
   { id: "chapters", label: "project.chapters", icon: BookOpen },
   { id: "characters", label: "project.characters", icon: UserRound },
+  { id: "auditions", label: "project.auditions", icon: Headphones },
   { id: "pronunciation", label: "project.pronunciation", icon: Volume2 },
   { id: "preflight", label: "project.preflight", icon: Gauge },
+  { id: "proofing", label: "project.proofing", icon: ShieldCheck },
+  { id: "distribution", label: "project.distribution", icon: PackageCheck },
 ];
+
+function retryIdempotencyKey(error: unknown, previous?: string): string {
+  return error instanceof ApiError && error.problem.status === 0 && previous
+    ? previous
+    : crypto.randomUUID();
+}
 
 export function ProjectPage({ tab }: { tab: ProjectTab }) {
   const { id = "" } = useParams();
@@ -69,15 +82,18 @@ export function ProjectPage({ tab }: { tab: ProjectTab }) {
       <nav className="project-tabs" aria-label={project.data.title}>
         {tabs.map((item) => {
           const Icon = item.icon;
-          return <Link key={item.id} className={clsx("project-tab", tab === item.id && "active")} to={`/projects/${id}/${item.id}`}><Icon size={16} />{t(item.label)}</Link>;
+          return <Link key={item.id} className={clsx("project-tab", tab === item.id && "active")} aria-current={tab === item.id ? "page" : undefined} to={`/projects/${id}/${item.id}`}><Icon size={16} />{t(item.label)}</Link>;
         })}
       </nav>
 
       <div className="project-tab-content">
         {tab === "chapters" ? <ChaptersPanel projectId={id} /> : null}
         {tab === "characters" ? <CharactersPanel projectId={id} reviewStatus={project.data.characterReviewStatus} consentCloudAudio={project.data.consentCloudAudio} /> : null}
+        {tab === "auditions" ? <VoiceAuditionPanel projectId={id} /> : null}
         {tab === "pronunciation" ? <PronunciationPanel projectId={id} defaultLanguage={project.data.language ?? ""} /> : null}
         {tab === "preflight" ? <PreflightPanel projectId={id} /> : null}
+        {tab === "proofing" ? <ProofingWorkbench projectId={id} /> : null}
+        {tab === "distribution" ? <DistributionPanel projectId={id} /> : null}
       </div>
     </div>
   );
@@ -131,6 +147,7 @@ export function characterDetectionInput(
   reasoningMode: DetectionReasoning["mode"],
   reasoningEffort: "minimal" | "low" | "medium" | "high",
   reasoningTokens: number,
+  expectedCharacterRevision: number,
 ): CharacterDetectionInput {
   const temperature: DetectionTemperature = temperatureMode === "value"
     ? { mode: "value", value: temperatureValue }
@@ -139,13 +156,18 @@ export function characterDetectionInput(
   if (reasoningMode === "effort") reasoning = { mode: "effort", effort: reasoningEffort };
   else if (reasoningMode === "token_budget") reasoning = { mode: "token_budget", tokens: reasoningTokens };
   else reasoning = { mode: reasoningMode };
-  return { providerProfileId, temperature, reasoning };
+  return { providerProfileId, temperature, reasoning, expectedCharacterRevision };
 }
 
 function CharactersPanel({ projectId, reviewStatus, consentCloudAudio }: { projectId: string; reviewStatus: string; consentCloudAudio: boolean }) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const characters = useQuery({ queryKey: ["characters", projectId], queryFn: () => api.characters(projectId) });
+  const detectionStatus = useQuery({
+    queryKey: ["character-detection", projectId],
+    queryFn: () => api.characterDetectionStatus(projectId),
+    refetchInterval: (query) => query.state.data?.activeJob ? 3_000 : false,
+  });
   const providers = useQuery({ queryKey: ["providers"], queryFn: api.providers });
   const voices = useQuery({ queryKey: ["voices"], queryFn: () => api.voices() });
   const aiProviders = providers.data?.items.filter((provider) => provider.capabilities?.characterDetection) ?? [];
@@ -161,33 +183,66 @@ function CharactersPanel({ projectId, reviewStatus, consentCloudAudio }: { proje
   const [identityAliases, setIdentityAliases] = useState("");
   const [voiceProvider, setVoiceProvider] = useState("");
   const [voiceId, setVoiceId] = useState("");
-  const [speakerSelections, setSpeakerSelections] = useState<Record<string, string>>({});
+  const [speakerSelections, setSpeakerSelections] = useState<Record<string, { selection: string; characterRevision: number }>>({});
   const [voiceLibraryOpen, setVoiceLibraryOpen] = useState(false);
+  const [addingCharacter, setAddingCharacter] = useState(false);
+  const [newCharacterName, setNewCharacterName] = useState("");
+  const [newCharacterAliases, setNewCharacterAliases] = useState("");
+  const [mergingCharacter, setMergingCharacter] = useState<Character>();
+  const [mergeTargetId, setMergeTargetId] = useState("");
+  const [mergeConfirmed, setMergeConfirmed] = useState(false);
+  const [deletingCharacter, setDeletingCharacter] = useState<Character>();
+  const [deleteCharacterConfirmed, setDeleteCharacterConfirmed] = useState(false);
+  const characterRevision = characters.data?.characterRevision ?? 0;
+  const activeDetection = detectionStatus.data?.activeJob;
+  const latestDetection = detectionStatus.data?.latestJob;
   const detection = useMutation({
-    mutationFn: () => api.detectCharacters(projectId, characterDetectionInput(
+    mutationFn: (idempotencyKey: string) => api.detectCharacters(projectId, characterDetectionInput(
       detectionProvider,
       temperatureMode,
       temperatureValue,
       reasoningMode,
       reasoningEffort,
       reasoningTokens,
-    )),
-    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["characters", projectId] }),
+      characterRevision,
+    ), idempotencyKey),
+    onSuccess: async (job) => {
+      queryClient.setQueryData(["character-detection", projectId], { activeJob: job, latestJob: job });
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["jobs"] }),
+        queryClient.invalidateQueries({ queryKey: ["project", projectId] }),
+        queryClient.invalidateQueries({ queryKey: ["characters", projectId] }),
+      ]);
+    },
   });
-  const approve = useMutation({ mutationFn: () => api.approveCharacters(projectId), onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["project", projectId] }) });
+  const approve = useMutation({ mutationFn: () => api.approveCharacters(projectId, characterRevision), onSuccess: async () => { await Promise.all([queryClient.invalidateQueries({ queryKey: ["project", projectId] }), queryClient.invalidateQueries({ queryKey: ["characters", projectId] })]); } });
   const assignment = useMutation({
     mutationFn: async () => {
       const provider = providers.data?.items.find((item) => item.id === voiceProvider);
       const voice = voices.data?.items.find((item) => item.id === voiceId);
-      if (!assigning || !provider || !voice) throw new Error("Missing voice selection");
-      const value: VoiceAssignment = { providerProfileId: provider.id, providerName: provider.name, voiceId: voice.id, voiceName: voice.name, model: provider.model };
-      return api.assignVoice(projectId, assigning.id, value);
+      if (!assigning || !provider || !voice) throw new Error(t("characters.missingVoiceSelection"));
+      const value: VoiceAssignment = {
+        providerProfileId: provider.id,
+        providerName: provider.name,
+        voiceId: voice.id,
+        voiceName: voice.name,
+        model: provider.model,
+        performance: assigning.voiceAssignment?.performance ?? {},
+        timing: assigning.voiceAssignment?.timing ?? {},
+      };
+      return api.assignVoice(projectId, assigning.id, value, characterRevision);
     },
-    onSuccess: async () => { await queryClient.invalidateQueries({ queryKey: ["characters", projectId] }); setAssigning(undefined); },
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["characters", projectId] }),
+        queryClient.invalidateQueries({ queryKey: ["project", projectId] }),
+      ]);
+      setAssigning(undefined);
+    },
   });
   const identity = useMutation({
     mutationFn: ({ characterId, name, aliases }: { characterId: string; name: string; aliases: string[] }) =>
-      api.updateCharacter(projectId, characterId, { name, aliases }),
+      api.updateCharacter(projectId, characterId, { canonicalName: name, aliases, expectedCharacterRevision: characterRevision }),
     onSuccess: async () => {
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ["characters", projectId] }),
@@ -199,25 +254,91 @@ function CharactersPanel({ projectId, reviewStatus, consentCloudAudio }: { proje
   const speakerOverride = useMutation({
     mutationFn: ({ evidence, selection }: { evidence: DialogueEvidence; selection: string }) =>
       selection === AUTO_SPEAKER
-        ? api.deleteSpeakerOverride(projectId, paragraphIdFor(evidence))
-        : api.setSpeakerOverride(projectId, paragraphIdFor(evidence), speakerOverrideInput(evidence, selection)),
-    onSuccess: async (_data, variables) => {
-      const paragraphId = paragraphIdFor(variables.evidence);
-      setSpeakerSelections((current) => ({ ...current, [paragraphId]: variables.selection }));
+        ? api.deleteSpeakerOverride(projectId, paragraphIdFor(evidence), evidence.startOffset, evidence.endOffset, characterRevision)
+        : api.setSpeakerOverride(projectId, paragraphIdFor(evidence), speakerOverrideInput(evidence, selection), characterRevision),
+    onSuccess: async (data, variables) => {
+      const evidenceKey = `${paragraphIdFor(variables.evidence)}:${variables.evidence.startOffset}:${variables.evidence.endOffset}`;
+      setSpeakerSelections((current) => ({
+        ...current,
+        [evidenceKey]: { selection: variables.selection, characterRevision: data.characterRevision },
+      }));
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ["characters", projectId] }),
         queryClient.invalidateQueries({ queryKey: ["project", projectId] }),
       ]);
     },
   });
+  const createIdentity = useMutation({
+    mutationFn: (idempotencyKey: string) => api.createCharacter(projectId, {
+      canonicalName: newCharacterName.trim(),
+      aliases: parseAliases(newCharacterAliases, newCharacterName),
+      expectedCharacterRevision: characterRevision,
+    }, idempotencyKey),
+    onSuccess: async () => {
+      await Promise.all([queryClient.invalidateQueries({ queryKey: ["characters", projectId] }), queryClient.invalidateQueries({ queryKey: ["project", projectId] })]);
+      setAddingCharacter(false); setNewCharacterName(""); setNewCharacterAliases("");
+    },
+  });
+  const mergeIdentity = useMutation({
+    mutationFn: (idempotencyKey: string) => {
+      if (!mergingCharacter || !mergeTargetId) throw new Error(t("characters.missingMergeTarget"));
+      return api.mergeCharacter(projectId, mergingCharacter.id, mergeTargetId, characterRevision, idempotencyKey);
+    },
+    onSuccess: async () => {
+      await Promise.all([queryClient.invalidateQueries({ queryKey: ["characters", projectId] }), queryClient.invalidateQueries({ queryKey: ["project", projectId] }), queryClient.invalidateQueries({ queryKey: ["pronunciation-rules"] })]);
+      setMergingCharacter(undefined); setMergeTargetId(""); setMergeConfirmed(false);
+    },
+  });
+  const deleteIdentity = useMutation({
+    mutationFn: (idempotencyKey: string) => {
+      if (!deletingCharacter) throw new Error(t("characters.missingCharacter"));
+      return api.deleteCharacter(projectId, deletingCharacter.id, characterRevision, idempotencyKey);
+    },
+    onSuccess: async () => {
+      await Promise.all([queryClient.invalidateQueries({ queryKey: ["characters", projectId] }), queryClient.invalidateQueries({ queryKey: ["project", projectId] })]);
+      setDeletingCharacter(undefined); setDeleteCharacterConfirmed(false);
+    },
+  });
+  const detectionAction = useMutation({
+    mutationFn: (action: "pause" | "resume" | "cancel" | "retry") => {
+      const job = detectionStatus.data?.activeJob ?? detectionStatus.data?.latestJob;
+      if (!job) throw new Error(t("characters.missingDetectionJob"));
+      return api.jobAction(job.id, action);
+    },
+    onSuccess: async (job) => {
+      queryClient.setQueryData(["job", job.id], job);
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["character-detection", projectId] }),
+        queryClient.invalidateQueries({ queryKey: ["jobs"] }),
+      ]);
+    },
+  });
+  useEffect(() => {
+    if (!activeDetection || typeof EventSource === "undefined") return;
+    const source = new EventSource(jobEventsUrl(activeDetection.id), { withCredentials: true });
+    const refresh = () => {
+      void queryClient.invalidateQueries({ queryKey: ["character-detection", projectId] });
+      void queryClient.invalidateQueries({ queryKey: ["job", activeDetection.id] });
+    };
+    const terminal = () => {
+      refresh();
+      void queryClient.invalidateQueries({ queryKey: ["characters", projectId] });
+      void queryClient.invalidateQueries({ queryKey: ["project", projectId] });
+      void queryClient.invalidateQueries({ queryKey: ["jobs"] });
+    };
+    for (const eventType of ["job.queued", "job.updated", "job.progress", "job.unit.updated"]) source.addEventListener(eventType, refresh);
+    for (const eventType of ["job.completed", "job.failed", "job.cancelled", "character-detection.completed"]) source.addEventListener(eventType, terminal);
+    return () => source.close();
+  }, [activeDetection?.id, projectId, queryClient]);
   const filteredVoices = voices.data?.items.filter((voice) => !voiceProvider || voice.providerProfileId === voiceProvider) ?? [];
   const cloneProviders = providers.data?.items.filter((provider) => provider.capabilities?.voiceCloning) ?? [];
   const selectedDetectionProvider = aiProviders.find((provider) => provider.id === detectionProvider);
+  const characterMutationPending = detection.isPending || approve.isPending || assignment.isPending || identity.isPending
+    || speakerOverride.isPending || createIdentity.isPending || mergeIdentity.isPending || deleteIdentity.isPending;
 
-  if (characters.isLoading || providers.isLoading || voices.isLoading) return <LoadingState label={t("state.loadingProject")} />;
+  if (characters.isLoading || detectionStatus.isLoading) return <LoadingState label={t("state.loadingProject")} />;
   if (characters.isError) return <ErrorState error={characters.error} onRetry={() => void characters.refetch()} />;
-  if (providers.isError) return <ErrorState error={providers.error} onRetry={() => void providers.refetch()} />;
-  if (voices.isError) return <ErrorState error={voices.error} onRetry={() => void voices.refetch()} />;
+  if (detectionStatus.isError) return <ErrorState error={detectionStatus.error} onRetry={() => void detectionStatus.refetch()} />;
 
   const characterItems = characters.data?.items ?? [];
   const noCharacters = characterItems.length === 0;
@@ -226,30 +347,51 @@ function CharactersPanel({ projectId, reviewStatus, consentCloudAudio }: { proje
       <PageHeading title={t("characters.title")} subtitle={t("characters.subtitle")} actions={
         <div className="cluster">
           {reviewStatus === "approved" ? <Badge tone="positive"><Check size={13} />{t("characters.approved")}</Badge> : <Badge tone="warning"><AlertTriangle size={13} />{t("characters.needsReview")}</Badge>}
+          <Button variant="secondary" disabled={Boolean(activeDetection) || characterMutationPending} onClick={() => setAddingCharacter(true)}><Plus size={16} />{t("characters.addCharacter")}</Button>
           {cloneProviders.length ? <Button variant="secondary" onClick={() => setVoiceLibraryOpen(true)}><Mic2 size={16} />{t("characters.manageVoiceClones")}</Button> : null}
         </div>
       } />
+      {providers.isLoading || voices.isLoading ? <LoadingState label={t("state.loadingProviders")} /> : null}
+      {providers.isError ? <ErrorState error={providers.error} onRetry={() => void providers.refetch()} /> : null}
+      {voices.isError ? <ErrorState error={voices.error} onRetry={() => void voices.refetch()} /> : null}
+      {activeDetection ? <Card className="detection-config stack" role="status">
+        <div className="space-between"><div><h2>{t("characters.detectionStatus", { status: t(`characters.detectionState_${activeDetection.status}`, { defaultValue: activeDetection.status.replace("_", " ") }) })}</h2><p>{activeDetection.currentStage ? t(`stage.${activeDetection.currentStage}`, { defaultValue: activeDetection.currentStage }) : t("characters.detectionPreparing")}</p></div><Badge tone={activeDetection.status === "paused" ? "warning" : "accent"}>{Math.round(activeDetection.progress)}%</Badge></div>
+        <ProgressBar value={activeDetection.progress} label={t("characters.detectionProgress", { value: Math.round(activeDetection.progress) })} />
+        <div className="cluster">
+          {(["queued", "running"] as const).includes(activeDetection.status as "queued" | "running") ? <Button size="sm" variant="secondary" disabled={detectionAction.isPending} onClick={() => detectionAction.mutate("pause")}>{t("jobs.pause")}</Button> : null}
+          {activeDetection.status === "paused" ? <Button size="sm" disabled={detectionAction.isPending} onClick={() => detectionAction.mutate("resume")}>{t("jobs.resume")}</Button> : null}
+          {!(["cancelling", "cancelled", "complete", "failed"] as string[]).includes(activeDetection.status) ? <Button size="sm" variant="ghost" disabled={detectionAction.isPending} onClick={() => detectionAction.mutate("cancel")}>{t("jobs.cancel")}</Button> : null}
+          <Link className="button button-secondary button-sm" to={`/jobs/${activeDetection.id}`}>{t("characters.openJob")}</Link>
+        </div>
+        <p className="muted-copy">{t("characters.detectionLocked")}</p>
+        {detectionAction.isError ? <ErrorState error={detectionAction.error} onRetry={() => detectionAction.mutate(detectionAction.variables ?? "retry")} /> : null}
+      </Card> : null}
+      {!activeDetection && latestDetection?.status === "failed" ? <Card className="detection-config stack" role="alert">
+        <div className="space-between"><div><h2>{t("characters.detectionFailedTitle")}</h2><p>{latestDetection.currentStage ? t(`stage.${latestDetection.currentStage}`, { defaultValue: latestDetection.currentStage }) : t("characters.detectionFailedDetail")}</p></div><Badge tone="danger">{t("jobs.failed")}</Badge></div>
+        <div className="cluster"><Button size="sm" disabled={detectionAction.isPending} onClick={() => detectionAction.mutate("retry")}>{t("characters.retryFailedJob")}</Button><Link className="button button-secondary button-sm" to={`/jobs/${latestDetection.id}`}>{t("characters.openJob")}</Link></div>
+        {detectionAction.isError ? <ErrorState error={detectionAction.error} onRetry={() => detectionAction.mutate(detectionAction.variables ?? "retry")} /> : null}
+      </Card> : null}
       {aiProviders.length ? <Card className="detection-config stack">
         <div className="section-heading"><div><h2>{t("characters.detectionSettings")}</h2><p>{t("characters.detectionSettingsDetail")}</p></div></div>
         <div className="grid-2">
           <Field label={t("characters.detectionProvider")}>
-            <Select value={detectionProvider} onChange={(event) => { setDetectionProvider(event.target.value); setTemperatureMode("default"); setReasoningMode("inherit"); detection.reset(); }}>
+            <Select value={detectionProvider} disabled={characterMutationPending} onChange={(event) => { setDetectionProvider(event.target.value); setTemperatureMode("default"); setReasoningMode("inherit"); detection.reset(); }}>
               <option value="">{t("common.select")}</option>
               {aiProviders.map((provider) => <option key={provider.id} value={provider.id}>{provider.name}</option>)}
             </Select>
           </Field>
           {selectedDetectionProvider?.capabilities?.temperature !== "unsupported" ? <Field label={t("characters.temperature")} hint={t("characters.temperatureHint")}>
-            <Select value={temperatureMode} onChange={(event) => setTemperatureMode(event.target.value as DetectionTemperature["mode"])}>
+            <Select value={temperatureMode} disabled={characterMutationPending} onChange={(event) => setTemperatureMode(event.target.value as DetectionTemperature["mode"])}>
               <option value="default">{t("characters.providerDefault")}</option>
               {selectedDetectionProvider?.capabilities?.temperature === "nullable" ? <option value="null">{t("characters.explicitNull")}</option> : null}
               <option value="value">{t("characters.customValue")}</option>
             </Select>
           </Field> : null}
           {temperatureMode === "value" && selectedDetectionProvider?.capabilities?.temperature !== "unsupported" ? <Field label={t("characters.temperatureValue")}>
-            <Input type="number" min={0} max={2} step={0.1} value={temperatureValue} onChange={(event) => { if (Number.isFinite(event.target.valueAsNumber)) setTemperatureValue(event.target.valueAsNumber); }} />
+            <Input type="number" min={0} max={2} step={0.1} disabled={characterMutationPending} value={temperatureValue} onChange={(event) => { if (Number.isFinite(event.target.valueAsNumber)) setTemperatureValue(event.target.valueAsNumber); }} />
           </Field> : null}
           {selectedDetectionProvider?.capabilities?.reasoning.length ? <Field label={t("characters.reasoning")} hint={t("characters.reasoningHint")}>
-            <Select value={reasoningMode} onChange={(event) => setReasoningMode(event.target.value as DetectionReasoning["mode"])}>
+            <Select value={reasoningMode} disabled={characterMutationPending} onChange={(event) => setReasoningMode(event.target.value as DetectionReasoning["mode"])}>
               <option value="inherit">{t("characters.providerDefault")}</option>
               {selectedDetectionProvider.capabilities.reasoning.includes("disabled") ? <option value="disabled">{t("characters.reasoningDisabled")}</option> : null}
               {selectedDetectionProvider.capabilities.reasoning.includes("effort") ? <option value="effort">{t("characters.reasoningEffort")}</option> : null}
@@ -258,62 +400,83 @@ function CharactersPanel({ projectId, reviewStatus, consentCloudAudio }: { proje
             </Select>
           </Field> : null}
           {reasoningMode === "effort" ? <Field label={t("characters.reasoningEffort")}>
-            <Select value={reasoningEffort} onChange={(event) => setReasoningEffort(event.target.value as typeof reasoningEffort)}>
+            <Select value={reasoningEffort} disabled={characterMutationPending} onChange={(event) => setReasoningEffort(event.target.value as typeof reasoningEffort)}>
               {(["minimal", "low", "medium", "high"] as const).map((effort) => <option value={effort} key={effort}>{t(`characters.effort_${effort}`)}</option>)}
             </Select>
           </Field> : null}
           {reasoningMode === "token_budget" ? <Field label={t("characters.reasoningTokens")}>
-            <Input type="number" min={1024} step={256} value={reasoningTokens} onChange={(event) => { if (Number.isFinite(event.target.valueAsNumber)) setReasoningTokens(event.target.valueAsNumber); }} />
+            <Input type="number" min={1024} step={256} disabled={characterMutationPending} value={reasoningTokens} onChange={(event) => { if (Number.isFinite(event.target.valueAsNumber)) setReasoningTokens(event.target.valueAsNumber); }} />
           </Field> : null}
         </div>
-        <div className="space-between"><span className="muted-copy">{t("characters.detectionBilling")}</span><Button disabled={!detectionProvider || detection.isPending || (reasoningMode === "token_budget" && reasoningTokens < 1024)} onClick={() => detection.mutate()}>{detection.isPending ? <LoaderCircle className="spin" size={16} /> : <Sparkles size={16} />}{noCharacters ? t("characters.detect") : t("characters.detectAgain")}</Button></div>
+        <div className="space-between"><span className="muted-copy">{t("characters.detectionBilling")}</span><Button disabled={!detectionProvider || characterMutationPending || Boolean(activeDetection) || (reasoningMode === "token_budget" && reasoningTokens < 1024)} onClick={() => detection.mutate(crypto.randomUUID())}>{detection.isPending ? <LoaderCircle className="spin" size={16} /> : <Sparkles size={16} />}{noCharacters ? t("characters.detect") : t("characters.detectAgain")}</Button></div>
       </Card> : null}
-      {detection.isError ? <ErrorState error={detection.error} onRetry={() => detection.mutate()} /> : null}
-      {identity.isError ? <ErrorState error={identity.error} onRetry={() => identity.reset()} /> : null}
-      {speakerOverride.isError ? <ErrorState error={speakerOverride.error} onRetry={() => speakerOverride.reset()} /> : null}
+      {detection.isError ? <ErrorState error={detection.error} onRetry={() => detection.mutate(retryIdempotencyKey(detection.error, detection.variables))} /> : null}
+      {speakerOverride.isError ? <ErrorState error={speakerOverride.error} onRetry={speakerOverride.variables ? () => speakerOverride.mutate(speakerOverride.variables!) : undefined} /> : null}
       {noCharacters ? (
         <Card className="detection-empty">
           <div className="empty-icon"><Sparkles size={23} /></div><h2>{t("characters.notStartedTitle")}</h2><p>{t("characters.notStartedDetail")}</p>
-          {!aiProviders.length ? <div className="stack"><Badge tone="warning">{t("characters.providerNeeded")}</Badge><Link className="button button-secondary button-md" to="/providers">{t("providers.add")}</Link></div> : null}
+          {!aiProviders.length && !providers.isLoading && !providers.isError ? <div className="stack"><Badge tone="warning">{t("characters.providerNeeded")}</Badge><Link className="button button-secondary button-md" to="/providers">{t("providers.add")}</Link></div> : null}
         </Card>
       ) : (
         <>
           <div className="character-grid">
             {characterItems.map((character) => (
               <Card className="character-card" key={character.id}>
-                <div className="character-top"><div className="avatar">{character.canonicalName.slice(0, 1).toUpperCase()}</div><div><h2>{character.canonicalName}</h2><p>{t("characters.dialogue", { count: character.dialogueCount })}</p></div><div className="character-card-actions"><Badge tone={character.confidence >= .8 ? "positive" : "warning"}>{t("characters.confidence", { value: `${Math.round(character.confidence * 100)}%` })}</Badge><Button size="sm" variant="ghost" aria-label={t("characters.editIdentity", { name: character.canonicalName })} onClick={() => { setEditingIdentity(character); setIdentityName(character.canonicalName); setIdentityAliases(character.aliases.join(", ")); identity.reset(); }}><Pencil size={14} /></Button></div></div>
+                <div className="character-top"><div className="avatar">{character.canonicalName.slice(0, 1).toUpperCase()}</div><div><div className="cluster"><h2>{character.canonicalName}</h2>{character.role === "narrator" ? <Badge tone="accent">{t("characters.narratorRole")}</Badge> : null}</div><p>{t("characters.dialogue", { count: character.dialogueCount })}</p></div><div className="character-card-actions"><Badge tone={character.confidence >= .8 ? "positive" : "warning"}>{t("characters.confidence", { value: `${Math.round(character.confidence * 100)}%` })}</Badge><Button disabled={Boolean(activeDetection) || characterMutationPending} size="sm" variant="ghost" aria-label={t("characters.editIdentity", { name: character.canonicalName })} onClick={() => { setEditingIdentity(character); setIdentityName(character.canonicalName); setIdentityAliases(character.aliases.join(", ")); identity.reset(); }}><Pencil size={14} /></Button>{character.role !== "narrator" ? <><Button disabled={Boolean(activeDetection) || characterMutationPending} size="sm" variant="ghost" aria-label={t("characters.mergeCharacterLabel", { name: character.canonicalName })} onClick={() => { setMergingCharacter(character); setMergeTargetId(""); setMergeConfirmed(false); }}><UserRound size={14} /></Button><Button disabled={Boolean(activeDetection) || characterMutationPending} size="sm" variant="ghost" aria-label={t("characters.deleteCharacterLabel", { name: character.canonicalName })} onClick={() => { setDeletingCharacter(character); setDeleteCharacterConfirmed(false); }}><Trash2 size={14} /></Button></> : null}</div></div>
                 {character.aliases.length ? <div className="aliases"><span>{t("characters.aliases")}</span>{character.aliases.map((alias) => <Badge key={alias}>{alias}</Badge>)}</div> : null}
-                <button type="button" className="voice-assignment" onClick={() => { setAssigning(character); setVoiceProvider(character.voiceAssignment?.providerProfileId ?? ""); setVoiceId(character.voiceAssignment?.voiceId ?? ""); }}>
+                <button type="button" className="voice-assignment" disabled={Boolean(activeDetection) || characterMutationPending || providers.isLoading || providers.isError || voices.isLoading || voices.isError} onClick={() => { setAssigning(character); setVoiceProvider(character.voiceAssignment?.providerProfileId ?? ""); setVoiceId(character.voiceAssignment?.voiceId ?? ""); }}>
                   <span className="voice-icon"><Mic2 size={17} /></span><span><small>{t("characters.voice")}</small><strong>{character.voiceAssignment?.voiceName ?? t("characters.noVoice")}</strong>{character.voiceAssignment ? <em>{character.voiceAssignment.providerName}</em> : null}</span><span>{t("common.edit")}</span>
                 </button>
                 {character.evidence.length ? <details className="evidence"><summary><MessageSquareQuote size={15} />{t("characters.evidence")}<span>{character.evidence.length}</span></summary><div className="evidence-list">{character.evidence.map((item) => {
                   const paragraphId = paragraphIdFor(item);
-                  const selection = speakerSelections[paragraphId] ?? storedSpeakerSelection(item, characterItems);
-                  const saving = speakerOverride.isPending && paragraphIdFor(speakerOverride.variables.evidence) === paragraphId;
-                  return <article className="evidence-item" key={item.id}><blockquote><p>“{item.excerpt}”</p><cite>{item.chapterTitle} · {Math.round(item.confidence * 100)}%</cite></blockquote><div className="evidence-speaker"><Field label={t("characters.speakerFor", { chapter: item.chapterTitle })}><Select value={selection} disabled={saving} onChange={(event) => speakerOverride.mutate({ evidence: item, selection: event.target.value })}><option value={AUTO_SPEAKER}>{t("characters.detectedSpeaker", { name: character.canonicalName })}</option><option value={NARRATOR_SPEAKER}>{t("characters.narratorSpeaker")}</option>{characterItems.map((candidate) => <option key={candidate.id} value={candidate.id}>{candidate.canonicalName}</option>)}</Select></Field>{saving ? <span className="speaker-saving" role="status"><LoaderCircle className="spin" size={13} />{t("characters.correctingSpeaker")}</span> : selection !== AUTO_SPEAKER ? <Badge tone="accent">{t("characters.override")}</Badge> : null}</div></article>;
+                  const evidenceKey = `${paragraphId}:${item.startOffset}:${item.endOffset}`;
+                  const optimisticSelection = speakerSelections[evidenceKey];
+                  const selection = optimisticSelection && optimisticSelection.characterRevision > characterRevision
+                    ? optimisticSelection.selection
+                    : storedSpeakerSelection(item, characterItems);
+                  const saving = speakerOverride.isPending && `${paragraphIdFor(speakerOverride.variables.evidence)}:${speakerOverride.variables.evidence.startOffset}:${speakerOverride.variables.evidence.endOffset}` === evidenceKey;
+                  return <article className="evidence-item" key={item.id}><blockquote><p>“{item.excerpt}”</p><cite>{item.chapterTitle} · {Math.round(item.confidence * 100)}%</cite></blockquote><div className="evidence-speaker"><Field label={t("characters.speakerFor", { chapter: item.chapterTitle })}><Select value={selection} disabled={characterMutationPending || Boolean(activeDetection)} onChange={(event) => speakerOverride.mutate({ evidence: item, selection: event.target.value })}><option value={AUTO_SPEAKER}>{t("characters.detectedSpeaker", { name: character.canonicalName })}</option><option value={NARRATOR_SPEAKER}>{t("characters.narratorSpeaker")}</option>{characterItems.map((candidate) => <option key={candidate.id} value={candidate.id}>{candidate.canonicalName}</option>)}</Select></Field>{saving ? <span className="speaker-saving" role="status"><LoaderCircle className="spin" size={13} />{t("characters.correctingSpeaker")}</span> : selection !== AUTO_SPEAKER ? <Badge tone="accent">{t("characters.override")}</Badge> : null}</div></article>;
                 })}</div></details> : null}
               </Card>
             ))}
           </div>
-          <Card className="review-gate"><ShieldCheck size={23} /><div><strong>{reviewStatus === "approved" ? t("characters.approved") : t("characters.approve")}</strong><p>{t("characters.approveDetail")}</p></div>{reviewStatus !== "approved" ? <Button onClick={() => approve.mutate()} disabled={approve.isPending}>{approve.isPending ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}{t("characters.approve")}</Button> : null}</Card>
+          <Card className="review-gate"><ShieldCheck size={23} /><div><strong>{reviewStatus === "approved" ? t("characters.approved") : t("characters.approve")}</strong><p>{t("characters.approveDetail")}</p></div>{reviewStatus !== "approved" ? <Button onClick={() => approve.mutate()} disabled={characterMutationPending || Boolean(activeDetection)}>{approve.isPending ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}{t("characters.approve")}</Button> : null}</Card>
+          {approve.isError ? <ErrorState error={approve.error} onRetry={() => void Promise.all([characters.refetch(), queryClient.invalidateQueries({ queryKey: ["project", projectId] })])} /> : null}
           <div className="panel-footer"><Link className="button button-primary button-md" to={`/projects/${projectId}/pronunciation`}>{t("common.continue")}<Volume2 size={16} /></Link></div>
         </>
       )}
 
-      <Dialog open={Boolean(assigning)} onOpenChange={(open) => !open && setAssigning(undefined)} title={t("characters.assignVoice", { name: assigning?.canonicalName })} description={t("characters.subtitle")} footer={<><Button variant="secondary" onClick={() => setAssigning(undefined)}>{t("common.cancel")}</Button><Button disabled={!voiceProvider || !voiceId || assignment.isPending} onClick={() => assignment.mutate()}>{assignment.isPending ? t("state.saving") : t("common.save")}</Button></>}>
+      <Dialog open={Boolean(assigning)} onOpenChange={(open) => !open && !assignment.isPending && setAssigning(undefined)} title={t("characters.assignVoice", { name: assigning?.canonicalName })} description={t("characters.subtitle")} footer={<><Button variant="secondary" disabled={assignment.isPending} onClick={() => setAssigning(undefined)}>{t("common.cancel")}</Button><Button disabled={!voiceProvider || !voiceId || characterMutationPending} onClick={() => assignment.mutate()}>{assignment.isPending ? t("state.saving") : t("common.save")}</Button></>}>
         <div className="stack">
-          <Field label={t("providers.title")}><Select value={voiceProvider} onChange={(event) => { setVoiceProvider(event.target.value); setVoiceId(""); }}><option value="">{t("common.select")}</option>{providers.data?.items.filter((provider) => provider.capabilities?.tts).map((provider) => <option value={provider.id} key={provider.id}>{provider.name}</option>)}</Select></Field>
-          <Field label={t("characters.voice")}><Select value={voiceId} onChange={(event) => setVoiceId(event.target.value)} disabled={!voiceProvider}><option value="">{t("common.select")}</option>{filteredVoices.map((voice) => <option value={voice.id} key={voice.id}>{voice.name}{voice.locale ? ` · ${voice.locale}` : ""}</option>)}</Select></Field>
+          <Field label={t("providers.title")}><Select value={voiceProvider} disabled={characterMutationPending} onChange={(event) => { setVoiceProvider(event.target.value); setVoiceId(""); }}><option value="">{t("common.select")}</option>{providers.data?.items.filter((provider) => provider.capabilities?.tts).map((provider) => <option value={provider.id} key={provider.id}>{provider.name}</option>)}</Select></Field>
+          <Field label={t("characters.voice")}><Select value={voiceId} onChange={(event) => setVoiceId(event.target.value)} disabled={!voiceProvider || characterMutationPending}><option value="">{t("common.select")}</option>{filteredVoices.map((voice) => <option value={voice.id} key={voice.id}>{voice.name}{voice.locale ? ` · ${voice.locale}` : ""}</option>)}</Select></Field>
           {providers.data?.items.find((provider) => provider.id === voiceProvider)?.capabilities?.voiceCloning ? <Button variant="secondary" onClick={() => { setAssigning(undefined); setVoiceLibraryOpen(true); }}><Plus size={16} />{t("characters.manageVoiceClones")}</Button> : null}
           {assignment.isError ? <ErrorState error={assignment.error} /> : null}
         </div>
       </Dialog>
-      <Dialog open={Boolean(editingIdentity)} onOpenChange={(open) => !open && setEditingIdentity(undefined)} title={t("characters.editIdentityTitle")} description={editingIdentity?.canonicalName} footer={<><Button variant="secondary" onClick={() => setEditingIdentity(undefined)}>{t("common.cancel")}</Button><Button disabled={!identityName.trim() || identity.isPending} onClick={() => editingIdentity && identity.mutate({ characterId: editingIdentity.id, name: identityName.trim(), aliases: parseAliases(identityAliases, identityName) })}>{identity.isPending ? <LoaderCircle className="spin" size={16} /> : <Save size={16} />}{identity.isPending ? t("state.saving") : t("common.save")}</Button></>}>
+      <Dialog open={Boolean(editingIdentity)} onOpenChange={(open) => !open && !identity.isPending && setEditingIdentity(undefined)} title={t("characters.editIdentityTitle")} description={editingIdentity?.canonicalName} footer={<><Button variant="secondary" disabled={identity.isPending} onClick={() => setEditingIdentity(undefined)}>{t("common.cancel")}</Button><Button disabled={!identityName.trim() || characterMutationPending} onClick={() => editingIdentity && identity.mutate({ characterId: editingIdentity.id, name: identityName.trim(), aliases: parseAliases(identityAliases, identityName) })}>{identity.isPending ? <LoaderCircle className="spin" size={16} /> : <Save size={16} />}{identity.isPending ? t("state.saving") : t("common.save")}</Button></>}>
         <div className="stack character-identity-form">
-          <Field label={t("characters.canonicalName")}><Input autoFocus value={identityName} onChange={(event) => setIdentityName(event.target.value)} /></Field>
-          <Field label={t("characters.aliases")} hint={t("characters.aliasesHint")}><Textarea aria-label={t("characters.aliases")} value={identityAliases} onChange={(event) => setIdentityAliases(event.target.value)} /></Field>
+          <Field label={t("characters.canonicalName")}><Input autoFocus disabled={characterMutationPending} value={identityName} onChange={(event) => setIdentityName(event.target.value)} /></Field>
+          <Field label={t("characters.aliases")} hint={t("characters.aliasesHint")}><Textarea aria-label={t("characters.aliases")} disabled={characterMutationPending} value={identityAliases} onChange={(event) => setIdentityAliases(event.target.value)} /></Field>
           {identity.isError ? <ErrorState error={identity.error} /> : null}
         </div>
+      </Dialog>
+      <Dialog open={addingCharacter} onOpenChange={(open) => !createIdentity.isPending && setAddingCharacter(open)} title={t("characters.addCharacter")} description={t("characters.addCharacterDetail")} footer={<><Button variant="secondary" disabled={createIdentity.isPending} onClick={() => setAddingCharacter(false)}>{t("common.cancel")}</Button><Button disabled={!newCharacterName.trim() || characterMutationPending || Boolean(activeDetection)} onClick={() => createIdentity.mutate(crypto.randomUUID())}>{createIdentity.isPending ? <LoaderCircle className="spin" size={16} /> : <Plus size={16} />}{t("characters.addCharacter")}</Button></>}>
+        <div className="stack character-identity-form">
+          <Field label={t("characters.canonicalName")}><Input autoFocus disabled={characterMutationPending} value={newCharacterName} onChange={(event) => setNewCharacterName(event.target.value)} /></Field>
+          <Field label={t("characters.aliases")} hint={t("characters.aliasesHint")}><Textarea aria-label={t("characters.newCharacterAliases")} disabled={characterMutationPending} value={newCharacterAliases} onChange={(event) => setNewCharacterAliases(event.target.value)} /></Field>
+          {createIdentity.isError ? <ErrorState error={createIdentity.error} onRetry={() => createIdentity.mutate(retryIdempotencyKey(createIdentity.error, createIdentity.variables))} /> : null}
+        </div>
+      </Dialog>
+      <Dialog open={Boolean(mergingCharacter)} onOpenChange={(open) => { if (!open && !mergeIdentity.isPending) { setMergingCharacter(undefined); setMergeTargetId(""); setMergeConfirmed(false); } }} title={t("characters.mergeTitle", { name: mergingCharacter?.canonicalName ?? t("characters.characterFallback") })} description={t("characters.mergeDetail")} footer={<><Button variant="secondary" disabled={mergeIdentity.isPending} onClick={() => { setMergingCharacter(undefined); setMergeTargetId(""); setMergeConfirmed(false); }}>{t("common.cancel")}</Button><Button variant="danger" disabled={!mergeTargetId || !mergeConfirmed || characterMutationPending || Boolean(activeDetection)} onClick={() => mergeIdentity.mutate(crypto.randomUUID())}>{mergeIdentity.isPending ? <LoaderCircle className="spin" size={16} /> : <UserRound size={16} />}{t("characters.mergeAction")}</Button></>}>
+        <div className="stack">
+          <Field label={t("characters.mergeInto")}><Select aria-label={t("characters.mergeTarget")} disabled={characterMutationPending} value={mergeTargetId} onChange={(event) => { setMergeTargetId(event.target.value); setMergeConfirmed(false); }}><option value="">{t("common.select")}</option>{characterItems.filter((candidate) => candidate.id !== mergingCharacter?.id).map((candidate) => <option key={candidate.id} value={candidate.id}>{candidate.canonicalName}{candidate.role === "narrator" ? ` · ${t("characters.narratorRole")}` : ""}</option>)}</Select></Field>
+          <SwitchField checked={mergeConfirmed} disabled={characterMutationPending || !mergeTargetId} onCheckedChange={setMergeConfirmed} label={t("characters.confirmMerge")} detail={t("characters.confirmMergeDetail")} />
+          {mergeIdentity.isError ? <ErrorState error={mergeIdentity.error} onRetry={() => mergeIdentity.mutate(retryIdempotencyKey(mergeIdentity.error, mergeIdentity.variables))} /> : null}
+        </div>
+      </Dialog>
+      <Dialog open={Boolean(deletingCharacter)} onOpenChange={(open) => { if (!open && !deleteIdentity.isPending) { setDeletingCharacter(undefined); setDeleteCharacterConfirmed(false); } }} title={t("characters.deleteTitle", { name: deletingCharacter?.canonicalName ?? t("characters.characterFallback") })} description={t("characters.deleteDetail")} footer={<><Button variant="secondary" disabled={deleteIdentity.isPending} onClick={() => { setDeletingCharacter(undefined); setDeleteCharacterConfirmed(false); }}>{t("common.cancel")}</Button><Button variant="danger" disabled={!deleteCharacterConfirmed || characterMutationPending || Boolean(activeDetection)} onClick={() => deleteIdentity.mutate(crypto.randomUUID())}>{deleteIdentity.isPending ? <LoaderCircle className="spin" size={16} /> : <Trash2 size={16} />}{t("characters.deleteAction")}</Button></>}>
+        <div className="stack"><p>{t("characters.deleteResultDetail")}</p><SwitchField checked={deleteCharacterConfirmed} disabled={characterMutationPending} onCheckedChange={setDeleteCharacterConfirmed} label={t("characters.confirmDeleteCharacter")} detail={t("characters.confirmDeleteCharacterDetail")} />{deleteIdentity.isError ? <ErrorState error={deleteIdentity.error} onRetry={() => deleteIdentity.mutate(retryIdempotencyKey(deleteIdentity.error, deleteIdentity.variables))} /> : null}</div>
       </Dialog>
       <VoiceCloneManager
         projectId={projectId}

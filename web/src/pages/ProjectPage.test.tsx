@@ -21,6 +21,7 @@ const project: ProjectDetail = {
   consentCloudText: true,
   consentCloudAudio: false,
   characterReviewStatus: "needs_review",
+  characterRevision: 3,
   chapters: [{
     id: "chapter-1",
     index: 0,
@@ -34,6 +35,7 @@ const project: ProjectDetail = {
 
 const alice: Character = {
   id: "character-alice",
+  role: "character",
   canonicalName: "Alice",
   aliases: ["Ally"],
   confidence: 0.82,
@@ -52,6 +54,7 @@ const alice: Character = {
 
 const bob: Character = {
   id: "character-bob",
+  role: "character",
   canonicalName: "Bob",
   aliases: [],
   confidence: 0.91,
@@ -63,6 +66,7 @@ const queuedJob: Job = {
   id: "job-1",
   projectId: "project-1",
   projectTitle: "The Example Book",
+  kind: "character_detection",
   status: "queued",
   progress: 0,
   updatedAt: "2026-08-04T10:05:00Z",
@@ -94,6 +98,7 @@ const cloneProvider: ProviderProfile = {
     modelSwitch: false,
     temperature: "unsupported",
     reasoning: [],
+    modelPerformance: [],
   },
 };
 
@@ -122,7 +127,7 @@ function renderProjectTab(tab: "characters" | "preflight" | "pronunciation") {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
-  return render(
+  return { ...render(
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={[`/projects/project-1/${tab}`]}>
         <Routes>
@@ -131,7 +136,7 @@ function renderProjectTab(tab: "characters" | "preflight" | "pronunciation") {
         </Routes>
       </MemoryRouter>
     </QueryClientProvider>,
-  );
+  ), queryClient: client };
 }
 
 function renderCharacterReview() {
@@ -141,14 +146,19 @@ function renderCharacterReview() {
 beforeEach(async () => {
   await i18n.changeLanguage("en");
   vi.spyOn(api, "project").mockResolvedValue(project);
-  vi.spyOn(api, "characters").mockResolvedValue({ items: [alice, bob], total: 2 });
+  vi.spyOn(api, "characters").mockResolvedValue({ items: [alice, bob], total: 2, characterRevision: 3 });
+  vi.spyOn(api, "characterDetectionStatus").mockResolvedValue({});
   vi.spyOn(api, "providers").mockResolvedValue({ items: [], total: 0 });
   vi.spyOn(api, "voices").mockResolvedValue({ items: [], total: 0 });
-  vi.spyOn(api, "updateCharacter").mockResolvedValue(alice);
-  vi.spyOn(api, "setSpeakerOverride").mockResolvedValue(undefined);
-  vi.spyOn(api, "deleteSpeakerOverride").mockResolvedValue(undefined);
-  vi.spyOn(api, "approveCharacters").mockResolvedValue(undefined);
+  vi.spyOn(api, "updateCharacter").mockResolvedValue({ character: alice, characterRevision: 4 });
+  vi.spyOn(api, "createCharacter").mockResolvedValue({ character: alice, characterRevision: 4 });
+  vi.spyOn(api, "mergeCharacter").mockResolvedValue({ character: bob, removedCharacterId: alice.id, characterRevision: 4 });
+  vi.spyOn(api, "deleteCharacter").mockResolvedValue({ removedCharacterId: bob.id, characterRevision: 4 });
+  vi.spyOn(api, "setSpeakerOverride").mockResolvedValue({ characterRevision: 4 });
+  vi.spyOn(api, "deleteSpeakerOverride").mockResolvedValue({ characterRevision: 4 });
+  vi.spyOn(api, "approveCharacters").mockResolvedValue({ reviewStatus: "approved", characterRevision: 4 });
   vi.spyOn(api, "detectCharacters").mockResolvedValue(queuedJob);
+  vi.spyOn(api, "jobAction").mockResolvedValue({ ...queuedJob, status: "running" });
   vi.spyOn(api, "pronunciationRules").mockResolvedValue({ items: [], total: 0 });
   vi.spyOn(api, "createPronunciationRule").mockImplementation(async (rule) => ({ id: "rule-1", ...rule } as PronunciationRule));
   vi.spyOn(api, "previewPronunciationRules").mockResolvedValue({ originalText: "", transformedText: "", appliedRuleIds: [], conflicts: [] });
@@ -268,6 +278,57 @@ describe("pronunciation rules", () => {
 });
 
 describe("character review", () => {
+  it("restores an active detection job and locks conflicting review edits", async () => {
+    vi.mocked(api.characterDetectionStatus).mockResolvedValue({ activeJob: queuedJob, latestJob: queuedJob });
+    renderCharacterReview();
+
+    expect(await screen.findByText("Character detection is queued")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Add character" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Edit Alice" })).toBeDisabled();
+    expect(screen.getByRole("link", { name: "Open job" })).toHaveAttribute("href", "/jobs/job-1");
+  });
+
+  it("offers a durable retry when the latest detection job failed", async () => {
+    const user = userEvent.setup();
+    const failedJob: Job = { ...queuedJob, status: "failed", currentStage: "Provider timed out" };
+    vi.mocked(api.characterDetectionStatus).mockResolvedValue({ latestJob: failedJob });
+    renderCharacterReview();
+
+    expect(await screen.findByText("The last character detection failed")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Retry failed job" }));
+    await waitFor(() => expect(api.jobAction).toHaveBeenCalledWith(failedJob.id, "retry"));
+  });
+
+  it("creates, merges, and deletes identities with the current character revision", async () => {
+    const user = userEvent.setup();
+    renderCharacterReview();
+
+    await user.click(await screen.findByRole("button", { name: "Add character" }));
+    await user.type(screen.getByRole("textbox", { name: "Canonical name" }), "Charlie");
+    await user.type(screen.getByRole("textbox", { name: "New character aliases" }), "Charles, Chaz");
+    await user.click(screen.getAllByRole("button", { name: "Add character" }).at(-1)!);
+    await waitFor(() => expect(api.createCharacter).toHaveBeenCalledWith("project-1", {
+      canonicalName: "Charlie",
+      aliases: ["Charles", "Chaz"],
+      expectedCharacterRevision: 3,
+    }, expect.any(String)));
+
+    await user.click(screen.getByRole("button", { name: "Merge Alice" }));
+    await user.selectOptions(screen.getByRole("combobox", { name: "Merge target" }), bob.id);
+    await user.click(screen.getByRole("switch", { name: "I understand this merge cannot be undone" }));
+    await user.click(screen.getByRole("button", { name: "Merge character" }));
+    await waitFor(() => expect(api.mergeCharacter).toHaveBeenCalledWith(
+      "project-1", alice.id, bob.id, 3, expect.any(String),
+    ));
+
+    await user.click(screen.getByRole("button", { name: "Delete Bob" }));
+    await user.click(screen.getByRole("switch", { name: "I understand this character will be permanently deleted" }));
+    await user.click(screen.getByRole("button", { name: "Delete character" }));
+    await waitFor(() => expect(api.deleteCharacter).toHaveBeenCalledWith(
+      "project-1", bob.id, 3, expect.any(String),
+    ));
+  });
+
   it("sends only capability-gated temperature and reasoning controls", async () => {
     const user = userEvent.setup();
     const provider: ProviderProfile = {
@@ -297,7 +358,8 @@ describe("character review", () => {
       providerProfileId: provider.id,
       temperature: { mode: "null" },
       reasoning: { mode: "effort", effort: "high" },
-    }));
+      expectedCharacterRevision: 3,
+    }, expect.any(String)));
   });
 
   it("normalizes aliases without duplicates or the canonical name", () => {
@@ -318,9 +380,46 @@ describe("character review", () => {
     await user.click(screen.getByRole("button", { name: "Save changes" }));
 
     await waitFor(() => expect(api.updateCharacter).toHaveBeenCalledWith("project-1", "character-alice", {
-      name: "Alicia",
+      canonicalName: "Alicia",
       aliases: ["Ally", "A. Example"],
+      expectedCharacterRevision: 3,
     }));
+  });
+
+  it("reflects approval invalidation immediately after changing a voice", async () => {
+    const user = userEvent.setup();
+    const approvedProject = { ...project, characterReviewStatus: "approved" as const };
+    const needsReviewProject = { ...project, characterReviewStatus: "needs_review" as const, characterRevision: 4 };
+    const assignedAlice: Character = {
+      ...alice,
+      voiceAssignment: {
+        providerProfileId: cloneProvider.id,
+        providerName: cloneProvider.name,
+        voiceId: ownedClone.id,
+        voiceName: ownedClone.name,
+        performance: {},
+        timing: {},
+      },
+    };
+    vi.mocked(api.project).mockResolvedValueOnce(approvedProject).mockResolvedValue(needsReviewProject);
+    vi.mocked(api.characters)
+      .mockResolvedValueOnce({ items: [alice, bob], total: 2, characterRevision: 3 })
+      .mockResolvedValue({ items: [assignedAlice, bob], total: 2, characterRevision: 4 });
+    vi.mocked(api.providers).mockResolvedValue({ items: [cloneProvider], total: 1 });
+    vi.mocked(api.voices).mockResolvedValue({ items: [ownedClone], total: 1 });
+    vi.spyOn(api, "assignVoice").mockResolvedValue({ character: assignedAlice, characterRevision: 4 });
+    renderCharacterReview();
+
+    expect((await screen.findAllByText("Cast approved")).length).toBeGreaterThan(0);
+    await user.click(screen.getAllByRole("button", { name: /No voice/ })[0]!);
+    await user.selectOptions(screen.getByRole("combobox", { name: "Provider connections" }), cloneProvider.id);
+    await user.selectOptions(screen.getByRole("combobox", { name: "Voice" }), ownedClone.id);
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+
+    await waitFor(() => expect(api.assignVoice).toHaveBeenCalled());
+    expect(await screen.findByRole("button", { name: "Approve cast for synthesis" })).toBeInTheDocument();
+    expect(screen.getByText("Review required")).toBeInTheDocument();
+    expect(api.project).toHaveBeenCalledTimes(2);
   });
 
   it("sets character and narrator overrides and can return to the detected speaker", async () => {
@@ -335,7 +434,7 @@ describe("character review", () => {
       characterId: "character-bob",
       startOffset: 14,
       endOffset: 42,
-    }));
+    }, 3));
     await waitFor(() => expect(speaker).toHaveValue("character-bob"));
 
     await user.selectOptions(speaker, NARRATOR_SPEAKER);
@@ -344,11 +443,44 @@ describe("character review", () => {
       characterId: null,
       startOffset: 14,
       endOffset: 42,
-    }));
+    }, 3));
     await waitFor(() => expect(speaker).toHaveValue(NARRATOR_SPEAKER));
 
     await user.selectOptions(speaker, AUTO_SPEAKER);
-    await waitFor(() => expect(api.deleteSpeakerOverride).toHaveBeenCalledWith("project-1", "paragraph-42"));
+    await waitFor(() => expect(api.deleteSpeakerOverride).toHaveBeenCalledWith("project-1", "paragraph-42", 14, 42, 3));
+  });
+
+  it("stops showing an optimistic speaker when a newer durable revision arrives", async () => {
+    const user = userEvent.setup();
+    const evidence = alice.evidence[0]!;
+    const withSpeaker = (characterId: string, revision: number) => ({
+      items: [{
+        ...alice,
+        evidence: [{
+          ...evidence,
+          speakerOverride: { characterId, startOffset: evidence.startOffset, endOffset: evidence.endOffset },
+          speakerOverrideActive: true,
+        }],
+      }, bob],
+      total: 2,
+      characterRevision: revision,
+    });
+    vi.mocked(api.characters)
+      .mockResolvedValueOnce({ items: [alice, bob], total: 2, characterRevision: 3 })
+      .mockResolvedValueOnce(withSpeaker(bob.id, 4))
+      .mockResolvedValue(withSpeaker(alice.id, 5));
+    vi.mocked(api.setSpeakerOverride).mockResolvedValue({ characterRevision: 4 });
+    const { queryClient } = renderCharacterReview();
+
+    await user.click(await screen.findByText("Dialogue evidence"));
+    const speaker = screen.getByRole("combobox", { name: "Speaker for dialogue in Chapter One" });
+    await user.selectOptions(speaker, bob.id);
+    await waitFor(() => expect(speaker).toHaveValue(bob.id));
+
+    await queryClient.invalidateQueries({ queryKey: ["characters", "project-1"] });
+    await waitFor(() => expect(speaker).toHaveValue(alice.id));
+    await user.click(screen.getByRole("button", { name: "Approve cast for synthesis" }));
+    await waitFor(() => expect(api.approveCharacters).toHaveBeenCalledWith("project-1", 5));
   });
 
   it("creates, renames, and explicitly confirms deletion of an app-owned remote clone", async () => {

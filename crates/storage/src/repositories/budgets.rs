@@ -150,82 +150,38 @@ impl BudgetRepository {
 
     /// Atomically checks every allocation and reserves all or none of them.
     pub async fn reserve(&self, reservation: &BudgetReservation) -> Result<()> {
-        reservation.validate()?;
-        if reservation.status != ReservationStatus::Active {
-            return Err(StorageError::InvalidData(
-                "new budget reservations must be active".into(),
-            ));
-        }
-        let unique_ids = reservation
-            .allocations
-            .iter()
-            .map(|allocation| allocation.budget_id)
-            .collect::<BTreeSet<_>>();
-        if unique_ids.len() != reservation.allocations.len() {
-            return Err(StorageError::InvalidData(
-                "reservation contains duplicate budget allocations".into(),
-            ));
-        }
-
         let mut tx = self.pool.begin().await?;
-        expire_stale_reservations(&mut tx, reservation.created_at).await?;
-        for allocation in &reservation.allocations {
-            let budget = load_budget_tx(&mut tx, allocation.budget_id)
-                .await?
-                .ok_or_else(|| StorageError::NotFound {
-                    entity: "budget",
-                    id: allocation.budget_id.to_string(),
-                })?;
-            let budget = ensure_current_period_tx(&mut tx, budget, reservation.created_at).await?;
-            if !budget.enabled {
-                return Err(StorageError::InvalidData(format!(
-                    "budget {} is disabled",
-                    budget.id
-                )));
-            }
-            let active_reserved =
-                active_reserved_tx(&mut tx, &budget, reservation.created_at).await?;
-            let remaining = match budget.period {
-                BudgetPeriod::Job => budget.limit,
-                _ => budget.remaining(active_reserved),
-            };
-            if budget.hard && allocation.reserved_amount > remaining {
-                return Err(StorageError::BudgetExceeded {
-                    budget_id: budget.id,
-                    requested: allocation.reserved_amount,
-                    remaining,
-                });
-            }
-        }
-
-        sqlx::query(
-            "INSERT INTO budget_reservations \
-             (id, job_id, status, created_at, expires_at, reconciled_at, payload) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(reservation.id.to_string())
-        .bind(reservation.job_id.to_string())
-        .bind(enum_text(&reservation.status)?)
-        .bind(reservation.created_at.to_rfc3339())
-        .bind(reservation.expires_at.map(|value| value.to_rfc3339()))
-        .bind(reservation.reconciled_at.map(|value| value.to_rfc3339()))
-        .bind(encode(reservation)?)
-        .execute(&mut *tx)
-        .await?;
-        for allocation in &reservation.allocations {
-            sqlx::query(
-                "INSERT INTO budget_allocations \
-                 (reservation_id, budget_id, reserved_amount, actual_amount) VALUES (?, ?, ?, ?)",
-            )
-            .bind(reservation.id.to_string())
-            .bind(allocation.budget_id.to_string())
-            .bind(allocation.reserved_amount)
-            .bind(allocation.actual_amount)
-            .execute(&mut *tx)
-            .await?;
-        }
+        insert_budget_reservation_tx(&mut tx, reservation, true).await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Persists an explicit user override without enforcing the hard-capacity check. The
+    /// reservation remains fully durable and is reconciled like every other admission cycle.
+    pub async fn reserve_with_override(&self, reservation: &BudgetReservation) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        insert_budget_reservation_tx(&mut tx, reservation, false).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Returns the append-only usage-ledger boundary captured when this admission cycle began.
+    pub async fn usage_sequence_start(&self, id: ReservationId) -> Result<u64> {
+        let value = sqlx::query_scalar::<_, i64>(
+            "SELECT usage_sequence_start FROM budget_reservations WHERE id = ?",
+        )
+        .bind(id.to_string())
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| StorageError::NotFound {
+            entity: "budget_reservation",
+            id: id.to_string(),
+        })?;
+        u64::try_from(value).map_err(|_| {
+            StorageError::InvalidData(format!(
+                "budget reservation {id} has a negative usage sequence boundary"
+            ))
+        })
     }
 
     pub async fn get_reservation(&self, id: ReservationId) -> Result<Option<BudgetReservation>> {
@@ -257,7 +213,10 @@ impl BudgetRepository {
                     entity: "budget_reservation",
                     id: id.to_string(),
                 })?;
-        if reservation.status != ReservationStatus::Active {
+        if !matches!(
+            reservation.status,
+            ReservationStatus::Active | ReservationStatus::Expired
+        ) {
             return Err(StorageError::Conflict {
                 entity: "budget_reservation",
                 id: id.to_string(),
@@ -313,7 +272,7 @@ impl BudgetRepository {
         reservation.reconciled_at = Some(now);
         sqlx::query(
             "UPDATE budget_reservations SET status = 'reconciled', reconciled_at = ?, payload = ? \
-             WHERE id = ? AND status = 'active'",
+             WHERE id = ? AND status IN ('active', 'expired')",
         )
         .bind(now.to_rfc3339())
         .bind(encode(&reservation)?)
@@ -338,7 +297,10 @@ impl BudgetRepository {
                     entity: "budget_reservation",
                     id: id.to_string(),
                 })?;
-        if reservation.status != ReservationStatus::Active {
+        if !matches!(
+            reservation.status,
+            ReservationStatus::Active | ReservationStatus::Expired
+        ) {
             return Err(StorageError::Conflict {
                 entity: "budget_reservation",
                 id: id.to_string(),
@@ -348,7 +310,7 @@ impl BudgetRepository {
         reservation.reconciled_at = Some(now);
         sqlx::query(
             "UPDATE budget_reservations SET status = 'released', reconciled_at = ?, payload = ? \
-             WHERE id = ? AND status = 'active'",
+             WHERE id = ? AND status IN ('active', 'expired')",
         )
         .bind(now.to_rfc3339())
         .bind(encode(&reservation)?)
@@ -358,6 +320,122 @@ impl BudgetRepository {
         tx.commit().await?;
         Ok(reservation)
     }
+}
+
+/// Inserts one active reservation into an existing transaction. This is shared with retry job
+/// admission so the fresh budget cycle, optional output claim, and Failed -> Queued transition
+/// can commit atomically.
+#[allow(clippy::too_many_lines)]
+pub(super) async fn insert_budget_reservation_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    reservation: &BudgetReservation,
+    enforce_capacity: bool,
+) -> Result<()> {
+    reservation.validate()?;
+    if reservation.status != ReservationStatus::Active {
+        return Err(StorageError::InvalidData(
+            "new budget reservations must be active".into(),
+        ));
+    }
+    let unique_ids = reservation
+        .allocations
+        .iter()
+        .map(|allocation| allocation.budget_id)
+        .collect::<BTreeSet<_>>();
+    if unique_ids.len() != reservation.allocations.len() {
+        return Err(StorageError::InvalidData(
+            "reservation contains duplicate budget allocations".into(),
+        ));
+    }
+
+    expire_stale_reservations(tx, reservation.created_at).await?;
+    if enforce_capacity {
+        for allocation in &reservation.allocations {
+            let budget = load_budget_tx(tx, allocation.budget_id)
+                .await?
+                .ok_or_else(|| StorageError::NotFound {
+                    entity: "budget",
+                    id: allocation.budget_id.to_string(),
+                })?;
+            let budget = ensure_current_period_tx(tx, budget, reservation.created_at).await?;
+            if !budget.enabled {
+                return Err(StorageError::InvalidData(format!(
+                    "budget {} is disabled",
+                    budget.id
+                )));
+            }
+            let active_reserved = active_reserved_tx(tx, &budget, reservation.created_at).await?;
+            let remaining = match budget.period {
+                BudgetPeriod::Job => {
+                    let consumed = sqlx::query_scalar::<_, i64>(
+                        "SELECT COALESCE(SUM(CASE \
+                             WHEN r.status = 'reconciled' THEN COALESCE(a.actual_amount, 0) \
+                             WHEN r.status = 'active' THEN a.reserved_amount \
+                             ELSE 0 END), 0) \
+                         FROM budget_allocations a \
+                         JOIN budget_reservations r ON r.id = a.reservation_id \
+                         WHERE r.job_id = ? AND a.budget_id = ?",
+                    )
+                    .bind(reservation.job_id.to_string())
+                    .bind(budget.id.to_string())
+                    .fetch_one(&mut **tx)
+                    .await?;
+                    budget.limit.saturating_sub(consumed.max(0))
+                }
+                _ => budget.remaining(active_reserved),
+            };
+            if budget.hard && allocation.reserved_amount > remaining {
+                return Err(StorageError::BudgetExceeded {
+                    budget_id: budget.id,
+                    requested: allocation.reserved_amount,
+                    remaining,
+                });
+            }
+        }
+    }
+
+    let usage_sequence_start =
+        sqlx::query_scalar::<_, i64>("SELECT COALESCE(MAX(sequence), 0) FROM usage_ledger")
+            .fetch_one(&mut **tx)
+            .await?;
+    let result = sqlx::query(
+        "INSERT INTO budget_reservations \
+         (id, job_id, status, created_at, expires_at, reconciled_at, usage_sequence_start, payload) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(reservation.id.to_string())
+    .bind(reservation.job_id.to_string())
+    .bind(enum_text(&reservation.status)?)
+    .bind(reservation.created_at.to_rfc3339())
+    .bind(reservation.expires_at.map(|value| value.to_rfc3339()))
+    .bind(reservation.reconciled_at.map(|value| value.to_rfc3339()))
+    .bind(usage_sequence_start)
+    .bind(encode(reservation)?)
+    .execute(&mut **tx)
+    .await;
+    match result {
+        Ok(_) => {}
+        Err(error) if StorageError::is_unique_violation(&error) => {
+            return Err(StorageError::Conflict {
+                entity: "active budget reservation",
+                id: reservation.job_id.to_string(),
+            });
+        }
+        Err(error) => return Err(error.into()),
+    }
+    for allocation in &reservation.allocations {
+        sqlx::query(
+            "INSERT INTO budget_allocations \
+             (reservation_id, budget_id, reserved_amount, actual_amount) VALUES (?, ?, ?, ?)",
+        )
+        .bind(reservation.id.to_string())
+        .bind(allocation.budget_id.to_string())
+        .bind(allocation.reserved_amount)
+        .bind(allocation.actual_amount)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

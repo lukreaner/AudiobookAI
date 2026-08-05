@@ -15,12 +15,16 @@ out of scope.
 - Chapter-aware EPUB import, metadata and cover extraction, and DRM detection
 - Character/dialogue detection with editable speaker review
 - Per-character providers, models, catalog voices, reference audio, and clones
+- Typed voice direction and side-by-side, explicitly billable voice auditions
 - ElevenLabs, MLX-audio, LocalAI, AllTalk V2, native OS TTS, OpenAI, Anthropic,
   Gemini, Qwen, Kimi/Moonshot, LM Studio, and Ollama adapter families
 - In-app MLX-audio installation plus capability-gated local model management
 - Preview, estimate, dry-run, budgets, reservations, and provenance-led usage
 - Durable resumable jobs, per-provider concurrency, retries, and a content cache
+- A durable proofing workbench with text overrides, review states, take history,
+  selective regeneration, and provider-free re-export from approved takes
 - MP3, WAV/RF64, M4A, and M4B export with metadata, cover, and chapter markers
+- Versioned retailer QC and reproducible delivery packages with manual safety gates
 - Progressive playback, loudness normalization, and optional user-supplied music
 - OS-keychain/AES-GCM secrets and opt-in authenticated TLS LAN mode
 - Detailed, rotating, privacy-sanitized diagnostics in the authenticated UI

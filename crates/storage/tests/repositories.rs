@@ -3,13 +3,16 @@ use std::collections::BTreeMap;
 use audiobookai_core::{
     Book, BookId, BookMetadata, Budget, BudgetAllocation, BudgetId, BudgetMetric, BudgetPeriod,
     BudgetReservation, BudgetScope, BudgetScopeKind, Chapter, ChapterId, CloudConsent,
-    FileFingerprint, Job, JobId, JobKind, JobState, Money, Paragraph, ParagraphId, ParagraphKind,
-    Project, ProjectId, ProjectSettings, ProjectStatus, ProvenanceQuality, ProviderDeployment,
-    ProviderFamily, ProviderProfile, ProviderProfileId, ProviderRole, ReservationId,
-    ReservationStatus, SettingsMap, UsageEvent, UsageEventId, UsageQuantities, UsageWorkload,
+    ExportLayout, ExportProfileId, FileFingerprint, Job, JobId, JobKind, JobState, JobUnit,
+    JobUnitId, JobUnitKind, JobUnitState, Money, Paragraph, ParagraphId, ParagraphKind,
+    PerformanceSettings, ProductionSegment, ProductionSegmentSource, Project, ProjectId,
+    ProjectSettings, ProjectStatus, ProofingPlan, ProofingPlanStatus, ProvenanceQuality,
+    ProviderDeployment, ProviderFamily, ProviderProfile, ProviderProfileId, ProviderRole,
+    ReservationId, ReservationStatus, SegmentId, SegmentReviewState, SettingsMap, Speaker,
+    TimingSettings, UsageEvent, UsageEventId, UsageQuantities, UsageWorkload,
 };
 use audiobookai_storage::{
-    Database, StorageError,
+    Database, OutputDestinationReservation, OutputReservationState, StorageError,
     repositories::{IdempotencyClaim, IdempotentResponse, Repositories, UsageFilter},
 };
 use chrono::{DateTime, Duration, TimeZone, Utc};
@@ -116,6 +119,88 @@ fn job(project_id: ProjectId, reservation_id: Option<ReservationId>) -> Job {
     }
 }
 
+fn output_reservation(
+    job: &Job,
+    destination_key: &str,
+    destination_path: &str,
+) -> OutputDestinationReservation {
+    OutputDestinationReservation {
+        job_id: job.id,
+        project_id: job.project_id,
+        destination_key: destination_key.to_owned(),
+        destination_path: destination_path.to_owned(),
+        layout: ExportLayout::SingleFile,
+        state: OutputReservationState::Reserved,
+        created_at: job.created_at,
+        updated_at: job.created_at,
+        promoted_at: None,
+    }
+}
+
+fn proofing_segment(project_id: ProjectId, stable_key: &str) -> ProductionSegment {
+    let now = Utc::now();
+    ProductionSegment {
+        id: SegmentId::new(),
+        project_id,
+        chapter_id: None,
+        paragraph_id: None,
+        source: ProductionSegmentSource::OpeningCredit,
+        stable_key: stable_key.to_owned(),
+        ordinal: 0,
+        source_content_hash: format!("source-{stable_key}"),
+        byte_start: None,
+        byte_end: None,
+        speaker: Speaker::Narrator,
+        original_text: "Opening credit".to_owned(),
+        narration_text_override: None,
+        effective_text: "Opening credit".to_owned(),
+        context_before: None,
+        context_after: None,
+        performance_override: PerformanceSettings::default(),
+        timing_override: TimingSettings::default(),
+        expected_input_hash: format!("input-{stable_key}"),
+        review_state: SegmentReviewState::Unreviewed,
+        active: true,
+        revision: 0,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+fn proofing_plan(project_id: ProjectId, job_id: JobId, revision: u64) -> ProofingPlan {
+    let now = Utc::now();
+    ProofingPlan {
+        project_id,
+        source_conversion_job_id: job_id,
+        plan_revision: revision,
+        plan_hash: format!("plan-{revision}"),
+        status: ProofingPlanStatus::Ready,
+        dirty_reasons: Vec::new(),
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+fn job_unit(job_id: JobId, dependencies: Vec<JobUnitId>) -> JobUnit {
+    let now = Utc::now();
+    JobUnit {
+        id: JobUnitId::new(),
+        job_id,
+        kind: JobUnitKind::SynthesisSegment,
+        state: JobUnitState::Ready,
+        chapter_id: None,
+        segment_id: None,
+        provider_profile_id: None,
+        dependencies,
+        attempt_count: 0,
+        next_attempt_at: None,
+        output_artifact_id: None,
+        payload: BTreeMap::new(),
+        created_at: now,
+        updated_at: now,
+    }
+}
+
 fn utc(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> DateTime<Utc> {
     Utc.with_ymd_and_hms(year, month, day, hour, minute, 0)
         .single()
@@ -195,6 +280,41 @@ fn reservation(
         created_at,
         expires_at,
         reconciled_at: None,
+    }
+}
+
+fn usage_event(
+    project_id: ProjectId,
+    job_id: JobId,
+    provider_id: ProviderProfileId,
+    characters: u64,
+    occurred_at: DateTime<Utc>,
+) -> UsageEvent {
+    UsageEvent {
+        id: UsageEventId::new(),
+        occurred_at,
+        workload: UsageWorkload::Tts,
+        project_id,
+        job_id: Some(job_id),
+        attempt_id: None,
+        chapter_id: None,
+        segment_id: None,
+        provider_profile_id: provider_id,
+        provider_family: "local_ai".into(),
+        endpoint_family: "openai_compatible".into(),
+        model: Some("tts-1".into()),
+        voice_profile_id: None,
+        provider_request_id: None,
+        quantities: UsageQuantities {
+            characters: Some(characters),
+            ..UsageQuantities::default()
+        },
+        quantity_source: ProvenanceQuality::Reported,
+        cost: None,
+        cost_source: ProvenanceQuality::Unknown,
+        rate_card_id: None,
+        uncertain_charge: false,
+        redacted_raw_usage: BTreeMap::new(),
     }
 }
 
@@ -310,6 +430,560 @@ async fn jobs_use_optimistic_revisions_and_valid_transitions() {
             .await,
         Err(StorageError::StaleRevision { .. })
     ));
+}
+
+#[tokio::test]
+async fn output_destination_admission_is_exclusive_and_atomic() {
+    let root = TempDir::new().expect("temp dir");
+    let database = Database::open_in(root.path()).await.expect("open database");
+    let repositories = database.repositories();
+    let project_id = insert_test_project(&repositories).await;
+    let first = job(project_id, None);
+    let second = job(project_id, None);
+    let path = "/exports/the-book.m4b";
+    let first_reservation = output_reservation(&first, path, path);
+    let second_reservation = output_reservation(&second, &path.to_uppercase(), path);
+
+    let (first_result, second_result) = tokio::join!(
+        repositories
+            .jobs
+            .insert_with_output_reservation(&first, &first_reservation),
+        repositories
+            .jobs
+            .insert_with_output_reservation(&second, &second_reservation),
+    );
+    assert_ne!(first_result.is_ok(), second_result.is_ok());
+    let (winner, loser, error) = if first_result.is_ok() {
+        (
+            &first,
+            &second,
+            second_result.expect_err("second destination claim"),
+        )
+    } else {
+        (
+            &second,
+            &first,
+            first_result.expect_err("first destination claim"),
+        )
+    };
+    assert!(matches!(
+        error,
+        StorageError::Conflict {
+            entity: "output destination",
+            ..
+        }
+    ));
+    assert!(repositories.jobs.get(winner.id).await.unwrap().is_some());
+    assert_eq!(repositories.jobs.get(loser.id).await.unwrap(), None);
+    assert_eq!(
+        repositories
+            .jobs
+            .get_output_reservation(winner.id)
+            .await
+            .unwrap()
+            .expect("winner reservation")
+            .destination_path,
+        path
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn output_destination_hierarchy_is_exclusive_in_both_directions() {
+    let root = TempDir::new().expect("temp dir");
+    let database = Database::open_in(root.path()).await.expect("open database");
+    let repositories = database.repositories();
+    let project_id = insert_test_project(&repositories).await;
+    let mut other_project = repositories
+        .projects
+        .get_project(project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    other_project.id = ProjectId::new();
+    other_project.name = "Other project".to_owned();
+    repositories
+        .projects
+        .insert_project(&other_project)
+        .await
+        .unwrap();
+    let owner = job(project_id, None);
+    let owner_path = "/exports/book.m4b";
+    repositories
+        .jobs
+        .insert_with_output_reservation(&owner, &output_reservation(&owner, owner_path, owner_path))
+        .await
+        .unwrap();
+
+    let descendant = job(project_id, None);
+    let descendant_path = "/exports/book.m4b/other.m4b";
+    assert!(matches!(
+        repositories
+            .jobs
+            .insert_with_output_reservation(
+                &descendant,
+                &output_reservation(&descendant, descendant_path, descendant_path),
+            )
+            .await,
+        Err(StorageError::Conflict {
+            entity: "output destination",
+            ..
+        })
+    ));
+    assert_eq!(repositories.jobs.get(descendant.id).await.unwrap(), None);
+
+    let ancestor = job(project_id, None);
+    let ancestor_path = "/exports";
+    assert!(matches!(
+        repositories
+            .jobs
+            .insert_with_output_reservation(
+                &ancestor,
+                &output_reservation(&ancestor, ancestor_path, ancestor_path),
+            )
+            .await,
+        Err(StorageError::Conflict {
+            entity: "output destination",
+            ..
+        })
+    ));
+    assert_eq!(repositories.jobs.get(ancestor.id).await.unwrap(), None);
+
+    let manifest_collision = job(other_project.id, None);
+    let manifest_path = format!("{owner_path}.manifest.json");
+    let mut manifest_reservation =
+        output_reservation(&manifest_collision, &manifest_path, &manifest_path);
+    manifest_reservation.layout = ExportLayout::PerChapter;
+    assert!(matches!(
+        repositories
+            .jobs
+            .insert_with_output_reservation(&manifest_collision, &manifest_reservation)
+            .await,
+        Err(StorageError::Conflict {
+            entity: "output destination",
+            ..
+        })
+    ));
+    assert_eq!(
+        repositories.jobs.get(manifest_collision.id).await.unwrap(),
+        None
+    );
+
+    let reverse_blocker = job(project_id, None);
+    let reverse_manifest_path = "/exports/reverse.m4b.manifest.json";
+    let mut reverse_blocker_reservation = output_reservation(
+        &reverse_blocker,
+        reverse_manifest_path,
+        reverse_manifest_path,
+    );
+    reverse_blocker_reservation.layout = ExportLayout::PerChapter;
+    repositories
+        .jobs
+        .insert_with_output_reservation(&reverse_blocker, &reverse_blocker_reservation)
+        .await
+        .unwrap();
+    let reverse_single = job(other_project.id, None);
+    let reverse_single_path = "/exports/reverse.m4b";
+    assert!(matches!(
+        repositories
+            .jobs
+            .insert_with_output_reservation(
+                &reverse_single,
+                &output_reservation(&reverse_single, reverse_single_path, reverse_single_path,),
+            )
+            .await,
+        Err(StorageError::Conflict {
+            entity: "output destination",
+            ..
+        })
+    ));
+    assert_eq!(
+        repositories.jobs.get(reverse_single.id).await.unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn unicode_equivalent_output_keys_and_legacy_rows_cannot_alias() {
+    let root = TempDir::new().expect("temp dir");
+    let database = Database::open_in(root.path()).await.expect("open database");
+    let repositories = database.repositories();
+    let project_id = insert_test_project(&repositories).await;
+    let mut other_project = repositories
+        .projects
+        .get_project(project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    other_project.id = ProjectId::new();
+    other_project.name = "Unicode alias project".to_owned();
+    repositories
+        .projects
+        .insert_project(&other_project)
+        .await
+        .unwrap();
+
+    let owner = job(project_id, None);
+    let composed = "/exports/caf\u{e9}.m4b";
+    let decomposed = "/exports/cafe\u{301}.m4b";
+    repositories
+        .jobs
+        .insert_with_output_reservation(&owner, &output_reservation(&owner, composed, composed))
+        .await
+        .unwrap();
+
+    // Simulate a reservation written before Unicode normalization was added. Decoding, lookup,
+    // and new admission must all compare its normalized representation without requiring a risky
+    // in-place migration of an active claim.
+    sqlx::query("UPDATE output_destination_reservations SET destination_key = ? WHERE job_id = ?")
+        .bind(decomposed)
+        .bind(owner.id.to_string())
+        .execute(database.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        repositories
+            .jobs
+            .get_output_reservation(owner.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .destination_key,
+        audiobookai_storage::normalize_output_destination_key(composed)
+    );
+    let contained_manifest = format!("{composed}.manifest.json/nested");
+    assert_eq!(
+        repositories
+            .jobs
+            .find_output_reservation_containing_path(&contained_manifest)
+            .await
+            .unwrap()
+            .map(|reservation| reservation.job_id),
+        Some(owner.id)
+    );
+
+    let alias = job(other_project.id, None);
+    assert!(matches!(
+        repositories
+            .jobs
+            .insert_with_output_reservation(
+                &alias,
+                &output_reservation(&alias, composed, composed),
+            )
+            .await,
+        Err(StorageError::Conflict {
+            entity: "output destination",
+            ..
+        })
+    ));
+    assert_eq!(repositories.jobs.get(alias.id).await.unwrap(), None);
+    assert_eq!(
+        audiobookai_storage::normalize_output_destination_key("/exports/\u{3c2}.m4b"),
+        audiobookai_storage::normalize_output_destination_key("/exports/\u{3c3}.m4b"),
+        "filesystem-conservative case folding must merge final and ordinary sigma"
+    );
+}
+
+#[tokio::test]
+async fn only_unpromoted_terminal_output_claims_can_be_reacquired() {
+    let root = TempDir::new().expect("temp dir");
+    let database = Database::open_in(root.path()).await.expect("open database");
+    let repositories = database.repositories();
+    let project_id = insert_test_project(&repositories).await;
+    let mut first = job(project_id, None);
+    let path = "/exports/retry.m4b";
+    let reservation = output_reservation(&first, path, path);
+    repositories
+        .jobs
+        .insert_with_output_reservation(&first, &reservation)
+        .await
+        .unwrap();
+    first.transition(JobState::Failed, Utc::now()).unwrap();
+    first = repositories
+        .jobs
+        .update_terminal_with_output_release(&first, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        repositories
+            .jobs
+            .get_output_reservation(first.id)
+            .await
+            .unwrap(),
+        None
+    );
+    first.transition(JobState::Queued, Utc::now()).unwrap();
+    let reacquired = output_reservation(&first, path, path);
+    first = repositories
+        .jobs
+        .update_with_output_reservation(&first, 1, &reacquired)
+        .await
+        .expect("retry state and claim commit together");
+    assert_eq!(first.state, JobState::Queued);
+
+    repositories
+        .jobs
+        .mark_output_promoting(first.id, Utc::now())
+        .await
+        .unwrap();
+    assert!(
+        !repositories
+            .jobs
+            .release_unpromoted_output_reservation(first.id)
+            .await
+            .unwrap()
+    );
+    let second = job(project_id, None);
+    assert!(matches!(
+        repositories
+            .jobs
+            .insert_with_output_reservation(&second, &output_reservation(&second, path, path))
+            .await,
+        Err(StorageError::Conflict {
+            entity: "output destination",
+            ..
+        })
+    ));
+    assert_eq!(repositories.jobs.get(second.id).await.unwrap(), None);
+
+    repositories
+        .jobs
+        .mark_output_promoted(first.id, Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(
+        repositories
+            .jobs
+            .get_output_reservation(first.id)
+            .await
+            .unwrap()
+            .expect("promoted reservation")
+            .state,
+        OutputReservationState::Promoted
+    );
+    first.transition(JobState::Running, Utc::now()).unwrap();
+    first = repositories.jobs.update(&first, 2).await.unwrap();
+    first.transition(JobState::Completed, Utc::now()).unwrap();
+    repositories.jobs.update(&first, 3).await.unwrap();
+    assert!(
+        repositories
+            .jobs
+            .release_completed_output_reservation(first.id)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        repositories
+            .jobs
+            .get_output_reservation(first.id)
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn replaced_proofing_segments_are_authoritatively_inactive() {
+    let root = TempDir::new().expect("temp dir");
+    let database = Database::open_in(root.path()).await.expect("open database");
+    let repositories = database.repositories();
+    let (book, project, _, _) = imported_entities();
+    repositories.projects.insert_book(&book).await.unwrap();
+    repositories
+        .projects
+        .insert_project(&project)
+        .await
+        .unwrap();
+
+    let first_job = job(project.id, None);
+    let second_job = job(project.id, None);
+    repositories.jobs.insert(&first_job).await.unwrap();
+    repositories.jobs.insert(&second_job).await.unwrap();
+    let first = proofing_segment(project.id, "opening-credit");
+    repositories
+        .proofing
+        .replace_plan(
+            &proofing_plan(project.id, first_job.id, 1),
+            std::slice::from_ref(&first),
+        )
+        .await
+        .unwrap();
+    let replacement = proofing_segment(project.id, "opening-credit");
+    repositories
+        .proofing
+        .replace_plan(
+            &proofing_plan(project.id, second_job.id, 2),
+            std::slice::from_ref(&replacement),
+        )
+        .await
+        .unwrap();
+
+    let retired = repositories
+        .proofing
+        .get_segment(first.id)
+        .await
+        .unwrap()
+        .expect("retired segment remains auditable");
+    assert!(!retired.active);
+    let retired_payload: ProductionSegment = serde_json::from_str(
+        &sqlx::query_scalar::<_, String>("SELECT payload FROM production_segments WHERE id = ?")
+            .bind(first.id.to_string())
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(!retired_payload.active);
+    assert_eq!(
+        repositories
+            .proofing
+            .list_active_segments(project.id, None)
+            .await
+            .unwrap(),
+        vec![replacement]
+    );
+}
+
+#[tokio::test]
+async fn job_graph_insert_rolls_back_every_row_when_a_dependency_insert_fails() {
+    let root = TempDir::new().expect("temp dir");
+    let database = Database::open_in(root.path()).await.expect("open database");
+    let repositories = database.repositories();
+    let project_id = insert_test_project(&repositories).await;
+    let queued = job(project_id, None);
+    let dependency = job_unit(queued.id, Vec::new());
+    let dependent = job_unit(queued.id, vec![dependency.id]);
+
+    assert!(
+        repositories
+            .proofing
+            .insert_job_graph(&queued, &[dependent, dependency], None)
+            .await
+            .is_err()
+    );
+    assert_eq!(repositories.jobs.get(queued.id).await.unwrap(), None);
+    let stored_units =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM job_units WHERE job_id = ?")
+            .bind(queued.id.to_string())
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(stored_units, 0);
+}
+
+#[tokio::test]
+async fn failed_conversion_graph_preserves_the_previous_active_proofing_plan() {
+    let root = TempDir::new().expect("temp dir");
+    let database = Database::open_in(root.path()).await.expect("open database");
+    let repositories = database.repositories();
+    let project_id = insert_test_project(&repositories).await;
+    let first_job = job(project_id, None);
+    let second_job = job(project_id, None);
+    repositories.jobs.insert(&first_job).await.unwrap();
+    repositories.jobs.insert(&second_job).await.unwrap();
+    let first_plan = proofing_plan(project_id, first_job.id, 1);
+    let first_segment = proofing_segment(project_id, "opening-credit");
+    repositories
+        .proofing
+        .replace_plan(&first_plan, std::slice::from_ref(&first_segment))
+        .await
+        .unwrap();
+
+    let second_plan = proofing_plan(project_id, second_job.id, 2);
+    let second_segment = proofing_segment(project_id, "opening-credit");
+    let mut dependency = job_unit(second_job.id, Vec::new());
+    dependency.segment_id = Some(second_segment.id);
+    let mut dependent = job_unit(second_job.id, vec![dependency.id]);
+    dependent.segment_id = Some(second_segment.id);
+    assert!(
+        repositories
+            .proofing
+            .replace_plan_with_units(
+                &second_plan,
+                std::slice::from_ref(&second_segment),
+                &[dependent.clone(), dependency.clone()],
+            )
+            .await
+            .is_err()
+    );
+
+    assert_eq!(
+        repositories.proofing.get_plan(project_id).await.unwrap(),
+        Some(first_plan)
+    );
+    assert!(
+        repositories
+            .proofing
+            .get_segment(first_segment.id)
+            .await
+            .unwrap()
+            .expect("prior segment")
+            .active
+    );
+    assert_eq!(
+        repositories
+            .proofing
+            .get_segment(second_segment.id)
+            .await
+            .unwrap(),
+        None
+    );
+    let stored_units =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM job_units WHERE job_id = ?")
+            .bind(second_job.id.to_string())
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(stored_units, 0);
+
+    repositories
+        .proofing
+        .replace_plan_with_units(
+            &second_plan,
+            std::slice::from_ref(&second_segment),
+            &[dependency, dependent],
+        )
+        .await
+        .expect("correctly ordered graph commits");
+    assert!(
+        !repositories
+            .proofing
+            .get_segment(first_segment.id)
+            .await
+            .unwrap()
+            .expect("retired segment")
+            .active
+    );
+    assert!(
+        repositories
+            .proofing
+            .get_segment(second_segment.id)
+            .await
+            .unwrap()
+            .expect("new segment")
+            .active
+    );
+}
+
+#[tokio::test]
+async fn proof_export_job_graph_requires_its_audit_snapshot() {
+    let root = TempDir::new().expect("temp dir");
+    let database = Database::open_in(root.path()).await.expect("open database");
+    let repositories = database.repositories();
+    let project_id = insert_test_project(&repositories).await;
+    let mut export = job(project_id, None);
+    export.kind = JobKind::Export;
+    export.export_profile_id = Some(ExportProfileId::new());
+    let unit = job_unit(export.id, Vec::new());
+
+    assert!(matches!(
+        repositories
+            .proofing
+            .insert_job_graph(&export, &[unit], None)
+            .await,
+        Err(StorageError::InvalidData(message)) if message.contains("audit snapshot")
+    ));
+    assert_eq!(repositories.jobs.get(export.id).await.unwrap(), None);
 }
 
 #[tokio::test]
@@ -688,6 +1362,169 @@ async fn per_job_budget_is_independent_for_each_concurrent_and_prior_job() {
             .await,
         Err(StorageError::BudgetExceeded { remaining: 100, .. })
     ));
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn manual_retry_uses_fresh_history_and_prior_job_usage_reduces_capacity() {
+    let root = TempDir::new().expect("temp dir");
+    let database = Database::open_in(root.path()).await.expect("open database");
+    let repositories = database.repositories();
+    let project_id = insert_test_project(&repositories).await;
+    let now = utc(2026, 8, 5, 10, 0);
+    let budget = global_budget(BudgetPeriod::Job, 100, 0, now);
+    repositories.budgets.upsert(&budget).await.unwrap();
+    let provider = provider(now);
+    repositories.providers.upsert(&provider).await.unwrap();
+
+    let old_id = ReservationId::new();
+    let mut failed = job(project_id, Some(old_id));
+    failed.state = JobState::Failed;
+    failed.finished_at = Some(now);
+    failed.updated_at = now;
+    repositories.jobs.insert(&failed).await.unwrap();
+    repositories
+        .budgets
+        .reserve(&reservation(
+            old_id,
+            failed.id,
+            budget.id,
+            80,
+            now,
+            Some(now + Duration::minutes(1)),
+        ))
+        .await
+        .unwrap();
+
+    let competing_id = ReservationId::new();
+    assert!(matches!(
+        repositories
+            .budgets
+            .reserve(&reservation(
+                competing_id,
+                failed.id,
+                budget.id,
+                1,
+                now,
+                None,
+            ))
+            .await,
+        Err(StorageError::Conflict {
+            entity: "active budget reservation",
+            ..
+        })
+    ));
+    repositories
+        .budgets
+        .reconcile(old_id, &BTreeMap::from([(budget.id, 40)]), now)
+        .await
+        .unwrap();
+    let prior_usage_sequence = repositories
+        .usage
+        .append(&usage_event(project_id, failed.id, provider.id, 40, now))
+        .await
+        .unwrap();
+
+    let rejected_id = ReservationId::new();
+    let mut queued = failed.clone();
+    queued.reservation_id = Some(rejected_id);
+    queued.transition(JobState::Queued, now).unwrap();
+    queued.finished_at = None;
+    let rejected = reservation(
+        rejected_id,
+        failed.id,
+        budget.id,
+        61,
+        now,
+        Some(now + Duration::minutes(1)),
+    );
+    assert!(matches!(
+        repositories
+            .jobs
+            .update_with_retry_admission(&queued, 0, Some(&rejected), None)
+            .await,
+        Err(StorageError::BudgetExceeded { remaining: 60, .. })
+    ));
+    assert_eq!(
+        repositories
+            .jobs
+            .get(failed.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        JobState::Failed,
+        "a rejected retry must remain non-runnable"
+    );
+    assert!(
+        repositories
+            .budgets
+            .get_reservation(rejected_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "the failed atomic admission must not leave a reservation"
+    );
+
+    let retry_id = ReservationId::new();
+    queued.reservation_id = Some(retry_id);
+    let retry = reservation(
+        retry_id,
+        failed.id,
+        budget.id,
+        60,
+        now,
+        Some(now + Duration::minutes(1)),
+    );
+    let admitted = repositories
+        .jobs
+        .update_with_retry_admission(&queued, 0, Some(&retry), None)
+        .await
+        .expect("remaining per-job capacity admits retry atomically");
+    assert_eq!(admitted.state, JobState::Queued);
+    assert_eq!(admitted.reservation_id, Some(retry_id));
+    assert_eq!(
+        repositories
+            .budgets
+            .usage_sequence_start(retry_id)
+            .await
+            .unwrap(),
+        prior_usage_sequence,
+        "the fresh cycle starts after all prior-cycle ledger rows"
+    );
+    let history_count =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM budget_reservations WHERE job_id = ?")
+            .bind(failed.id.to_string())
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(history_count, 2, "retry cycles remain append-only history");
+
+    repositories
+        .budgets
+        .get_at(budget.id, now + Duration::minutes(2))
+        .await
+        .unwrap();
+    assert_eq!(
+        repositories
+            .budgets
+            .get_reservation(retry_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        ReservationStatus::Expired
+    );
+    let reconciled = repositories
+        .budgets
+        .reconcile(
+            retry_id,
+            &BTreeMap::from([(budget.id, 10)]),
+            now + Duration::minutes(2),
+        )
+        .await
+        .expect("expired retry usage remains reconcilable");
+    assert_eq!(reconciled.status, ReservationStatus::Reconciled);
 }
 
 #[tokio::test]

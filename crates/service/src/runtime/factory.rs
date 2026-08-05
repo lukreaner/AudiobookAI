@@ -94,10 +94,13 @@ impl ProviderAdapterFactory {
                 bundle.voice_cloner = Some(provider);
             }
             RuntimeAdapterKind::MlxAudio => {
-                bundle.tts = Some(Arc::new(MlxAudioProvider::new(
-                    required_endpoint(control_endpoint.as_ref())?.clone(),
-                    Arc::clone(&self.transport),
-                )?));
+                bundle.tts = Some(Arc::new(
+                    MlxAudioProvider::new(
+                        required_endpoint(control_endpoint.as_ref())?.clone(),
+                        Arc::clone(&self.transport),
+                    )?
+                    .with_model_performance(profile.model_performance.clone())?,
+                ));
             }
             RuntimeAdapterKind::LocalAi => {
                 bundle.tts = Some(Arc::new(LocalAiProvider::new(

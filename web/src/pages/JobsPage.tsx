@@ -12,7 +12,7 @@ import { formatDuration, formatRelative } from "../lib/format";
 function jobTone(status: Job["status"]): "neutral" | "accent" | "positive" | "warning" | "danger" {
   if (status === "complete") return "positive";
   if (status === "failed" || status === "cancelled") return "danger";
-  if (status === "paused" || status === "pausing") return "warning";
+  if (status === "paused" || status === "pausing" || status === "cancelling") return "warning";
   if (status === "running") return "accent";
   return "neutral";
 }
@@ -27,8 +27,8 @@ function JobList() {
   const jobs = useQuery({ queryKey: ["jobs"], queryFn: api.jobs, refetchInterval: 10_000 });
   if (jobs.isLoading) return <LoadingState label={t("state.loadingJobs")} />;
   if (jobs.isError) return <ErrorState error={jobs.error} onRetry={() => void jobs.refetch()} />;
-  const active = jobs.data?.items.filter((job) => ["queued", "running", "pausing", "paused"].includes(job.status)) ?? [];
-  const history = jobs.data?.items.filter((job) => !["queued", "running", "pausing", "paused"].includes(job.status)) ?? [];
+  const active = jobs.data?.items.filter((job) => ["queued", "running", "pausing", "paused", "cancelling"].includes(job.status)) ?? [];
+  const history = jobs.data?.items.filter((job) => !["queued", "running", "pausing", "paused", "cancelling"].includes(job.status)) ?? [];
   return (
     <div className="page jobs-page">
       <PageHeading eyebrow={t("jobs.eyebrow")} title={t("jobs.title")} subtitle={t("jobs.subtitle")} />
@@ -51,7 +51,7 @@ function JobSection({ title, jobs, locale }: { title: string; jobs: Job[]; local
         {jobs.map((job) => (
           <Link className="job-card card" key={job.id} to={`/jobs/${job.id}`}>
             <div className="job-icon"><Box size={20} /></div>
-            <div className="job-copy"><div className="cluster"><h3>{job.projectTitle}</h3><Badge tone={jobTone(job.status)}>{t(`jobs.${job.status}`)}</Badge></div><p>{job.currentStage ? t("jobs.now", { stage: t(`stage.${job.currentStage}`, { defaultValue: job.currentStage }) }) : t("jobs.updated", { value: formatRelative(job.updatedAt, locale) })}</p><ProgressBar value={job.progress} label={t("jobs.progress", { value: Math.round(job.progress) })} tone={job.status === "failed" ? "warning" : "accent"} /></div>
+            <div className="job-copy"><div className="cluster"><h3>{job.projectTitle}</h3><Badge>{job.kind.replaceAll("_", " ")}</Badge><Badge tone={jobTone(job.status)}>{t(`jobs.${job.status}`)}</Badge></div><p>{job.currentStage ? t("jobs.now", { stage: t(`stage.${job.currentStage}`, { defaultValue: job.currentStage }) }) : t("jobs.updated", { value: formatRelative(job.updatedAt, locale) })}</p><ProgressBar value={job.progress} label={t("jobs.progress", { value: Math.round(job.progress) })} tone={job.status === "failed" ? "warning" : "accent"} /></div>
             <div className="job-time">{job.estimatedRemainingSeconds ? <><Clock3 size={14} />{t("jobs.remaining", { value: formatDuration(job.estimatedRemainingSeconds, locale) })}</> : <>{Math.round(job.progress)}%</>}</div>
             <ChevronRight size={18} className="job-chevron" />
           </Link>

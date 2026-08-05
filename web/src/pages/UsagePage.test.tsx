@@ -31,6 +31,7 @@ const provider: ProviderProfile = {
     modelSwitch: false,
     temperature: "unsupported",
     reasoning: [],
+    modelPerformance: [],
   },
 };
 

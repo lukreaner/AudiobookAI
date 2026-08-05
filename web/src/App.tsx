@@ -33,8 +33,11 @@ export default function App() {
             <Route path="/import" element={<ImportPage />} />
             <Route path="/projects/:id/chapters" element={<ProjectPage tab="chapters" />} />
             <Route path="/projects/:id/characters" element={<ProjectPage tab="characters" />} />
+            <Route path="/projects/:id/auditions" element={<ProjectPage tab="auditions" />} />
             <Route path="/projects/:id/pronunciation" element={<ProjectPage tab="pronunciation" />} />
             <Route path="/projects/:id/preflight" element={<ProjectPage tab="preflight" />} />
+            <Route path="/projects/:id/proofing" element={<ProjectPage tab="proofing" />} />
+            <Route path="/projects/:id/distribution" element={<ProjectPage tab="distribution" />} />
             <Route path="/providers" element={<ProvidersPage />} />
             <Route path="/jobs" element={<JobsPage />} />
             <Route path="/jobs/:id" element={<JobsPage />} />

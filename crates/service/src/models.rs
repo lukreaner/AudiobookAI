@@ -96,6 +96,7 @@ pub struct ProjectDetail {
     pub consent_cloud_audio: bool,
     pub chapters: Vec<ChapterView>,
     pub character_review_status: ReviewStatus,
+    pub character_revision: u64,
     pub output_name: Option<String>,
 }
 
@@ -140,18 +141,61 @@ pub struct VoiceAssignmentView {
     pub voice_id: Id,
     pub voice_name: String,
     pub model: Option<String>,
+    #[serde(default)]
+    pub performance: audiobookai_core::PerformanceSettings,
+    #[serde(default)]
+    pub timing: audiobookai_core::TimingSettings,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CharacterView {
     pub id: Id,
+    pub role: audiobookai_core::CharacterRole,
     pub canonical_name: String,
     pub aliases: Vec<String>,
     pub confidence: f32,
     pub dialogue_count: usize,
     pub voice_assignment: Option<VoiceAssignmentView>,
     pub evidence: Vec<DialogueEvidenceView>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CharacterPageView {
+    pub items: Vec<CharacterView>,
+    pub total: usize,
+    pub character_revision: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CharacterMutationView {
+    pub character: Option<CharacterView>,
+    pub removed_character_id: Option<Id>,
+    pub inherited_voice: Option<bool>,
+    pub character_revision: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeakerOverrideView {
+    pub character_id: Option<Id>,
+    pub character_name: String,
+    pub start_offset: usize,
+    pub end_offset: usize,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobKindView {
+    CharacterDetection,
+    Preview,
+    Conversion,
+    SegmentRegeneration,
+    Export,
+    QualityControl,
+    CacheCleanup,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -211,7 +255,7 @@ pub struct PronunciationRuleView {
     pub project_id: Option<Id>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKindView {
     Elevenlabs,
@@ -230,7 +274,7 @@ pub enum ProviderKindView {
     Ollama,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderModeView {
     CloudRemote,
@@ -278,6 +322,9 @@ pub struct ProviderCapabilitiesView {
     pub temperature: String,
     pub reasoning: Vec<String>,
     pub max_concurrency: Option<u16>,
+    /// Performance controls positively verified for exact model identifiers.
+    #[serde(default)]
+    pub model_performance: Vec<audiobookai_core::ModelPerformanceCapabilities>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -442,6 +489,7 @@ pub enum JobStageView {
     Mix,
     Normalize,
     Export,
+    QualityControl,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -474,6 +522,7 @@ pub enum JobStatusView {
     Running,
     Pausing,
     Paused,
+    Cancelling,
     Complete,
     Failed,
     Cancelled,
@@ -485,6 +534,7 @@ pub struct JobView {
     pub id: Id,
     pub project_id: Id,
     pub project_title: String,
+    pub kind: JobKindView,
     pub status: JobStatusView,
     pub progress: f32,
     pub current_stage: Option<String>,
@@ -494,6 +544,13 @@ pub struct JobView {
     pub units: Vec<JobUnitView>,
     pub progressive_playback_url: Option<String>,
     pub uncertain_charge: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CharacterDetectionStatusView {
+    pub active_job: Option<JobView>,
+    pub latest_job: Option<JobView>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -572,6 +629,10 @@ const fn default_ducking() -> bool {
 pub struct ExportArtifactView {
     pub id: Id,
     pub project_id: Id,
+    pub job_id: Id,
+    /// Zero-based position in the export manifest's canonical output-file order.
+    pub part_index: u32,
+    pub part_count: u32,
     pub project_title: String,
     pub format: String,
     pub split_mode: String,

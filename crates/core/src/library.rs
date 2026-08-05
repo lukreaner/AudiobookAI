@@ -320,10 +320,20 @@ pub struct Segment {
     pub cached_artifact_id: Option<ArtifactId>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CharacterRole {
+    Narrator,
+    #[default]
+    Character,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Character {
     pub id: CharacterId,
     pub project_id: ProjectId,
+    #[serde(default)]
+    pub role: CharacterRole,
     pub canonical_name: String,
     #[serde(default)]
     pub aliases: Vec<String>,

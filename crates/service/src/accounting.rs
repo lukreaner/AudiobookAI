@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::OnceLock};
 
 use audiobookai_core::{
     Budget, BudgetAllocation, BudgetId, BudgetMetric, BudgetReservation, BudgetScopeKind, Job,
@@ -9,6 +9,8 @@ use chrono::Utc;
 use sqlx::Row;
 
 use crate::{AppState, ServiceError};
+
+static BUDGET_RESERVATION_LIFECYCLE: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
 #[derive(Clone, Debug)]
 pub(crate) struct RatedUsageEstimate {
@@ -157,6 +159,37 @@ pub(crate) async fn reserve_for_estimates(
     job: &Job,
     estimates: &[RatedUsageEstimate],
 ) -> Result<Option<ReservationId>, ServiceError> {
+    let Some(reservation) = prepare_reservation_for_estimates(state, job, estimates).await? else {
+        return Ok(None);
+    };
+    if job.allow_budget_override {
+        state
+            .database
+            .repositories()
+            .budgets
+            .reserve_with_override(&reservation)
+            .await
+            .map_err(storage_error)?;
+    } else {
+        state
+            .database
+            .repositories()
+            .budgets
+            .reserve(&reservation)
+            .await
+            .map_err(|error| ServiceError::Conflict(error.to_string()))?;
+    }
+    refresh_budget_views(state).await?;
+    Ok(Some(reservation.id))
+}
+
+/// Builds a fresh admission cycle without making it visible. Retry admission persists this value
+/// in the same transaction that makes the job runnable.
+pub(crate) async fn prepare_reservation_for_estimates(
+    state: &AppState,
+    job: &Job,
+    estimates: &[RatedUsageEstimate],
+) -> Result<Option<BudgetReservation>, ServiceError> {
     let budgets = state
         .database
         .repositories()
@@ -193,7 +226,7 @@ pub(crate) async fn reserve_for_estimates(
         return Ok(None);
     }
     let now = Utc::now();
-    let reservation = BudgetReservation {
+    Ok(Some(BudgetReservation {
         id: ReservationId::new(),
         job_id: job.id,
         status: ReservationStatus::Active,
@@ -201,20 +234,7 @@ pub(crate) async fn reserve_for_estimates(
         created_at: now,
         expires_at: Some(now + chrono::Duration::days(7)),
         reconciled_at: None,
-    };
-    if job.allow_budget_override {
-        insert_override_reservation(state, &reservation).await?;
-    } else {
-        state
-            .database
-            .repositories()
-            .budgets
-            .reserve(&reservation)
-            .await
-            .map_err(|error| ServiceError::Conflict(error.to_string()))?;
-    }
-    refresh_budget_views(state).await?;
-    Ok(Some(reservation.id))
+    }))
 }
 
 /// Fails closed immediately before dispatch when a current hard budget is not covered by the
@@ -264,10 +284,16 @@ pub(crate) async fn verify_dispatch_is_reserved(
             "the job's budget reservation is no longer active".to_owned(),
         ));
     }
+    let sequence_after = repositories
+        .budgets
+        .usage_sequence_start(reservation_id)
+        .await
+        .map_err(storage_error)?;
     let events = repositories
         .usage
         .list(&audiobookai_storage::repositories::UsageFilter {
             job_id: Some(job_id),
+            sequence_after: Some(sequence_after),
             ..audiobookai_storage::repositories::UsageFilter::default()
         })
         .await
@@ -319,6 +345,24 @@ pub(crate) async fn finalize_job_reservation(
     state: &AppState,
     job_id: JobId,
 ) -> Result<(), ServiceError> {
+    let _guard = lock_budget_reservation_lifecycle().await;
+    finalize_job_reservation_locked(state, job_id).await
+}
+
+/// Serializes terminal reconciliation with fresh retry admission. Callers that keep this guard
+/// through the retry transaction prevent a finishing worker from finalizing the new cycle.
+pub(crate) async fn lock_budget_reservation_lifecycle() -> tokio::sync::MutexGuard<'static, ()> {
+    BUDGET_RESERVATION_LIFECYCLE
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
+}
+
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn finalize_job_reservation_locked(
+    state: &AppState,
+    job_id: JobId,
+) -> Result<(), ServiceError> {
     let repositories = state.database.repositories();
     let job = repositories
         .jobs
@@ -338,18 +382,52 @@ pub(crate) async fn finalize_job_reservation(
         .await
         .map_err(storage_error)?
         .ok_or(ServiceError::NotFound)?;
-    if reservation.status != ReservationStatus::Active {
+    if matches!(
+        reservation.status,
+        ReservationStatus::Reconciled | ReservationStatus::Released
+    ) {
         return Ok(());
     }
+    let sequence_after = repositories
+        .budgets
+        .usage_sequence_start(reservation_id)
+        .await
+        .map_err(storage_error)?;
     let events = repositories
         .usage
         .list(&audiobookai_storage::repositories::UsageFilter {
             job_id: Some(job_id),
+            sequence_after: Some(sequence_after),
             ..audiobookai_storage::repositories::UsageFilter::default()
         })
         .await
         .map_err(storage_error)?;
     if events.is_empty() {
+        let successful_dispatch_exists = sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(SELECT 1 FROM job_attempts a \
+             JOIN job_units u ON u.id = a.job_unit_id \
+             WHERE u.job_id = ? AND a.finished_at IS NOT NULL \
+             AND a.finished_at >= ? \
+             AND a.failure_class IS NULL AND a.uncertain_charge = 0)",
+        )
+        .bind(job_id.to_string())
+        .bind(reservation.created_at.to_rfc3339())
+        .fetch_one(state.database.pool())
+        .await
+        .map_err(storage_error)?
+            != 0;
+        if successful_dispatch_exists {
+            // A succeeded attempt is durable proof that provider-owned work completed. If its
+            // usage row could not be written, retain the hard-budget reservation for recovery or
+            // manual reconciliation instead of incorrectly releasing it as an uncharged job.
+            tracing::warn!(
+                diagnostic_code = "budget.reconciliation.success_usage_missing",
+                %job_id,
+                %reservation_id,
+                "successful provider dispatch has no usage event; reservation retained"
+            );
+            return Ok(());
+        }
         repositories
             .budgets
             .release(reservation_id, Utc::now())
@@ -467,42 +545,6 @@ const fn structurally_known_zero(workload: UsageWorkload, metric: BudgetMetric) 
         (UsageWorkload::CharacterDetection, BudgetMetric::AudioMilliseconds) => Some(0),
         _ => None,
     }
-}
-
-async fn insert_override_reservation(
-    state: &AppState,
-    reservation: &BudgetReservation,
-) -> Result<(), ServiceError> {
-    let mut transaction = state.database.pool().begin().await.map_err(storage_error)?;
-    sqlx::query(
-        "INSERT INTO budget_reservations \
-         (id, job_id, status, created_at, expires_at, reconciled_at, payload) \
-         VALUES (?, ?, 'active', ?, ?, NULL, ?)",
-    )
-    .bind(reservation.id.to_string())
-    .bind(reservation.job_id.to_string())
-    .bind(reservation.created_at.to_rfc3339())
-    .bind(reservation.expires_at.map(|value| value.to_rfc3339()))
-    .bind(
-        serde_json::to_string(reservation)
-            .map_err(|error| ServiceError::Internal(error.to_string()))?,
-    )
-    .execute(&mut *transaction)
-    .await
-    .map_err(storage_error)?;
-    for allocation in &reservation.allocations {
-        sqlx::query(
-            "INSERT INTO budget_allocations \
-             (reservation_id, budget_id, reserved_amount, actual_amount) VALUES (?, ?, ?, NULL)",
-        )
-        .bind(reservation.id.to_string())
-        .bind(allocation.budget_id.to_string())
-        .bind(allocation.reserved_amount)
-        .execute(&mut *transaction)
-        .await
-        .map_err(storage_error)?;
-    }
-    transaction.commit().await.map_err(storage_error)
 }
 
 fn storage_error(error: impl std::fmt::Display) -> ServiceError {
@@ -627,7 +669,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     use audiobookai_core::{
-        BudgetPeriod, BudgetScope, BudgetScopeKind, ProviderProfileId, RateCardId,
+        AttemptId, BookId, BudgetPeriod, BudgetScope, BudgetScopeKind, JobAttempt, JobKind,
+        JobState, JobUnit, JobUnitId, JobUnitKind, JobUnitState, ProjectId, ProviderProfileId,
+        RateCardId,
     };
 
     use super::*;
@@ -684,6 +728,230 @@ mod tests {
             cost,
             rate_card_id: Some(RateCardId::new()),
         }
+    }
+
+    async fn test_state() -> (tempfile::TempDir, AppState) {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let database = audiobookai_storage::Database::open_in(directory.path())
+            .await
+            .expect("database");
+        let state = AppState::new(
+            crate::ServiceConfig {
+                bind: "127.0.0.1:0".parse().expect("address"),
+                data_dir: directory.path().to_path_buf(),
+                bundled_sidecar_dir: None,
+                tls: None,
+                lan_hostnames: Vec::new(),
+                allow_insecure_lan: false,
+                desktop_bootstrap: false,
+            },
+            database,
+        )
+        .await
+        .expect("application state");
+        (directory, state)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn terminal_job_with_reservation(
+        state: &AppState,
+        reservation_created_at: chrono::DateTime<Utc>,
+        attempt_finished_at: chrono::DateTime<Utc>,
+    ) -> (JobId, ReservationId) {
+        let project_id = ProjectId::new();
+        let book_id = BookId::new();
+        let created_at = reservation_created_at - chrono::Duration::minutes(20);
+        sqlx::query(
+            "INSERT INTO books (id, managed_epub_path, source_hash, imported_at, payload) \
+             VALUES (?, ?, ?, ?, '{}')",
+        )
+        .bind(book_id.to_string())
+        .bind(format!("/fixtures/{book_id}.epub"))
+        .bind(format!("fixture-{book_id}"))
+        .bind(created_at.to_rfc3339())
+        .execute(state.database.pool())
+        .await
+        .expect("book fixture");
+        sqlx::query(
+            "INSERT INTO projects \
+             (id, book_id, name, status, created_at, updated_at, revision, payload) \
+             VALUES (?, ?, 'Accounting fixture', 'draft', ?, ?, 0, '{}')",
+        )
+        .bind(project_id.to_string())
+        .bind(book_id.to_string())
+        .bind(created_at.to_rfc3339())
+        .bind(created_at.to_rfc3339())
+        .execute(state.database.pool())
+        .await
+        .expect("project fixture");
+
+        let job_id = JobId::new();
+        let unit_id = JobUnitId::new();
+        let mut job = Job {
+            id: job_id,
+            project_id,
+            kind: JobKind::Preview,
+            state: JobState::Running,
+            export_profile_id: None,
+            reservation_id: None,
+            progress_completed: 0,
+            progress_total: 1,
+            status_message: None,
+            allow_budget_override: false,
+            created_at,
+            started_at: Some(created_at),
+            finished_at: None,
+            updated_at: created_at,
+            revision: 0,
+        };
+        let unit = JobUnit {
+            id: unit_id,
+            job_id,
+            kind: JobUnitKind::SynthesisSegment,
+            state: JobUnitState::Running,
+            chapter_id: None,
+            segment_id: None,
+            provider_profile_id: None,
+            dependencies: Vec::new(),
+            attempt_count: 1,
+            next_attempt_at: None,
+            output_artifact_id: None,
+            payload: BTreeMap::new(),
+            created_at,
+            updated_at: created_at,
+        };
+        state
+            .database
+            .repositories()
+            .proofing
+            .insert_job_graph(&job, std::slice::from_ref(&unit), None)
+            .await
+            .expect("job fixture");
+
+        let budget = budget(BudgetMetric::Characters, None);
+        state
+            .database
+            .repositories()
+            .budgets
+            .upsert(&budget)
+            .await
+            .expect("budget fixture");
+        let reservation = BudgetReservation {
+            id: ReservationId::new(),
+            job_id,
+            status: ReservationStatus::Active,
+            allocations: vec![BudgetAllocation {
+                budget_id: budget.id,
+                reserved_amount: 100,
+                actual_amount: None,
+            }],
+            created_at: reservation_created_at,
+            expires_at: Some(reservation_created_at + chrono::Duration::days(1)),
+            reconciled_at: None,
+        };
+        state
+            .database
+            .repositories()
+            .budgets
+            .reserve(&reservation)
+            .await
+            .expect("reservation fixture");
+        let expected_revision = job.revision;
+        job.reservation_id = Some(reservation.id);
+        job.updated_at = reservation_created_at;
+        job = state
+            .database
+            .repositories()
+            .jobs
+            .update(&job, expected_revision)
+            .await
+            .expect("attach reservation");
+
+        let attempt = JobAttempt {
+            id: AttemptId::new(),
+            job_unit_id: unit_id,
+            ordinal: 1,
+            started_at: attempt_finished_at - chrono::Duration::seconds(1),
+            finished_at: Some(attempt_finished_at),
+            failure_class: None,
+            error_code: None,
+            redacted_error: None,
+            provider_request_id: Some("provider-request".to_owned()),
+            uncertain_charge: false,
+        };
+        state
+            .database
+            .repositories()
+            .jobs
+            .insert_attempt(&attempt)
+            .await
+            .expect("attempt fixture");
+        job.transition(
+            JobState::Failed,
+            reservation_created_at + chrono::Duration::minutes(1),
+        )
+        .expect("terminal job");
+        state
+            .database
+            .repositories()
+            .jobs
+            .update(&job, job.revision)
+            .await
+            .expect("persist terminal job");
+
+        (job_id, reservation.id)
+    }
+
+    #[tokio::test]
+    async fn prior_cycle_success_does_not_retain_a_fresh_uncharged_reservation() {
+        let (_directory, state) = test_state().await;
+        let reservation_created_at = Utc::now();
+        let (job_id, reservation_id) = terminal_job_with_reservation(
+            &state,
+            reservation_created_at,
+            reservation_created_at - chrono::Duration::minutes(5),
+        )
+        .await;
+
+        finalize_job_reservation(&state, job_id)
+            .await
+            .expect("finalize reservation");
+
+        let reservation = state
+            .database
+            .repositories()
+            .budgets
+            .get_reservation(reservation_id)
+            .await
+            .expect("load reservation")
+            .expect("reservation exists");
+        assert_eq!(reservation.status, ReservationStatus::Released);
+    }
+
+    #[tokio::test]
+    async fn current_cycle_success_without_usage_retains_the_reservation() {
+        let (_directory, state) = test_state().await;
+        let reservation_created_at = Utc::now();
+        let (job_id, reservation_id) = terminal_job_with_reservation(
+            &state,
+            reservation_created_at,
+            reservation_created_at + chrono::Duration::seconds(5),
+        )
+        .await;
+
+        finalize_job_reservation(&state, job_id)
+            .await
+            .expect("finalize reservation");
+
+        let reservation = state
+            .database
+            .repositories()
+            .budgets
+            .get_reservation(reservation_id)
+            .await
+            .expect("load reservation")
+            .expect("reservation exists");
+        assert_eq!(reservation.status, ReservationStatus::Active);
     }
 
     #[test]

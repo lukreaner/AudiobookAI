@@ -8,6 +8,7 @@ export interface ProblemDetails {
   instance?: string;
   code?: string;
   errors?: Record<string, string[]>;
+  meta?: Record<string, unknown>;
 }
 
 export interface HealthStatus {
@@ -51,6 +52,7 @@ export interface ProjectDetail extends BookSummary {
   consentCloudAudio: boolean;
   chapters: Chapter[];
   characterReviewStatus: "not_started" | "needs_review" | "approved";
+  characterRevision: number;
   outputName?: string;
 }
 
@@ -81,12 +83,14 @@ export interface SpeakerOverrideInput {
 }
 
 export interface CharacterIdentityInput {
-  name: string;
+  canonicalName: string;
   aliases: string[];
+  expectedCharacterRevision: number;
 }
 
 export interface Character {
   id: Id;
+  role: "narrator" | "character";
   canonicalName: string;
   aliases: string[];
   confidence: number;
@@ -101,6 +105,8 @@ export interface VoiceAssignment {
   voiceId: Id;
   voiceName: string;
   model?: string;
+  performance: PerformanceSettings;
+  timing: TimingSettings;
 }
 
 export type DetectionTemperature =
@@ -119,6 +125,23 @@ export interface CharacterDetectionInput {
   providerProfileId: Id;
   temperature: DetectionTemperature;
   reasoning: DetectionReasoning;
+  expectedCharacterRevision: number;
+}
+
+export interface CharacterPage extends PageResponse<Character> {
+  characterRevision: number;
+}
+
+export interface CharacterMutationResult {
+  character?: Character;
+  removedCharacterId?: Id;
+  inheritedVoice?: boolean;
+  characterRevision: number;
+}
+
+export interface CharacterDetectionStatus {
+  activeJob?: Job;
+  latestJob?: Job;
 }
 
 export interface Voice {
@@ -201,6 +224,29 @@ export interface ProviderCapabilities {
   temperature: "unsupported" | "number" | "nullable";
   reasoning: string[];
   maxConcurrency?: number;
+  /** Exact-model descriptors; an absent model or control is unsupported. */
+  modelPerformance: ModelPerformanceCapabilities[];
+}
+
+export interface PerformanceRange {
+  minimum: number;
+  maximum: number;
+}
+
+/** Nested domain capability objects retain the backend's snake_case wire names. */
+export interface PerformanceCapabilities {
+  speed?: PerformanceRange | null;
+  pitch?: PerformanceRange | null;
+  stability?: PerformanceRange | null;
+  similarity?: PerformanceRange | null;
+  style?: PerformanceRange | null;
+  speaker_boost: boolean;
+  delivery_cues: DeliveryCue[];
+}
+
+export interface ModelPerformanceCapabilities {
+  model: string;
+  performance: PerformanceCapabilities;
 }
 
 export interface ProviderProfile {
@@ -374,6 +420,341 @@ export interface PreviewResult {
   cached: boolean;
 }
 
+export type DeliveryCue = "whisper" | "shout" | "sarcastic" | "curious" | "excited" | "crying" | "mischievous";
+
+/** Domain objects below intentionally use the service's persisted snake_case wire format. */
+export interface PerformanceSettings {
+  speed?: number;
+  pitch?: number;
+  stability?: number;
+  similarity?: number;
+  style?: number;
+  speaker_boost?: boolean;
+  delivery_cue?: DeliveryCue;
+}
+
+export interface TimingSettings {
+  pause_before_ms?: number;
+  pause_after_ms?: number;
+}
+
+export type SegmentSpeaker =
+  | { kind: "narrator" }
+  | { kind: "character"; id: Id }
+  | { kind: "named"; id: string };
+
+export type SegmentReviewState = "unreviewed" | "flagged" | "approved" | "locked";
+
+export interface ProductionSegment {
+  id: Id;
+  project_id: Id;
+  chapter_id?: Id | null;
+  paragraph_id?: Id | null;
+  source: "epub_range" | "opening_credit" | "closing_credit";
+  stable_key: string;
+  ordinal: number;
+  source_content_hash: string;
+  byte_start?: number | null;
+  byte_end?: number | null;
+  speaker: SegmentSpeaker;
+  original_text: string;
+  narration_text_override?: string | null;
+  effective_text: string;
+  context_before?: string | null;
+  context_after?: string | null;
+  performance_override: PerformanceSettings;
+  timing_override: TimingSettings;
+  expected_input_hash: string;
+  review_state: SegmentReviewState;
+  active: boolean;
+  revision: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ProofingPlan {
+  project_id: Id;
+  source_conversion_job_id: Id;
+  plan_revision: number;
+  plan_hash: string;
+  status: "ready" | "dirty" | "incomplete";
+  dirty_reasons: string[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface TakeFinding {
+  code: string;
+  severity: "warning" | "error";
+  message: string;
+  start_ms?: number | null;
+  end_ms?: number | null;
+  actual?: number | null;
+  expected?: string | null;
+}
+
+export interface SegmentTake {
+  id: Id;
+  segment_id: Id;
+  artifact_id: Id;
+  ordinal: number;
+  source_job_id: Id;
+  source_job_unit_id: Id;
+  semantic_input_hash: string;
+  duration_ms: number;
+  provider_profile_id?: Id | null;
+  model?: string | null;
+  voice_profile_id?: Id | null;
+  dictionary_revision_hash: string;
+  normalization_version: string;
+  synthesis_provenance: Record<string, unknown>;
+  findings: TakeFinding[];
+  created_at: string;
+}
+
+export interface SegmentSelection {
+  segment_id: Id;
+  take_id: Id;
+  selected_at: string;
+  revision: number;
+}
+
+export interface ProofingCounts {
+  total: number;
+  unreviewed: number;
+  flagged: number;
+  approved: number;
+  locked: number;
+  stale: number;
+  missing: number;
+}
+
+export interface ProofingSummary {
+  available: boolean;
+  requiresNewConversion: boolean;
+  plan?: ProofingPlan | null;
+  counts: ProofingCounts;
+  chapters: { id: Id; title: string; total: number; issueCount: number }[];
+  retailerExportReady: boolean;
+  genericExportReady: boolean;
+}
+
+export interface ProofingSegmentView {
+  segment: ProductionSegment;
+  selection?: SegmentSelection | null;
+  selectedTake?: SegmentTake | null;
+  takeCount: number;
+  selectedTakeCurrent: boolean;
+  audioUrl?: string | null;
+}
+
+export interface ProofingSegmentQuery {
+  chapterId?: Id;
+  state?: SegmentReviewState;
+  issuesOnly?: boolean;
+  staleOnly?: boolean;
+  search?: string;
+  cursor?: string;
+  limit?: number;
+}
+
+export interface ProofingSegmentPage {
+  items: ProofingSegmentView[];
+  total: number;
+  nextCursor?: string | null;
+}
+
+export interface SegmentUpdateInput {
+  expectedRevision: number;
+  textOverride?: string;
+  clearTextOverride?: boolean;
+  performanceOverride?: PerformanceSettings;
+  timingOverride?: TimingSettings;
+}
+
+export interface SegmentSelectionInput {
+  takeId: Id;
+  expectedRevision: number;
+  expectedSegmentRevision: number;
+}
+
+export interface RegenerationEstimate {
+  segmentId: Id;
+  segmentRevision: number;
+  providerProfileId: Id;
+  providerName: string;
+  model?: string | null;
+  characters: number;
+  monetaryCostMicros?: number | null;
+  currency?: string | null;
+  credits?: number | null;
+  unknownPricing: boolean;
+  estimateToken: string;
+  expiresAt: string;
+}
+
+export interface VoiceAuditionCandidateInput {
+  candidateId: string;
+  providerProfileId: Id;
+  voiceId: Id;
+  model?: string;
+  performance: PerformanceSettings;
+}
+
+export interface VoiceAuditionInput {
+  text?: string;
+  characterId?: Id;
+  confirmBillable: boolean;
+  candidates: VoiceAuditionCandidateInput[];
+}
+
+export interface VoiceAuditionResult {
+  candidateId: string;
+  providerProfileId: Id;
+  voiceId: Id;
+  preview?: PreviewResult | null;
+  error?: string | null;
+}
+
+export interface VoiceAuditionResponse {
+  results: VoiceAuditionResult[];
+  potentiallyBillable: boolean;
+}
+
+export type DistributionTarget = "generic_m4b" | "acx" | "spotify_for_authors" | "google_play";
+
+export interface DistributionPolicyRule {
+  code: string;
+  level: "required" | "recommended" | "manual_gate";
+  automated: boolean;
+  expected: unknown;
+  description: string;
+}
+
+export interface DistributionPolicyView {
+  target: DistributionTarget;
+  policyVersion: string;
+  effectiveDate: string;
+  sourceUrls: string[];
+  displayName: string;
+  rules: DistributionPolicyRule[];
+}
+
+export interface ManualAttestations {
+  acx_external_authorization?: string | null;
+  acx_authorization_reference?: string | null;
+  spotify_digital_voice_disclosure?: string | null;
+  rights_and_eligibility_confirmed?: string | null;
+}
+
+export interface DistributionMetadata {
+  subtitle?: string | null;
+  authors: string[];
+  narrators: string[];
+  publisher?: string | null;
+  imprint?: string | null;
+  description?: string | null;
+  language?: string | null;
+  abridged?: boolean | null;
+  identifier?: string | null;
+  identifier_kind?: string | null;
+  source_rights?: string | null;
+  audio_rights?: string | null;
+  release_date?: string | null;
+  cover_artifact_id?: Id | null;
+  opening_credit_segment_ids: Id[];
+  closing_credit_segment_ids: Id[];
+  sample_segment_ids: Id[];
+  attestations: ManualAttestations;
+}
+
+export interface DistributionMetadataView {
+  revision: number;
+  updatedAt?: string | null;
+  metadata: DistributionMetadata;
+}
+
+export interface DistributionPolicyRef {
+  target: DistributionTarget;
+  policy_version: string;
+  effective_date: string;
+  source_urls: string[];
+}
+
+export interface QualityFinding {
+  code: string;
+  status: "pass" | "warning" | "fail" | "manual";
+  scope: string;
+  message: string;
+  actual?: unknown | null;
+  expected?: unknown | null;
+  start_ms?: number | null;
+  end_ms?: number | null;
+  remediation?: string | null;
+  acknowledged: boolean;
+}
+
+export interface QualityReport {
+  id: Id;
+  package_id: Id;
+  policy: DistributionPolicyRef;
+  policy_digest: string;
+  policy_snapshot?: unknown | null;
+  metadata_revision: number;
+  metadata_digest: string;
+  metadata_snapshot?: DistributionMetadata | null;
+  project_title?: string | null;
+  package_digest: string;
+  package_snapshot?: DistributionPackage | null;
+  export_manifest_artifact_id?: Id | null;
+  segment_evidence: DistributionSegmentEvidence[];
+  technical_ready: boolean;
+  submission_ready: boolean;
+  findings: QualityFinding[];
+  analyzer_version: string;
+  ffmpeg_version: string;
+  ffmpeg_build_fingerprint: string;
+  file_hashes: Record<string, string>;
+  generated_at: string;
+}
+
+export interface DistributionSegmentEvidence {
+  segment_id: Id;
+  source?: ProductionSegment["source"] | null;
+  active: boolean;
+  selection_revision?: number | null;
+  take_id?: Id | null;
+  take_artifact_id?: Id | null;
+  expected_input_hash?: string | null;
+  selected_take_input_hash?: string | null;
+  current_input_hash?: string | null;
+  current: boolean;
+  problem?: string | null;
+}
+
+export interface DistributionPackage {
+  id: Id;
+  project_id: Id;
+  job_id: Id;
+  target: DistributionTarget;
+  output_directory: string;
+  upload_artifact_ids: Id[];
+  review_artifact_ids: Id[];
+  quality_report_id?: Id | null;
+  created_at: string;
+}
+
+export interface DistributionPackageView {
+  package: DistributionPackage;
+  latestReport?: QualityReport | null;
+  latestReportCurrent: boolean;
+}
+
+export interface DistributionQualityRun {
+  package: DistributionPackage;
+  report: QualityReport;
+}
+
 export type ExportFormat = "mp3" | "wav" | "m4a" | "m4b";
 
 export interface JobExportSettings {
@@ -397,7 +778,7 @@ export interface StartJobRequest {
 export interface JobUnit {
   id: Id;
   title: string;
-  stage: "detect" | "synthesize" | "assemble" | "mix" | "normalize" | "export";
+  stage: "detect" | "synthesize" | "assemble" | "mix" | "normalize" | "export" | "quality_control";
   status: "queued" | "running" | "paused" | "complete" | "failed" | "cancelled";
   progress: number;
   attempt: number;
@@ -408,7 +789,8 @@ export interface Job {
   id: Id;
   projectId: Id;
   projectTitle: string;
-  status: "queued" | "running" | "pausing" | "paused" | "complete" | "failed" | "cancelled";
+  kind: "character_detection" | "preview" | "conversion" | "segment_regeneration" | "export" | "quality_control" | "cache_cleanup";
+  status: "queued" | "running" | "pausing" | "paused" | "cancelling" | "complete" | "failed" | "cancelled";
   progress: number;
   currentStage?: string;
   startedAt?: string;
@@ -422,6 +804,9 @@ export interface Job {
 export interface ExportArtifact {
   id: Id;
   projectId: Id;
+  jobId: Id;
+  partIndex: number;
+  partCount: number;
   projectTitle: string;
   format: "mp3" | "wav" | "m4a" | "m4b";
   splitMode: "single" | "per_chapter";

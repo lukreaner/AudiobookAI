@@ -35,6 +35,7 @@ const managedProvider: ProviderProfile = {
     modelSwitch: false,
     temperature: "unsupported",
     reasoning: [],
+    modelPerformance: [],
   },
 };
 

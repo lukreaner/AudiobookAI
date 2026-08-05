@@ -117,6 +117,7 @@ pub struct RuntimeProfile {
     pub working_directory: Option<PathBuf>,
     pub environment: BTreeMap<String, String>,
     pub model_control: Option<RuntimeModelControl>,
+    pub model_performance: Vec<audiobookai_core::ModelPerformanceCapabilities>,
 }
 
 impl RuntimeProfile {
@@ -137,6 +138,7 @@ impl RuntimeProfile {
             working_directory: None,
             environment: BTreeMap::new(),
             model_control: None,
+            model_performance: Vec::new(),
         }
     }
 
@@ -258,6 +260,7 @@ impl fmt::Debug for RuntimeProfile {
                 &self.environment.keys().collect::<Vec<_>>(),
             )
             .field("model_control", &self.model_control)
+            .field("model_performance", &self.model_performance)
             .finish()
     }
 }

@@ -10,3 +10,7 @@ pub mod repositories;
 pub use database::Database;
 pub use error::{Result, StorageError};
 pub use paths::{AppPaths, harden_private_file};
+pub use repositories::ProofingRepository;
+pub use repositories::{
+    OutputDestinationReservation, OutputReservationState, normalize_output_destination_key,
+};

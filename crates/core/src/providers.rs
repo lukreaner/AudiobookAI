@@ -5,8 +5,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use url::Url;
 
 use crate::{
-    CapabilitySnapshotId, ProviderProfileId, SecretId, SettingsMap, SourceProvenance, Validate,
-    ValidationIssue, error::require_non_empty,
+    CapabilitySnapshotId, DeliveryCue, ProviderProfileId, SecretId, SettingsMap, SourceProvenance,
+    Validate, ValidationIssue, error::require_non_empty,
 };
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -247,6 +247,61 @@ pub struct TtsCapabilities {
     pub reports_audio_seconds: bool,
     pub reports_cost: bool,
     pub max_input_characters: Option<u64>,
+    /// Exact-model performance controls. An absent model is deliberately unsupported.
+    #[serde(default)]
+    pub model_performance: Vec<ModelPerformanceCapabilities>,
+}
+
+/// Inclusive numeric bounds for a model-supported voice performance setting.
+///
+/// A missing range in [`PerformanceCapabilities`] means unsupported, not "unknown". This makes
+/// stale or incomplete capability snapshots fail closed instead of leaking provider-specific
+/// fields into a request.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+pub struct PerformanceRange {
+    pub minimum: f64,
+    pub maximum: f64,
+}
+
+impl PerformanceRange {
+    #[must_use]
+    pub const fn new(minimum: f64, maximum: f64) -> Self {
+        Self { minimum, maximum }
+    }
+
+    #[must_use]
+    pub fn is_valid(self) -> bool {
+        self.minimum.is_finite() && self.maximum.is_finite() && self.minimum <= self.maximum
+    }
+
+    #[must_use]
+    pub fn contains(self, value: f64) -> bool {
+        self.is_valid() && value.is_finite() && (self.minimum..=self.maximum).contains(&value)
+    }
+}
+
+/// Provider-neutral performance controls positively supported by one exact provider model.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(default)]
+pub struct PerformanceCapabilities {
+    pub speed: Option<PerformanceRange>,
+    pub pitch: Option<PerformanceRange>,
+    pub stability: Option<PerformanceRange>,
+    pub similarity: Option<PerformanceRange>,
+    pub style: Option<PerformanceRange>,
+    pub speaker_boost: bool,
+    pub delivery_cues: Vec<DeliveryCue>,
+}
+
+/// An exact model binding for performance controls.
+///
+/// Model identifiers are intentionally matched exactly by adapters. Prefix, family, and fallback
+/// matches would turn an unknown model revision into implicit support and violate fail-closed
+/// request construction.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ModelPerformanceCapabilities {
+    pub model: String,
+    pub performance: PerformanceCapabilities,
 }
 
 #[allow(clippy::struct_excessive_bools)]

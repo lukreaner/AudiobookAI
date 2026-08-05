@@ -71,14 +71,25 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/api/v1/imports/{id}/cover", get(import_cover))
         .route("/api/v1/imports/{id}/commit", post(commit_import))
-        .route("/api/v1/projects/{id}/characters", get(list_characters))
+        .route(
+            "/api/v1/projects/{id}/characters",
+            get(list_characters).post(create_character),
+        )
         .route(
             "/api/v1/projects/{project_id}/characters/{character_id}",
             axum::routing::patch(update_character),
         )
         .route(
             "/api/v1/projects/{id}/character-detection",
-            post(start_character_detection),
+            get(character_detection_status).post(start_character_detection),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/characters/{character_id}/actions/merge",
+            post(merge_character),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/characters/{character_id}/actions/delete",
+            post(delete_character),
         )
         .route(
             "/api/v1/projects/{id}/character-review",
@@ -173,6 +184,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/v1/projects/{id}/preflight/preview",
             post(preflight_preview),
         )
+        .route(
+            "/api/v1/projects/{id}/voice-auditions",
+            post(voice_auditions),
+        )
         .route("/api/v1/jobs", get(list_jobs).post(start_job))
         .route("/api/v1/jobs/{id}", get(get_job))
         .route("/api/v1/jobs/{id}/actions/{action}", post(job_action))
@@ -202,6 +217,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/secrets/status", get(secret_status))
         .route("/api/v1/secrets/unlock", post(unlock_secret_store))
         .route("/api/v1/secrets/lock", post(lock_secret_store))
+        .merge(crate::proofing::routes())
+        .merge(crate::distribution::routes())
         .with_state(state)
 }
 
@@ -307,11 +324,27 @@ async fn get_project(
         .ok_or(ServiceError::NotFound)
 }
 
+#[allow(clippy::too_many_lines)]
 async fn update_project(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
     Json(patch): Json<serde_json::Value>,
 ) -> Result<Json<ProjectDetail>, ServiceError> {
+    let _model_lifecycle_guard = state.model_lifecycle.lock().await;
+    let changes_dispatch_consent =
+        patch.get("consentCloudText").is_some() || patch.get("consentCloudAudio").is_some();
+    let dispatch_consent_lock = if changes_dispatch_consent {
+        Some(state.dispatch_consent_lifecycle_lock(id).await)
+    } else {
+        None
+    };
+    let _dispatch_consent_guard = if let Some(lock) = dispatch_consent_lock.as_ref() {
+        Some(lock.write().await)
+    } else {
+        None
+    };
+    let project_lock = state.character_lifecycle_lock(id).await;
+    let _project_guard = project_lock.lock().await;
     let mut project = state
         .catalog
         .read()
@@ -412,6 +445,11 @@ async fn delete_project(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, ServiceError> {
+    let _model_lifecycle_guard = state.model_lifecycle.lock().await;
+    let dispatch_consent_lock = state.dispatch_consent_lifecycle_lock(id).await;
+    let _dispatch_consent_guard = dispatch_consent_lock.write().await;
+    let project_lock = state.character_lifecycle_lock(id).await;
+    let _project_guard = project_lock.lock().await;
     archive_project(&state, id).await?;
     let mut catalog = state.catalog.write().await;
     catalog.projects.remove(&id).ok_or(ServiceError::NotFound)?;
@@ -965,6 +1003,7 @@ async fn commit_import(
         consent_cloud_audio: false,
         chapters,
         character_review_status: ReviewStatus::NotStarted,
+        character_revision: 0,
         output_name: None,
     };
     catalog.projects.insert(project_id, project.clone());
@@ -1007,29 +1046,217 @@ async fn hash_file(
     .map_err(ServiceError::Io)
 }
 
+fn active_job_status(status: JobStatusView) -> bool {
+    matches!(
+        status,
+        JobStatusView::Queued
+            | JobStatusView::Running
+            | JobStatusView::Pausing
+            | JobStatusView::Paused
+            | JobStatusView::Cancelling
+    )
+}
+
+fn blocks_project_mutation(kind: crate::models::JobKindView) -> bool {
+    matches!(
+        kind,
+        crate::models::JobKindView::CharacterDetection
+            | crate::models::JobKindView::Conversion
+            | crate::models::JobKindView::SegmentRegeneration
+            | crate::models::JobKindView::Export
+    )
+}
+
+pub(crate) async fn blocking_project_job(
+    state: &AppState,
+    project_id: Uuid,
+    exclude_job_id: Option<Uuid>,
+) -> Option<JobView> {
+    let catalog = state.catalog.read().await;
+    let mut jobs = catalog
+        .jobs
+        .values()
+        .filter(|job| {
+            job.project_id == project_id
+                && Some(job.id) != exclude_job_id
+                && active_job_status(job.status)
+                && blocks_project_mutation(job.kind)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    jobs.sort_by_key(|job| job.updated_at);
+    jobs.into_iter().next()
+}
+
+async fn blocking_character_job(state: &AppState, project_id: Uuid) -> Option<JobView> {
+    blocking_project_job(state, project_id, None).await
+}
+
+pub(crate) fn active_job_conflict(job: &JobView) -> ServiceError {
+    let code = match job.kind {
+        crate::models::JobKindView::CharacterDetection => "active_character_detection",
+        crate::models::JobKindView::SegmentRegeneration => "active_segment_regeneration",
+        crate::models::JobKindView::Export => "active_proof_export",
+        crate::models::JobKindView::Conversion
+        | crate::models::JobKindView::Preview
+        | crate::models::JobKindView::QualityControl
+        | crate::models::JobKindView::CacheCleanup => "active_conversion",
+    };
+    ServiceError::ConflictDetails {
+        code,
+        detail: "finish or cancel the active project production job before changing the project or starting conflicting work".to_owned(),
+        meta: serde_json::json!({ "activeJobId": job.id }),
+    }
+}
+
+async fn advance_character_revision_tx(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    project_id: Uuid,
+    expected_character_revision: u64,
+    approved: bool,
+) -> Result<u64, ServiceError> {
+    use audiobookai_core::{Project, ProjectStatus};
+
+    let row = sqlx::query_as::<_, (i64, i64, String)>(
+        "SELECT revision, character_revision, payload FROM projects WHERE id = ?",
+    )
+    .bind(project_id.to_string())
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(|error| ServiceError::Storage(error.to_string()))?
+    .ok_or(ServiceError::NotFound)?;
+    let stored_character_revision = u64::try_from(row.1)
+        .map_err(|_| ServiceError::Internal("stored character revision is invalid".to_owned()))?;
+    if stored_character_revision != expected_character_revision {
+        return Err(ServiceError::ConflictDetails {
+            code: "stale_character_revision",
+            detail: "character review changed; refresh before saving".to_owned(),
+            meta: serde_json::json!({
+                "currentCharacterRevision": stored_character_revision,
+            }),
+        });
+    }
+    let mut project: Project =
+        serde_json::from_str(&row.2).map_err(|error| ServiceError::Internal(error.to_string()))?;
+    project.status = if approved {
+        ProjectStatus::Ready
+    } else {
+        ProjectStatus::NeedsCharacterReview
+    };
+    project.character_reviewed_at = approved.then(Utc::now);
+    project.updated_at = Utc::now();
+    let next_character_revision = stored_character_revision.saturating_add(1);
+    let next_revision = u64::try_from(row.0)
+        .map_err(|_| ServiceError::Internal("stored project revision is invalid".to_owned()))?
+        .saturating_add(1);
+    let result = sqlx::query(
+        "UPDATE projects SET status = ?, updated_at = ?, revision = ?, character_revision = ?, \
+         payload = ? WHERE id = ? AND revision = ? AND character_revision = ?",
+    )
+    .bind(if approved {
+        "ready"
+    } else {
+        "needs_character_review"
+    })
+    .bind(project.updated_at.to_rfc3339())
+    .bind(i64::try_from(next_revision).unwrap_or(i64::MAX))
+    .bind(i64::try_from(next_character_revision).unwrap_or(i64::MAX))
+    .bind(
+        serde_json::to_string(&project)
+            .map_err(|error| ServiceError::Internal(error.to_string()))?,
+    )
+    .bind(project_id.to_string())
+    .bind(row.0)
+    .bind(row.1)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|error| ServiceError::Storage(error.to_string()))?;
+    if result.rows_affected() != 1 {
+        return Err(ServiceError::Conflict(
+            "project review changed concurrently".to_owned(),
+        ));
+    }
+    Ok(next_character_revision)
+}
+
+async fn sync_character_review_catalog(
+    state: &AppState,
+    project_id: Uuid,
+    approved: bool,
+    character_revision: u64,
+) -> Result<(), ServiceError> {
+    let mut catalog = state.catalog.write().await;
+    let project = catalog
+        .projects
+        .get_mut(&project_id)
+        .ok_or(ServiceError::NotFound)?;
+    project.character_review_status = if approved {
+        ReviewStatus::Approved
+    } else {
+        ReviewStatus::NeedsReview
+    };
+    project.character_revision = character_revision;
+    project.summary.status = if approved {
+        ProjectDisplayStatus::Ready
+    } else {
+        ProjectDisplayStatus::Draft
+    };
+    project.summary.updated_at = Utc::now();
+    Ok(())
+}
+
 async fn list_characters(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
-) -> Result<Json<Page<crate::models::CharacterView>>, ServiceError> {
+) -> Result<Json<crate::models::CharacterPageView>, ServiceError> {
     let catalog = state.catalog.read().await;
-    if !catalog.projects.contains_key(&id) {
+    let project = catalog.projects.get(&id).ok_or(ServiceError::NotFound)?;
+    let items = catalog.characters.get(&id).cloned().unwrap_or_default();
+    Ok(Json(crate::models::CharacterPageView {
+        total: items.len(),
+        items,
+        character_revision: project.character_revision,
+    }))
+}
+
+async fn character_detection_status(
+    State(state): State<Arc<AppState>>,
+    Path(project_id): Path<Uuid>,
+) -> Result<Json<crate::models::CharacterDetectionStatusView>, ServiceError> {
+    let catalog = state.catalog.read().await;
+    if !catalog.projects.contains_key(&project_id) {
         return Err(ServiceError::NotFound);
     }
-    Ok(Json(Page::all(
-        catalog.characters.get(&id).cloned().unwrap_or_default(),
-    )))
+    let mut jobs = catalog
+        .jobs
+        .values()
+        .filter(|job| {
+            job.project_id == project_id
+                && matches!(job.kind, crate::models::JobKindView::CharacterDetection)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    jobs.sort_by_key(|job| std::cmp::Reverse(job.updated_at));
+    let latest_job = jobs.first().cloned();
+    let active_job = jobs.into_iter().find(|job| active_job_status(job.status));
+    Ok(Json(crate::models::CharacterDetectionStatusView {
+        active_job,
+        latest_job,
+    }))
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DetectionInput {
     provider_profile_id: Uuid,
+    expected_character_revision: u64,
     #[serde(default)]
     temperature: audiobookai_providers::Temperature,
     #[serde(default)]
     reasoning: audiobookai_providers::ReasoningControl,
 }
 
+#[allow(clippy::too_many_lines)]
 async fn start_character_detection(
     State(state): State<Arc<AppState>>,
     Path(project_id): Path<Uuid>,
@@ -1037,6 +1264,11 @@ async fn start_character_detection(
 ) -> Result<(StatusCode, Json<JobView>), ServiceError> {
     let _shutdown_admission = state.admit_shutdown_sensitive_work().await?;
     let _model_lifecycle_guard = state.model_lifecycle.lock().await;
+    let project_lock = state.character_lifecycle_lock(project_id).await;
+    let _project_guard = project_lock.lock().await;
+    if let Some(job) = blocking_character_job(&state, project_id).await {
+        return Err(active_job_conflict(&job));
+    }
     let mut catalog = state.catalog.write().await;
     let provider = catalog
         .providers
@@ -1075,6 +1307,15 @@ async fn start_character_detection(
         .projects
         .get_mut(&project_id)
         .ok_or(ServiceError::NotFound)?;
+    if project.character_revision != input.expected_character_revision {
+        return Err(ServiceError::ConflictDetails {
+            code: "stale_character_revision",
+            detail: "character review changed; refresh before starting detection".to_owned(),
+            meta: serde_json::json!({
+                "currentCharacterRevision": project.character_revision,
+            }),
+        });
+    }
     if provider_is_cloud && !project.consent_cloud_text {
         return Err(ServiceError::InvalidRequest(
             "grant this project permission to send book text to the selected cloud provider"
@@ -1103,7 +1344,12 @@ async fn start_character_detection(
         .reasoning
         .validate(runtime_provider.capabilities())
         .map_err(|error| ServiceError::InvalidRequest(error.to_string()))?;
-    let job = new_job(project_id, project_title, Vec::new());
+    let job = new_job(
+        project_id,
+        project_title,
+        crate::models::JobKindView::CharacterDetection,
+        Vec::new(),
+    );
     let job = crate::workflows::persist_detection_job(
         &state,
         &job,
@@ -1112,9 +1358,28 @@ async fn start_character_detection(
         provider_endpoint,
         input.temperature,
         input.reasoning,
+        input.expected_character_revision.saturating_add(1),
     )
     .await?;
+    let mut transaction = state
+        .database
+        .pool()
+        .begin()
+        .await
+        .map_err(|error| ServiceError::Storage(error.to_string()))?;
+    let character_revision = advance_character_revision_tx(
+        &mut transaction,
+        project_id,
+        input.expected_character_revision,
+        false,
+    )
+    .await?;
+    transaction
+        .commit()
+        .await
+        .map_err(|error| ServiceError::Storage(error.to_string()))?;
     state.catalog.write().await.jobs.insert(job.id, job.clone());
+    sync_character_review_catalog(&state, project_id, false, character_revision).await?;
     state.events.publish(
         "job.queued",
         serde_json::json!({ "jobId": job.id, "projectId": project_id }),
@@ -1124,16 +1389,226 @@ async fn start_character_detection(
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ReviewInput {
     approved: bool,
+    expected_character_revision: u64,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CharacterPatchInput {
-    name: String,
+    #[serde(alias = "name")]
+    canonical_name: String,
     #[serde(default)]
     aliases: Vec<String>,
+    expected_character_revision: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MergeCharacterInput {
+    target_character_id: Uuid,
+    expected_character_revision: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CharacterRevisionInput {
+    expected_character_revision: u64,
+}
+
+fn normalized_character_aliases(canonical_name: &str, aliases: Vec<String>) -> Vec<String> {
+    let mut normalized = HashSet::new();
+    aliases
+        .into_iter()
+        .filter_map(|alias| {
+            let alias = alias.trim();
+            if alias.is_empty() || alias.eq_ignore_ascii_case(canonical_name) {
+                return None;
+            }
+            normalized
+                .insert(alias.to_lowercase())
+                .then(|| alias.to_owned())
+        })
+        .collect()
+}
+
+fn ensure_character_name_available(
+    characters: &[crate::models::CharacterView],
+    canonical_name: &str,
+    aliases: &[String],
+    except_id: Option<Uuid>,
+) -> Result<(), ServiceError> {
+    let requested_names = std::iter::once(canonical_name)
+        .chain(aliases.iter().map(String::as_str))
+        .collect::<Vec<_>>();
+    let conflict = characters
+        .iter()
+        .filter(|character| Some(character.id) != except_id)
+        .find_map(|character| {
+            std::iter::once(character.canonical_name.as_str())
+                .chain(character.aliases.iter().map(String::as_str))
+                .find(|existing| {
+                    requested_names
+                        .iter()
+                        .any(|requested| existing.eq_ignore_ascii_case(requested))
+                })
+                .map(str::to_owned)
+        });
+    if let Some(conflicting_name) = conflict {
+        return Err(ServiceError::ConflictDetails {
+            code: "identity_conflict",
+            detail: "another project character already uses that name or alias".to_owned(),
+            meta: serde_json::json!({
+                "canonicalName": canonical_name,
+                "conflictingName": conflicting_name,
+            }),
+        });
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+async fn create_character(
+    State(state): State<Arc<AppState>>,
+    Path(project_id): Path<Uuid>,
+    Json(input): Json<CharacterPatchInput>,
+) -> Result<(StatusCode, Json<crate::models::CharacterMutationView>), ServiceError> {
+    use audiobookai_core::{Character, CharacterId, CharacterRole, ProjectId, Validate};
+
+    reject_empty("canonicalName", &input.canonical_name)?;
+    let canonical_name = input.canonical_name.trim().to_owned();
+    let aliases = normalized_character_aliases(&canonical_name, input.aliases);
+    let project_lock = state.character_lifecycle_lock(project_id).await;
+    let _project_guard = project_lock.lock().await;
+    if let Some(job) = blocking_character_job(&state, project_id).await {
+        return Err(active_job_conflict(&job));
+    }
+    {
+        let catalog = state.catalog.read().await;
+        let project = catalog
+            .projects
+            .get(&project_id)
+            .ok_or(ServiceError::NotFound)?;
+        if project.character_revision != input.expected_character_revision {
+            return Err(ServiceError::ConflictDetails {
+                code: "stale_character_revision",
+                detail: "character review changed; refresh before saving".to_owned(),
+                meta: serde_json::json!({
+                    "currentCharacterRevision": project.character_revision,
+                }),
+            });
+        }
+        ensure_character_name_available(
+            catalog
+                .characters
+                .get(&project_id)
+                .map_or(&[], Vec::as_slice),
+            &canonical_name,
+            &aliases,
+            None,
+        )?;
+    }
+    let now = Utc::now();
+    let character = Character {
+        id: CharacterId::new(),
+        project_id: ProjectId::from_uuid(project_id),
+        role: CharacterRole::Character,
+        canonical_name: canonical_name.clone(),
+        aliases: aliases.clone(),
+        description: None,
+        confidence: Some(1.0),
+        detection_run_id: None,
+        manually_created: true,
+        created_at: now,
+        updated_at: now,
+    };
+    character
+        .validate()
+        .map_err(|error| ServiceError::InvalidRequest(error.to_string()))?;
+    let mut transaction = state
+        .database
+        .pool()
+        .begin()
+        .await
+        .map_err(|error| ServiceError::Storage(error.to_string()))?;
+    sqlx::query(
+        "INSERT INTO characters (id, project_id, role, canonical_name, updated_at, payload) \
+         VALUES (?, ?, 'character', ?, ?, ?)",
+    )
+    .bind(character.id.to_string())
+    .bind(project_id.to_string())
+    .bind(&canonical_name)
+    .bind(now.to_rfc3339())
+    .bind(
+        serde_json::to_string(&character)
+            .map_err(|error| ServiceError::Internal(error.to_string()))?,
+    )
+    .execute(&mut *transaction)
+    .await
+    .map_err(|error| ServiceError::Storage(error.to_string()))?;
+    for alias in &aliases {
+        sqlx::query(
+            "INSERT INTO character_aliases (character_id, alias, normalized_alias) VALUES (?, ?, ?)",
+        )
+        .bind(character.id.to_string())
+        .bind(alias)
+        .bind(alias.to_lowercase())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| ServiceError::Storage(error.to_string()))?;
+    }
+    let character_revision = advance_character_revision_tx(
+        &mut transaction,
+        project_id,
+        input.expected_character_revision,
+        false,
+    )
+    .await?;
+    transaction
+        .commit()
+        .await
+        .map_err(|error| ServiceError::Storage(error.to_string()))?;
+    let view = crate::models::CharacterView {
+        id: character.id.as_uuid(),
+        role: CharacterRole::Character,
+        canonical_name,
+        aliases,
+        confidence: 1.0,
+        dialogue_count: 0,
+        voice_assignment: None,
+        evidence: Vec::new(),
+    };
+    {
+        let mut catalog = state.catalog.write().await;
+        let characters = catalog.characters.entry(project_id).or_default();
+        characters.push(view.clone());
+        characters.sort_by(|left, right| {
+            left.canonical_name
+                .to_lowercase()
+                .cmp(&right.canonical_name.to_lowercase())
+        });
+    }
+    sync_character_review_catalog(&state, project_id, false, character_revision).await?;
+    state.events.publish(
+        "character.updated",
+        serde_json::json!({
+            "projectId": project_id,
+            "characterId": character.id.as_uuid(),
+            "characterRevision": character_revision,
+            "operation": "created",
+        }),
+    );
+    Ok((
+        StatusCode::CREATED,
+        Json(crate::models::CharacterMutationView {
+            character: Some(view),
+            removed_character_id: None,
+            inherited_voice: None,
+            character_revision,
+        }),
+    ))
 }
 
 // Character identity, aliases, evidence, and review invalidation form one
@@ -1143,26 +1618,49 @@ async fn update_character(
     State(state): State<Arc<AppState>>,
     Path((project_id, character_id)): Path<(Uuid, Uuid)>,
     Json(input): Json<CharacterPatchInput>,
-) -> Result<Json<crate::models::CharacterView>, ServiceError> {
+) -> Result<Json<crate::models::CharacterMutationView>, ServiceError> {
     use audiobookai_core::{Character, CharacterId, Validate};
 
-    reject_empty("name", &input.name)?;
-    let canonical_name = input.name.trim().to_owned();
-    let mut aliases = Vec::new();
-    let mut normalized = HashSet::new();
-    for alias in input.aliases {
-        let alias = alias.trim();
-        if alias.is_empty() || alias.eq_ignore_ascii_case(&canonical_name) {
-            continue;
+    reject_empty("canonicalName", &input.canonical_name)?;
+    let canonical_name = input.canonical_name.trim().to_owned();
+    let mut aliases = normalized_character_aliases(&canonical_name, input.aliases);
+    let mut normalized = aliases
+        .iter()
+        .map(|alias| alias.to_lowercase())
+        .collect::<HashSet<_>>();
+    let project_lock = state.character_lifecycle_lock(project_id).await;
+    let _project_guard = project_lock.lock().await;
+    if let Some(job) = blocking_character_job(&state, project_id).await {
+        return Err(active_job_conflict(&job));
+    }
+    {
+        let catalog = state.catalog.read().await;
+        let project = catalog
+            .projects
+            .get(&project_id)
+            .ok_or(ServiceError::NotFound)?;
+        if project.character_revision != input.expected_character_revision {
+            return Err(ServiceError::ConflictDetails {
+                code: "stale_character_revision",
+                detail: "character review changed; refresh before saving".to_owned(),
+                meta: serde_json::json!({
+                    "currentCharacterRevision": project.character_revision,
+                }),
+            });
         }
-        let key = alias.to_lowercase();
-        if normalized.insert(key) {
-            aliases.push(alias.to_owned());
-        }
+        ensure_character_name_available(
+            catalog
+                .characters
+                .get(&project_id)
+                .map_or(&[], Vec::as_slice),
+            &canonical_name,
+            &aliases,
+            Some(character_id),
+        )?;
     }
 
-    let payload = sqlx::query_scalar::<_, String>(
-        "SELECT payload FROM characters WHERE id = ? AND project_id = ?",
+    let (role, payload) = sqlx::query_as::<_, (String, String)>(
+        "SELECT role, payload FROM characters WHERE id = ? AND project_id = ?",
     )
     .bind(character_id.to_string())
     .bind(project_id.to_string())
@@ -1172,6 +1670,11 @@ async fn update_character(
     .ok_or(ServiceError::NotFound)?;
     let mut character: Character = serde_json::from_str(&payload)
         .map_err(|error| ServiceError::Internal(error.to_string()))?;
+    character.role = if role == "narrator" {
+        audiobookai_core::CharacterRole::Narrator
+    } else {
+        audiobookai_core::CharacterRole::Character
+    };
     if !character
         .canonical_name
         .eq_ignore_ascii_case(&canonical_name)
@@ -1224,6 +1727,13 @@ async fn update_character(
         .await
         .map_err(|error| ServiceError::Storage(error.to_string()))?;
     }
+    let character_revision = advance_character_revision_tx(
+        &mut transaction,
+        project_id,
+        input.expected_character_revision,
+        false,
+    )
+    .await?;
     transaction
         .commit()
         .await
@@ -1243,19 +1753,473 @@ async fn update_character(
         view.aliases = aliases;
         view.clone()
     };
-    set_project_review_state(&state, project_id, false).await?;
+    sync_character_review_catalog(&state, project_id, false, character_revision).await?;
     state.events.publish(
         "character.updated",
-        serde_json::json!({ "projectId": project_id, "characterId": character_id }),
+        serde_json::json!({
+            "projectId": project_id,
+            "characterId": character_id,
+            "characterRevision": character_revision,
+            "operation": "updated",
+        }),
     );
-    Ok(Json(updated))
+    Ok(Json(crate::models::CharacterMutationView {
+        character: Some(updated),
+        removed_character_id: None,
+        inherited_voice: None,
+        character_revision,
+    }))
+}
+
+#[allow(clippy::too_many_lines)]
+async fn merge_character(
+    State(state): State<Arc<AppState>>,
+    Path((project_id, source_id)): Path<(Uuid, Uuid)>,
+    Json(input): Json<MergeCharacterInput>,
+) -> Result<Json<crate::models::CharacterMutationView>, ServiceError> {
+    use audiobookai_core::{
+        Character, CharacterId, CharacterRole, DictionaryRule, Speaker, SpeakerOverride,
+        VoiceAssignment,
+    };
+
+    if source_id == input.target_character_id {
+        return Err(ServiceError::InvalidRequest(
+            "merge source and target must be different characters".to_owned(),
+        ));
+    }
+    let project_lock = state.character_lifecycle_lock(project_id).await;
+    let _project_guard = project_lock.lock().await;
+    if let Some(job) = blocking_character_job(&state, project_id).await {
+        return Err(active_job_conflict(&job));
+    }
+    let (source_role, source_payload, target_role, target_payload) = {
+        let rows = sqlx::query_as::<_, (String, String, String)>(
+            "SELECT id, role, payload FROM characters WHERE project_id = ? AND id IN (?, ?)",
+        )
+        .bind(project_id.to_string())
+        .bind(source_id.to_string())
+        .bind(input.target_character_id.to_string())
+        .fetch_all(state.database.pool())
+        .await
+        .map_err(|error| ServiceError::Storage(error.to_string()))?;
+        let source = rows
+            .iter()
+            .find(|row| row.0 == source_id.to_string())
+            .map(|row| (row.1.clone(), row.2.clone()))
+            .ok_or(ServiceError::NotFound)?;
+        let target = rows
+            .iter()
+            .find(|row| row.0 == input.target_character_id.to_string())
+            .map(|row| (row.1.clone(), row.2.clone()))
+            .ok_or(ServiceError::NotFound)?;
+        (source.0, source.1, target.0, target.1)
+    };
+    let mut source: Character = serde_json::from_str(&source_payload)
+        .map_err(|error| ServiceError::Internal(error.to_string()))?;
+    let mut target: Character = serde_json::from_str(&target_payload)
+        .map_err(|error| ServiceError::Internal(error.to_string()))?;
+    source.role = if source_role == "narrator" {
+        CharacterRole::Narrator
+    } else {
+        CharacterRole::Character
+    };
+    target.role = if target_role == "narrator" {
+        CharacterRole::Narrator
+    } else {
+        CharacterRole::Character
+    };
+    if source.role == CharacterRole::Narrator {
+        return Err(ServiceError::ConflictDetails {
+            code: "protected_narrator",
+            detail: "the narrator cannot be merged into another character".to_owned(),
+            meta: serde_json::json!({ "characterId": source_id }),
+        });
+    }
+    let mut merged_aliases = target.aliases.clone();
+    merged_aliases.push(source.canonical_name.clone());
+    merged_aliases.extend(source.aliases.clone());
+    target.aliases = normalized_character_aliases(&target.canonical_name, merged_aliases);
+    target.manually_created = true;
+    target.updated_at = Utc::now();
+
+    let mut transaction = state
+        .database
+        .pool()
+        .begin()
+        .await
+        .map_err(|error| ServiceError::Storage(error.to_string()))?;
+    let current_revision =
+        sqlx::query_scalar::<_, i64>("SELECT character_revision FROM projects WHERE id = ?")
+            .bind(project_id.to_string())
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|error| ServiceError::Storage(error.to_string()))?;
+    if u64::try_from(current_revision).ok() != Some(input.expected_character_revision) {
+        return Err(ServiceError::ConflictDetails {
+            code: "stale_character_revision",
+            detail: "character review changed; refresh before saving".to_owned(),
+            meta: serde_json::json!({ "currentCharacterRevision": current_revision }),
+        });
+    }
+
+    sqlx::query(
+        "UPDATE dialogue_spans SET character_id = ?, \
+         payload = json_set(payload, '$.character_id', ?) WHERE character_id = ?",
+    )
+    .bind(input.target_character_id.to_string())
+    .bind(input.target_character_id.to_string())
+    .bind(source_id.to_string())
+    .execute(&mut *transaction)
+    .await
+    .map_err(|error| ServiceError::Storage(error.to_string()))?;
+
+    let override_rows = sqlx::query_as::<_, (String, String)>(
+        "SELECT id, payload FROM speaker_overrides WHERE speaker_character_id = ?",
+    )
+    .bind(source_id.to_string())
+    .fetch_all(&mut *transaction)
+    .await
+    .map_err(|error| ServiceError::Storage(error.to_string()))?;
+    for (override_id, payload) in override_rows {
+        let mut record: SpeakerOverride = serde_json::from_str(&payload)
+            .map_err(|error| ServiceError::Internal(error.to_string()))?;
+        record.speaker = if target.role == CharacterRole::Narrator {
+            Speaker::Narrator
+        } else {
+            Speaker::Character(CharacterId::from_uuid(input.target_character_id))
+        };
+        record.updated_at = Utc::now();
+        sqlx::query(
+            "UPDATE speaker_overrides SET speaker_character_id = ?, updated_at = ?, payload = ? \
+             WHERE id = ?",
+        )
+        .bind(
+            (target.role != CharacterRole::Narrator).then(|| input.target_character_id.to_string()),
+        )
+        .bind(record.updated_at.to_rfc3339())
+        .bind(
+            serde_json::to_string(&record)
+                .map_err(|error| ServiceError::Internal(error.to_string()))?,
+        )
+        .bind(override_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| ServiceError::Storage(error.to_string()))?;
+    }
+
+    let rule_rows = sqlx::query_as::<_, (String, String)>(
+        "SELECT id, payload FROM dictionary_rules WHERE character_id = ?",
+    )
+    .bind(source_id.to_string())
+    .fetch_all(&mut *transaction)
+    .await
+    .map_err(|error| ServiceError::Storage(error.to_string()))?;
+    for (rule_id, payload) in rule_rows {
+        let mut rule: DictionaryRule = serde_json::from_str(&payload)
+            .map_err(|error| ServiceError::Internal(error.to_string()))?;
+        rule.character_id = Some(CharacterId::from_uuid(input.target_character_id));
+        sqlx::query("UPDATE dictionary_rules SET character_id = ?, payload = ? WHERE id = ?")
+            .bind(input.target_character_id.to_string())
+            .bind(
+                serde_json::to_string(&rule)
+                    .map_err(|error| ServiceError::Internal(error.to_string()))?,
+            )
+            .bind(rule_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| ServiceError::Storage(error.to_string()))?;
+    }
+
+    let target_assignment = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM voice_assignments WHERE project_id = ? AND character_id = ?",
+    )
+    .bind(project_id.to_string())
+    .bind(input.target_character_id.to_string())
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(|error| ServiceError::Storage(error.to_string()))?;
+    let source_assignment = sqlx::query_as::<_, (String, String)>(
+        "SELECT id, payload FROM voice_assignments WHERE project_id = ? AND character_id = ?",
+    )
+    .bind(project_id.to_string())
+    .bind(source_id.to_string())
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(|error| ServiceError::Storage(error.to_string()))?;
+    let inherited_voice = target_assignment.is_none() && source_assignment.is_some();
+    if let Some((assignment_id, payload)) = source_assignment {
+        if target_assignment.is_some() {
+            sqlx::query("DELETE FROM voice_assignments WHERE id = ?")
+                .bind(assignment_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| ServiceError::Storage(error.to_string()))?;
+        } else {
+            let mut assignment: VoiceAssignment = serde_json::from_str(&payload)
+                .map_err(|error| ServiceError::Internal(error.to_string()))?;
+            assignment.speaker = if target.role == CharacterRole::Narrator {
+                Speaker::Narrator
+            } else {
+                Speaker::Character(CharacterId::from_uuid(input.target_character_id))
+            };
+            assignment.updated_at = Utc::now();
+            let speaker_key = if target.role == CharacterRole::Narrator {
+                "narrator".to_owned()
+            } else {
+                format!("character:{}", input.target_character_id)
+            };
+            sqlx::query(
+                "UPDATE voice_assignments SET character_id = ?, speaker_key = ?, updated_at = ?, \
+                 payload = ? WHERE id = ?",
+            )
+            .bind(input.target_character_id.to_string())
+            .bind(speaker_key)
+            .bind(assignment.updated_at.to_rfc3339())
+            .bind(
+                serde_json::to_string(&assignment)
+                    .map_err(|error| ServiceError::Internal(error.to_string()))?,
+            )
+            .bind(assignment_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| ServiceError::Storage(error.to_string()))?;
+        }
+    }
+
+    sqlx::query(
+        "UPDATE characters SET role = ?, canonical_name = ?, updated_at = ?, payload = ? WHERE id = ?",
+    )
+    .bind(if target.role == CharacterRole::Narrator {
+        "narrator"
+    } else {
+        "character"
+    })
+    .bind(&target.canonical_name)
+    .bind(target.updated_at.to_rfc3339())
+    .bind(
+        serde_json::to_string(&target)
+            .map_err(|error| ServiceError::Internal(error.to_string()))?,
+    )
+    .bind(input.target_character_id.to_string())
+    .execute(&mut *transaction)
+    .await
+    .map_err(|error| ServiceError::Storage(error.to_string()))?;
+    sqlx::query("DELETE FROM character_aliases WHERE character_id = ?")
+        .bind(input.target_character_id.to_string())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| ServiceError::Storage(error.to_string()))?;
+    for alias in &target.aliases {
+        sqlx::query(
+            "INSERT INTO character_aliases (character_id, alias, normalized_alias) VALUES (?, ?, ?)",
+        )
+        .bind(input.target_character_id.to_string())
+        .bind(alias)
+        .bind(alias.to_lowercase())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| ServiceError::Storage(error.to_string()))?;
+    }
+    sqlx::query("DELETE FROM characters WHERE id = ? AND project_id = ?")
+        .bind(source_id.to_string())
+        .bind(project_id.to_string())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| ServiceError::Storage(error.to_string()))?;
+    let character_revision = advance_character_revision_tx(
+        &mut transaction,
+        project_id,
+        input.expected_character_revision,
+        false,
+    )
+    .await?;
+    transaction
+        .commit()
+        .await
+        .map_err(|error| ServiceError::Storage(error.to_string()))?;
+
+    let updated = {
+        let mut catalog = state.catalog.write().await;
+        for rule in &mut catalog.pronunciation_rules {
+            if rule.character_id == Some(source_id) {
+                rule.character_id = Some(input.target_character_id);
+            }
+        }
+        let characters = catalog
+            .characters
+            .get_mut(&project_id)
+            .ok_or(ServiceError::NotFound)?;
+        let source_view = characters
+            .iter()
+            .find(|character| character.id == source_id)
+            .cloned()
+            .ok_or(ServiceError::NotFound)?;
+        characters.retain(|character| character.id != source_id);
+        let target_view = characters
+            .iter_mut()
+            .find(|character| character.id == input.target_character_id)
+            .ok_or(ServiceError::NotFound)?;
+        target_view.aliases = target.aliases;
+        target_view.evidence.extend(source_view.evidence);
+        target_view.dialogue_count = target_view.evidence.len();
+        if target_view.voice_assignment.is_none() {
+            target_view.voice_assignment = source_view.voice_assignment;
+        }
+        target_view.clone()
+    };
+    sync_character_review_catalog(&state, project_id, false, character_revision).await?;
+    state.events.publish(
+        "character.updated",
+        serde_json::json!({
+            "projectId": project_id,
+            "characterId": input.target_character_id,
+            "removedCharacterId": source_id,
+            "characterRevision": character_revision,
+            "operation": "merged",
+        }),
+    );
+    Ok(Json(crate::models::CharacterMutationView {
+        character: Some(updated),
+        removed_character_id: Some(source_id),
+        inherited_voice: Some(inherited_voice),
+        character_revision,
+    }))
+}
+
+#[allow(clippy::too_many_lines)]
+async fn delete_character(
+    State(state): State<Arc<AppState>>,
+    Path((project_id, character_id)): Path<(Uuid, Uuid)>,
+    Json(input): Json<CharacterRevisionInput>,
+) -> Result<Json<crate::models::CharacterMutationView>, ServiceError> {
+    use audiobookai_core::{Character, CharacterRole};
+
+    let project_lock = state.character_lifecycle_lock(project_id).await;
+    let _project_guard = project_lock.lock().await;
+    if let Some(job) = blocking_character_job(&state, project_id).await {
+        return Err(active_job_conflict(&job));
+    }
+    let (role, payload) = sqlx::query_as::<_, (String, String)>(
+        "SELECT role, payload FROM characters WHERE id = ? AND project_id = ?",
+    )
+    .bind(character_id.to_string())
+    .bind(project_id.to_string())
+    .fetch_optional(state.database.pool())
+    .await
+    .map_err(|error| ServiceError::Storage(error.to_string()))?
+    .ok_or(ServiceError::NotFound)?;
+    let mut character: Character = serde_json::from_str(&payload)
+        .map_err(|error| ServiceError::Internal(error.to_string()))?;
+    character.role = if role == "narrator" {
+        CharacterRole::Narrator
+    } else {
+        CharacterRole::Character
+    };
+    if character.role == CharacterRole::Narrator {
+        return Err(ServiceError::ConflictDetails {
+            code: "protected_narrator",
+            detail: "the narrator cannot be deleted".to_owned(),
+            meta: serde_json::json!({ "characterId": character_id }),
+        });
+    }
+    let dialogue_count =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM dialogue_spans WHERE character_id = ?")
+            .bind(character_id.to_string())
+            .fetch_one(state.database.pool())
+            .await
+            .map_err(|error| ServiceError::Storage(error.to_string()))?;
+    let override_count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM speaker_overrides WHERE speaker_character_id = ?",
+    )
+    .bind(character_id.to_string())
+    .fetch_one(state.database.pool())
+    .await
+    .map_err(|error| ServiceError::Storage(error.to_string()))?;
+    let rule_count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM dictionary_rules WHERE character_id = ?",
+    )
+    .bind(character_id.to_string())
+    .fetch_one(state.database.pool())
+    .await
+    .map_err(|error| ServiceError::Storage(error.to_string()))?;
+    if dialogue_count + override_count + rule_count > 0 {
+        return Err(ServiceError::ConflictDetails {
+            code: "character_in_use",
+            detail: "merge this referenced character into another identity before deleting it"
+                .to_owned(),
+            meta: serde_json::json!({
+                "dialogueSpans": dialogue_count,
+                "speakerOverrides": override_count,
+                "pronunciationRules": rule_count,
+                "mergeRequired": true,
+            }),
+        });
+    }
+    let mut transaction = state
+        .database
+        .pool()
+        .begin()
+        .await
+        .map_err(|error| ServiceError::Storage(error.to_string()))?;
+    sqlx::query("DELETE FROM voice_assignments WHERE project_id = ? AND character_id = ?")
+        .bind(project_id.to_string())
+        .bind(character_id.to_string())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| ServiceError::Storage(error.to_string()))?;
+    sqlx::query("DELETE FROM characters WHERE id = ? AND project_id = ?")
+        .bind(character_id.to_string())
+        .bind(project_id.to_string())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| ServiceError::Storage(error.to_string()))?;
+    let character_revision = advance_character_revision_tx(
+        &mut transaction,
+        project_id,
+        input.expected_character_revision,
+        false,
+    )
+    .await?;
+    transaction
+        .commit()
+        .await
+        .map_err(|error| ServiceError::Storage(error.to_string()))?;
+    {
+        let mut catalog = state.catalog.write().await;
+        let characters = catalog
+            .characters
+            .get_mut(&project_id)
+            .ok_or(ServiceError::NotFound)?;
+        characters.retain(|character| character.id != character_id);
+    }
+    sync_character_review_catalog(&state, project_id, false, character_revision).await?;
+    state.events.publish(
+        "character.updated",
+        serde_json::json!({
+            "projectId": project_id,
+            "removedCharacterId": character_id,
+            "characterRevision": character_revision,
+            "operation": "deleted",
+        }),
+    );
+    Ok(Json(crate::models::CharacterMutationView {
+        character: None,
+        removed_character_id: Some(character_id),
+        inherited_voice: None,
+        character_revision,
+    }))
 }
 
 async fn approve_character_review(
     State(state): State<Arc<AppState>>,
     Path(project_id): Path<Uuid>,
     Json(input): Json<ReviewInput>,
-) -> Result<StatusCode, ServiceError> {
+) -> Result<Json<serde_json::Value>, ServiceError> {
+    let project_lock = state.character_lifecycle_lock(project_id).await;
+    let _project_guard = project_lock.lock().await;
+    if let Some(job) = blocking_character_job(&state, project_id).await {
+        return Err(active_job_conflict(&job));
+    }
     if input.approved {
         let catalog = state.catalog.read().await;
         let characters = catalog.characters.get(&project_id).ok_or_else(|| {
@@ -1271,31 +2235,92 @@ async fn approve_character_review(
                     .to_owned(),
             ));
         }
+        if characters
+            .iter()
+            .filter(|character| matches!(character.role, audiobookai_core::CharacterRole::Narrator))
+            .count()
+            != 1
+        {
+            return Err(ServiceError::Conflict(
+                "character review must contain exactly one narrator".to_owned(),
+            ));
+        }
     }
-    set_project_review_state(&state, project_id, input.approved).await?;
+    let mut transaction = state
+        .database
+        .pool()
+        .begin()
+        .await
+        .map_err(|error| ServiceError::Storage(error.to_string()))?;
+    let character_revision = advance_character_revision_tx(
+        &mut transaction,
+        project_id,
+        input.expected_character_revision,
+        input.approved,
+    )
+    .await?;
+    transaction
+        .commit()
+        .await
+        .map_err(|error| ServiceError::Storage(error.to_string()))?;
+    sync_character_review_catalog(&state, project_id, input.approved, character_revision).await?;
     state.events.publish(
         "character-review.updated",
-        serde_json::json!({ "projectId": project_id, "approved": input.approved }),
+        serde_json::json!({
+            "projectId": project_id,
+            "approved": input.approved,
+            "characterRevision": character_revision,
+        }),
     );
-    Ok(StatusCode::NO_CONTENT)
+    Ok(Json(serde_json::json!({
+        "reviewStatus": if input.approved { "approved" } else { "needs_review" },
+        "characterRevision": character_revision,
+    })))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VoiceAssignmentInput {
+    provider_profile_id: Uuid,
+    provider_name: String,
+    voice_id: Uuid,
+    voice_name: String,
+    model: Option<String>,
+    #[serde(default)]
+    performance: audiobookai_core::PerformanceSettings,
+    #[serde(default)]
+    timing: audiobookai_core::TimingSettings,
+    expected_character_revision: u64,
+}
+
+#[allow(clippy::too_many_lines)]
 async fn assign_voice(
     State(state): State<Arc<AppState>>,
     Path((project_id, character_id)): Path<(Uuid, Uuid)>,
-    Json(assignment): Json<VoiceAssignmentView>,
-) -> Result<Json<crate::models::CharacterView>, ServiceError> {
+    Json(input): Json<VoiceAssignmentInput>,
+) -> Result<Json<crate::models::CharacterMutationView>, ServiceError> {
     let _model_lifecycle_guard = state.model_lifecycle.lock().await;
-    let (voice, source_id) = {
+    let project_lock = state.character_lifecycle_lock(project_id).await;
+    let _project_guard = project_lock.lock().await;
+    if let Some(job) = blocking_character_job(&state, project_id).await {
+        return Err(active_job_conflict(&job));
+    }
+    let mut assignment = VoiceAssignmentView {
+        provider_profile_id: input.provider_profile_id,
+        provider_name: input.provider_name,
+        voice_id: input.voice_id,
+        voice_name: input.voice_name,
+        model: input.model,
+        performance: input.performance,
+        timing: input.timing,
+    };
+    let (voice, source_id, provider) = {
         let catalog = state.catalog.read().await;
-        if !catalog
+        let provider = catalog
             .providers
-            .contains_key(&assignment.provider_profile_id)
-        {
-            return Err(ServiceError::InvalidRequest(
-                "unknown provider profile".to_owned(),
-            ));
-        }
+            .get(&assignment.provider_profile_id)
+            .cloned()
+            .ok_or_else(|| ServiceError::InvalidRequest("unknown provider profile".to_owned()))?;
         let voice = catalog
             .voices
             .iter()
@@ -1316,15 +2341,25 @@ async fn assign_voice(
             .ok_or_else(|| {
                 ServiceError::Conflict("refresh the provider voice catalog first".to_owned())
             })?;
-        (voice, source_id)
+        (voice, source_id, provider)
     };
-    if assignment.voice_name != voice.name {
-        return Err(ServiceError::InvalidRequest(
-            "unknown provider profile".to_owned(),
-        ));
-    }
+    assignment.provider_name.clone_from(&provider.name);
+    assignment.voice_name.clone_from(&voice.name);
+    validate_voice_direction(
+        &assignment.performance,
+        &assignment.timing,
+        assignment.model.as_deref().or(provider.model.as_deref()),
+        provider.capabilities.as_ref(),
+    )?;
+    let mut transaction = state
+        .database
+        .pool()
+        .begin()
+        .await
+        .map_err(|error| ServiceError::Storage(error.to_string()))?;
     persist_voice_assignment(
         &state,
+        &mut transaction,
         project_id,
         character_id,
         &voice,
@@ -1332,6 +2367,17 @@ async fn assign_voice(
         &assignment,
     )
     .await?;
+    let character_revision = advance_character_revision_tx(
+        &mut transaction,
+        project_id,
+        input.expected_character_revision,
+        false,
+    )
+    .await?;
+    transaction
+        .commit()
+        .await
+        .map_err(|error| ServiceError::Storage(error.to_string()))?;
     let updated = {
         let mut catalog = state.catalog.write().await;
         let characters = catalog
@@ -1345,60 +2391,90 @@ async fn assign_voice(
         character.voice_assignment = Some(assignment);
         character.clone()
     };
-    set_project_review_state(&state, project_id, false).await?;
-    Ok(Json(updated))
+    sync_character_review_catalog(&state, project_id, false, character_revision).await?;
+    Ok(Json(crate::models::CharacterMutationView {
+        character: Some(updated),
+        removed_character_id: None,
+        inherited_voice: None,
+        character_revision,
+    }))
 }
 
-async fn set_project_review_state(
-    state: &AppState,
-    project_id: Uuid,
-    approved: bool,
+pub(crate) fn validate_voice_direction(
+    performance: &audiobookai_core::PerformanceSettings,
+    timing: &audiobookai_core::TimingSettings,
+    model: Option<&str>,
+    capabilities: Option<&ProviderCapabilitiesView>,
 ) -> Result<(), ServiceError> {
-    use audiobookai_core::{ProjectId, ProjectStatus};
+    use audiobookai_core::Validate;
 
-    let repository = state.database.repositories().projects;
-    let mut project = repository
-        .get_project(ProjectId::from_uuid(project_id))
-        .await
-        .map_err(|error| ServiceError::Storage(error.to_string()))?
-        .ok_or(ServiceError::NotFound)?;
-    project.status = if approved {
-        ProjectStatus::Ready
-    } else {
-        ProjectStatus::NeedsCharacterReview
-    };
-    project.character_reviewed_at = approved.then(Utc::now);
-    project.updated_at = Utc::now();
-    let revision = sqlx::query_scalar::<_, i64>("SELECT revision FROM projects WHERE id = ?")
-        .bind(project_id.to_string())
-        .fetch_one(state.database.pool())
-        .await
-        .map_err(|error| ServiceError::Storage(error.to_string()))?;
-    repository
-        .update_project(
-            &project,
-            u64::try_from(revision)
-                .map_err(|_| ServiceError::Internal("stored revision is invalid".to_owned()))?,
+    if let Some(issue) = performance.validation_issues().into_iter().next() {
+        return Err(ServiceError::InvalidRequest(issue.message));
+    }
+    if let Some(issue) = timing.validation_issues().into_iter().next() {
+        return Err(ServiceError::InvalidRequest(issue.message));
+    }
+    if performance.is_empty() {
+        return Ok(());
+    }
+    let model = model.ok_or_else(|| {
+        ServiceError::InvalidRequest(
+            "select an exact TTS model before setting performance controls".to_owned(),
         )
-        .await
-        .map_err(|error| ServiceError::Storage(error.to_string()))?;
+    })?;
+    let descriptor = capabilities
+        .and_then(|values| {
+            values
+                .model_performance
+                .iter()
+                .find(|descriptor| descriptor.model == model)
+        })
+        .ok_or_else(|| {
+            ServiceError::InvalidRequest(
+                "the selected provider model has no verified performance controls".to_owned(),
+            )
+        })?;
+    validate_performance_value("speed", performance.speed, descriptor.performance.speed)?;
+    validate_performance_value("pitch", performance.pitch, descriptor.performance.pitch)?;
+    validate_performance_value(
+        "stability",
+        performance.stability,
+        descriptor.performance.stability,
+    )?;
+    validate_performance_value(
+        "similarity",
+        performance.similarity,
+        descriptor.performance.similarity,
+    )?;
+    validate_performance_value("style", performance.style, descriptor.performance.style)?;
+    if performance.speaker_boost.is_some() && !descriptor.performance.speaker_boost {
+        return Err(ServiceError::InvalidRequest(
+            "speaker boost is not supported by the selected model".to_owned(),
+        ));
+    }
+    if let Some(cue) = performance.delivery_cue
+        && !descriptor.performance.delivery_cues.contains(&cue)
+    {
+        return Err(ServiceError::InvalidRequest(
+            "the selected delivery cue is not supported by the selected model".to_owned(),
+        ));
+    }
+    Ok(())
+}
 
-    let mut catalog = state.catalog.write().await;
-    let view = catalog
-        .projects
-        .get_mut(&project_id)
-        .ok_or(ServiceError::NotFound)?;
-    view.character_review_status = if approved {
-        ReviewStatus::Approved
-    } else {
-        ReviewStatus::NeedsReview
+fn validate_performance_value(
+    name: &str,
+    value: Option<f64>,
+    range: Option<audiobookai_core::PerformanceRange>,
+) -> Result<(), ServiceError> {
+    let Some(value) = value else {
+        return Ok(());
     };
-    view.summary.status = if approved {
-        ProjectDisplayStatus::Ready
-    } else {
-        ProjectDisplayStatus::Draft
-    };
-    view.summary.updated_at = project.updated_at;
+    if !range.is_some_and(|range| range.contains(value)) {
+        return Err(ServiceError::InvalidRequest(format!(
+            "{name} is not supported at this value by the selected model"
+        )));
+    }
     Ok(())
 }
 
@@ -1407,6 +2483,7 @@ async fn set_project_review_state(
 #[allow(clippy::too_many_lines)]
 async fn persist_voice_assignment(
     state: &AppState,
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     project_id: Uuid,
     character_id: Uuid,
     voice: &VoiceView,
@@ -1422,7 +2499,7 @@ async fn persist_voice_assignment(
     let existing_profile =
         sqlx::query_scalar::<_, String>("SELECT payload FROM voice_profiles WHERE id = ?")
             .bind(voice.id.to_string())
-            .fetch_optional(state.database.pool())
+            .fetch_optional(&mut **transaction)
             .await
             .map_err(|error| ServiceError::Storage(error.to_string()))?
             .and_then(|payload| serde_json::from_str::<VoiceProfile>(&payload).ok());
@@ -1488,7 +2565,7 @@ async fn persist_voice_assignment(
         serde_json::to_string(&profile)
             .map_err(|error| ServiceError::Internal(error.to_string()))?,
     )
-    .execute(state.database.pool())
+    .execute(&mut **transaction)
     .await
     .map_err(|error| ServiceError::Storage(error.to_string()))?;
 
@@ -1503,8 +2580,9 @@ async fn persist_voice_assignment(
                 .iter()
                 .find(|character| character.id == character_id)
         })
-        .is_some_and(|character| character.canonical_name.eq_ignore_ascii_case("narrator"))
-    {
+        .is_some_and(|character| {
+            matches!(character.role, audiobookai_core::CharacterRole::Narrator)
+        }) {
         Speaker::Narrator
     } else {
         Speaker::Character(CharacterId::from_uuid(character_id))
@@ -1519,7 +2597,7 @@ async fn persist_voice_assignment(
     )
     .bind(project_id.to_string())
     .bind(&speaker_key)
-    .fetch_optional(state.database.pool())
+    .fetch_optional(&mut **transaction)
     .await
     .map_err(|error| ServiceError::Storage(error.to_string()))?
     .and_then(|payload| serde_json::from_str::<VoiceAssignment>(&payload).ok());
@@ -1532,17 +2610,19 @@ async fn persist_voice_assignment(
         voice_profile_id: profile.id,
         provider_profile_id: profile.provider_profile_id,
         model: assignment.model.clone(),
+        performance: assignment.performance.clone(),
+        timing: assignment.timing.clone(),
         settings: std::collections::BTreeMap::new(),
         created_at: existing.as_ref().map_or(now, |stored| stored.created_at),
         updated_at: now,
     };
     sqlx::query(
         "INSERT INTO voice_assignments \
-         (id, project_id, provider_id, voice_profile_id, speaker_key, updated_at, payload) \
-         VALUES (?, ?, ?, ?, ?, ?, ?) \
+         (id, project_id, provider_id, voice_profile_id, speaker_key, updated_at, payload, character_id) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(project_id, speaker_key) DO UPDATE SET provider_id = excluded.provider_id, \
          voice_profile_id = excluded.voice_profile_id, updated_at = excluded.updated_at, \
-         payload = excluded.payload",
+         payload = excluded.payload, character_id = excluded.character_id",
     )
     .bind(domain_assignment.id.to_string())
     .bind(domain_assignment.project_id.to_string())
@@ -1554,7 +2634,8 @@ async fn persist_voice_assignment(
         serde_json::to_string(&domain_assignment)
             .map_err(|error| ServiceError::Internal(error.to_string()))?,
     )
-    .execute(state.database.pool())
+    .bind(character_id.to_string())
+    .execute(&mut **transaction)
     .await
     .map_err(|error| ServiceError::Storage(error.to_string()))?;
     Ok(())
@@ -1566,6 +2647,15 @@ struct SpeakerOverrideInput {
     character_id: Option<Uuid>,
     start_offset: usize,
     end_offset: usize,
+    expected_character_revision: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeleteSpeakerOverrideInput {
+    start_offset: usize,
+    end_offset: usize,
+    expected_character_revision: u64,
 }
 
 // Override validation, durable storage, and catalog projection are one atomic
@@ -1580,6 +2670,11 @@ async fn upsert_speaker_override(
         CharacterId, Paragraph, ParagraphId, ProjectId, Speaker, SpeakerOverride, SpeakerOverrideId,
     };
 
+    let project_lock = state.character_lifecycle_lock(project_id).await;
+    let _project_guard = project_lock.lock().await;
+    if let Some(job) = blocking_character_job(&state, project_id).await {
+        return Err(active_job_conflict(&job));
+    }
     let paragraph_payload = sqlx::query_scalar::<_, String>(
         "SELECT p.payload FROM paragraphs p \
          JOIN chapters c ON c.id = p.chapter_id \
@@ -1604,30 +2699,39 @@ async fn upsert_speaker_override(
                 .to_owned(),
         ));
     }
-    let (speaker, speaker_name) = if let Some(character_id) = input.character_id {
-        let name = state
+    let (speaker, speaker_name, speaker_character_id) = if let Some(character_id) =
+        input.character_id
+    {
+        let character = state
             .catalog
             .read()
             .await
             .characters
             .get(&project_id)
             .and_then(|characters| characters.iter().find(|item| item.id == character_id))
-            .map(|character| character.canonical_name.clone())
+            .cloned()
             .ok_or_else(|| ServiceError::InvalidRequest("unknown project character".to_owned()))?;
-        (
-            Speaker::Character(CharacterId::from_uuid(character_id)),
-            name,
-        )
+        if matches!(character.role, audiobookai_core::CharacterRole::Narrator) {
+            (Speaker::Narrator, character.canonical_name, None)
+        } else {
+            (
+                Speaker::Character(CharacterId::from_uuid(character_id)),
+                character.canonical_name,
+                Some(character_id),
+            )
+        }
     } else {
-        (Speaker::Narrator, "Narrator".to_owned())
+        (Speaker::Narrator, "Narrator".to_owned(), None)
     };
     let existing_id = sqlx::query_scalar::<_, String>(
         "SELECT id FROM speaker_overrides \
-         WHERE project_id = ? AND paragraph_id = ? AND byte_start = ? AND byte_end = ? \
+         WHERE project_id = ? AND paragraph_id = ? AND source_content_hash = ? \
+         AND byte_start = ? AND byte_end = ? \
          ORDER BY updated_at DESC LIMIT 1",
     )
     .bind(project_id.to_string())
     .bind(paragraph_id.to_string())
+    .bind(&paragraph.content_hash)
     .bind(
         i64::try_from(input.start_offset)
             .map_err(|_| ServiceError::InvalidRequest("offset is too large".to_owned()))?,
@@ -1654,12 +2758,19 @@ async fn upsert_speaker_override(
         created_at: now,
         updated_at: now,
     };
+    let mut transaction = state
+        .database
+        .pool()
+        .begin()
+        .await
+        .map_err(|error| ServiceError::Storage(error.to_string()))?;
     sqlx::query(
         "INSERT INTO speaker_overrides \
-         (id, project_id, paragraph_id, source_content_hash, byte_start, byte_end, updated_at, payload) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
-         ON CONFLICT(id) DO UPDATE SET source_content_hash = excluded.source_content_hash, \
-         updated_at = excluded.updated_at, payload = excluded.payload",
+         (id, project_id, paragraph_id, source_content_hash, byte_start, byte_end, updated_at, payload, speaker_character_id) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(project_id, paragraph_id, source_content_hash, byte_start, byte_end) \
+         DO UPDATE SET updated_at = excluded.updated_at, payload = excluded.payload, \
+         speaker_character_id = excluded.speaker_character_id",
     )
     .bind(record.id.to_string())
     .bind(record.project_id.to_string())
@@ -1669,9 +2780,21 @@ async fn upsert_speaker_override(
     .bind(i64::try_from(record.byte_end).unwrap_or(i64::MAX))
     .bind(record.updated_at.to_rfc3339())
     .bind(serde_json::to_string(&record).map_err(|error| ServiceError::Internal(error.to_string()))?)
-    .execute(state.database.pool())
+    .bind(speaker_character_id.map(|id| id.to_string()))
+    .execute(&mut *transaction)
     .await
     .map_err(|error| ServiceError::Storage(error.to_string()))?;
+    let character_revision = advance_character_revision_tx(
+        &mut transaction,
+        project_id,
+        input.expected_character_revision,
+        false,
+    )
+    .await?;
+    transaction
+        .commit()
+        .await
+        .map_err(|error| ServiceError::Storage(error.to_string()))?;
     apply_speaker_override_to_catalog(
         &state,
         project_id,
@@ -1681,34 +2804,94 @@ async fn upsert_speaker_override(
         Some(speaker_name),
     )
     .await;
-    set_project_review_state(&state, project_id, false).await?;
+    sync_character_review_catalog(&state, project_id, false, character_revision).await?;
     Ok(Json(serde_json::json!({
         "id": record.id.as_uuid(),
         "projectId": project_id,
         "paragraphId": paragraph_id,
         "startOffset": input.start_offset,
         "endOffset": input.end_offset,
-        "characterId": input.character_id,
+        "characterId": speaker_character_id,
+        "characterRevision": character_revision,
     })))
 }
 
 async fn delete_speaker_override(
     State(state): State<Arc<AppState>>,
     Path((project_id, paragraph_id)): Path<(Uuid, Uuid)>,
-) -> Result<StatusCode, ServiceError> {
-    let result =
-        sqlx::query("DELETE FROM speaker_overrides WHERE project_id = ? AND paragraph_id = ?")
-            .bind(project_id.to_string())
-            .bind(paragraph_id.to_string())
-            .execute(state.database.pool())
-            .await
-            .map_err(|error| ServiceError::Storage(error.to_string()))?;
+    Json(input): Json<DeleteSpeakerOverrideInput>,
+) -> Result<Json<serde_json::Value>, ServiceError> {
+    let project_lock = state.character_lifecycle_lock(project_id).await;
+    let _project_guard = project_lock.lock().await;
+    if let Some(job) = blocking_character_job(&state, project_id).await {
+        return Err(active_job_conflict(&job));
+    }
+    let content_hash = sqlx::query_scalar::<_, String>(
+        "SELECT p.content_hash FROM paragraphs p \
+         JOIN chapters c ON c.id = p.chapter_id \
+         JOIN projects pr ON pr.book_id = c.book_id \
+         WHERE p.id = ? AND pr.id = ?",
+    )
+    .bind(paragraph_id.to_string())
+    .bind(project_id.to_string())
+    .fetch_optional(state.database.pool())
+    .await
+    .map_err(|error| ServiceError::Storage(error.to_string()))?
+    .ok_or(ServiceError::NotFound)?;
+    let mut transaction = state
+        .database
+        .pool()
+        .begin()
+        .await
+        .map_err(|error| ServiceError::Storage(error.to_string()))?;
+    let result = sqlx::query(
+        "DELETE FROM speaker_overrides WHERE project_id = ? AND paragraph_id = ? \
+         AND source_content_hash = ? AND byte_start = ? AND byte_end = ?",
+    )
+    .bind(project_id.to_string())
+    .bind(paragraph_id.to_string())
+    .bind(content_hash)
+    .bind(
+        i64::try_from(input.start_offset)
+            .map_err(|_| ServiceError::InvalidRequest("offset is too large".to_owned()))?,
+    )
+    .bind(
+        i64::try_from(input.end_offset)
+            .map_err(|_| ServiceError::InvalidRequest("offset is too large".to_owned()))?,
+    )
+    .execute(&mut *transaction)
+    .await
+    .map_err(|error| ServiceError::Storage(error.to_string()))?;
     if result.rows_affected() == 0 {
         return Err(ServiceError::NotFound);
     }
-    apply_speaker_override_to_catalog(&state, project_id, paragraph_id, 0, usize::MAX, None).await;
-    set_project_review_state(&state, project_id, false).await?;
-    Ok(StatusCode::NO_CONTENT)
+    let character_revision = advance_character_revision_tx(
+        &mut transaction,
+        project_id,
+        input.expected_character_revision,
+        false,
+    )
+    .await?;
+    transaction
+        .commit()
+        .await
+        .map_err(|error| ServiceError::Storage(error.to_string()))?;
+    apply_speaker_override_to_catalog(
+        &state,
+        project_id,
+        paragraph_id,
+        input.start_offset,
+        input.end_offset,
+        None,
+    )
+    .await;
+    sync_character_review_catalog(&state, project_id, false, character_revision).await?;
+    Ok(Json(serde_json::json!({
+        "paragraphId": paragraph_id,
+        "startOffset": input.start_offset,
+        "endOffset": input.end_offset,
+        "characterRevision": character_revision,
+    })))
 }
 
 async fn apply_speaker_override_to_catalog(
@@ -1773,26 +2956,6 @@ async fn create_voice_clone(
         ProviderProfileId, VoiceOrigin, VoiceOwnership, VoiceProfile, VoiceProfileId,
     };
     use audiobookai_providers::{VoiceCloneRequest, VoiceSample};
-
-    let provider = state
-        .catalog
-        .read()
-        .await
-        .providers
-        .get(&provider_id)
-        .cloned()
-        .ok_or(ServiceError::NotFound)?;
-    if !provider_capabilities_are_fresh(&provider)
-        || !provider
-            .capabilities
-            .as_ref()
-            .is_some_and(|capabilities| capabilities.voice_cloning)
-    {
-        return Err(ServiceError::Conflict(
-            "refresh a provider that supports voice cloning before uploading reference audio"
-                .to_owned(),
-        ));
-    }
 
     let mut name = None;
     let mut description = None;
@@ -1862,13 +3025,53 @@ async fn create_voice_clone(
             "at least one referenceAudio field is required".to_owned(),
         ));
     }
-    if matches!(provider.mode, ProviderModeView::CloudRemote) {
+    // Multipart parsing is local and bounded. Acquire lifecycle guards only for the final
+    // validation-and-dispatch window so provider routing and project consent cannot change after
+    // the checks below but before reference audio leaves the device.
+    let _model_lifecycle_guard = state.model_lifecycle.lock().await;
+    let provider = state
+        .catalog
+        .read()
+        .await
+        .providers
+        .get(&provider_id)
+        .cloned()
+        .ok_or(ServiceError::NotFound)?;
+    if !provider_capabilities_are_fresh(&provider)
+        || !provider
+            .capabilities
+            .as_ref()
+            .is_some_and(|capabilities| capabilities.voice_cloning)
+        || !matches!(provider.status, ProviderStatusView::Online)
+    {
+        return Err(ServiceError::Conflict(
+            "refresh an online provider that supports voice cloning before uploading reference audio"
+                .to_owned(),
+        ));
+    }
+    if matches!(provider.mode, ProviderModeView::CloudRemote) && !provider.credential_configured {
+        return Err(ServiceError::Conflict(
+            "configure the cloud provider credential before uploading reference audio".to_owned(),
+        ));
+    }
+    let dispatch_consent_lock = if matches!(provider.mode, ProviderModeView::CloudRemote) {
         let project_id = project_id.ok_or_else(|| {
             ServiceError::InvalidRequest(
                 "projectId is required before reference audio is sent to a cloud provider"
                     .to_owned(),
             )
         })?;
+        Some(state.dispatch_consent_lifecycle_lock(project_id).await)
+    } else {
+        None
+    };
+    let _dispatch_consent_guard = if let Some(lock) = dispatch_consent_lock.as_ref() {
+        Some(lock.read().await)
+    } else {
+        None
+    };
+    if matches!(provider.mode, ProviderModeView::CloudRemote) {
+        let project_id = project_id.expect("cloud provider requires project id above");
         let consented = state
             .catalog
             .read()
@@ -2168,6 +3371,8 @@ async fn create_pronunciation_rule(
         DictionaryScope, PhonemeAlphabet, ProjectId, PronunciationDictionary,
     };
 
+    let _model_lifecycle_guard = state.model_lifecycle.lock().await;
+
     reject_empty("source", &rule.source)?;
     reject_empty("replacement", &rule.replacement)?;
     if matches!(rule.kind, crate::models::PronunciationKindView::Regex) {
@@ -2315,8 +3520,9 @@ async fn create_pronunciation_rule(
     .await
     .map_err(|error| ServiceError::Storage(error.to_string()))?;
     sqlx::query(
-        "INSERT INTO dictionary_rules (id, dictionary_id, ordinal, kind, enabled, payload) \
-         VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO dictionary_rules \
+         (id, dictionary_id, ordinal, kind, enabled, payload, character_id) \
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(domain_rule.id.to_string())
     .bind(DictionaryId::from_uuid(dictionary.id.as_uuid()).to_string())
@@ -2333,6 +3539,7 @@ async fn create_pronunciation_rule(
         serde_json::to_string(&domain_rule)
             .map_err(|error| ServiceError::Internal(error.to_string()))?,
     )
+    .bind(domain_rule.character_id.map(|id| id.to_string()))
     .execute(&mut *transaction)
     .await
     .map_err(|error| ServiceError::Storage(error.to_string()))?;
@@ -2353,6 +3560,7 @@ async fn delete_pronunciation_rule(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, ServiceError> {
+    let _model_lifecycle_guard = state.model_lifecycle.lock().await;
     let dictionary_id =
         sqlx::query_scalar::<_, String>("SELECT dictionary_id FROM dictionary_rules WHERE id = ?")
             .bind(id.to_string())
@@ -3235,10 +4443,40 @@ async fn auto_configure_mlx_profile(
     Ok(())
 }
 
+/// Rejects a runtime replacement/removal while durable work can still dispatch through it.
+///
+/// Job admission and provider mutation both hold `model_lifecycle`, so the query and the
+/// subsequent mutation form one closed window: either the job is admitted first and blocks the
+/// mutation, or the mutation completes first and the job validates the replacement profile.
+async fn ensure_provider_runtime_mutation_allowed(
+    state: &AppState,
+    provider_id: Uuid,
+) -> Result<(), ServiceError> {
+    let active_job_id = sqlx::query_scalar::<_, String>(
+        "SELECT j.id FROM jobs j JOIN job_units u ON u.job_id = j.id \
+         WHERE u.provider_id = ? \
+         AND j.state NOT IN ('cancelled', 'failed', 'completed') \
+         AND u.state NOT IN ('cancelled', 'failed', 'completed') \
+         ORDER BY j.created_at, j.id LIMIT 1",
+    )
+    .bind(provider_id.to_string())
+    .fetch_optional(state.database.pool())
+    .await
+    .map_err(|error| ServiceError::Storage(error.to_string()))?;
+    if let Some(job_id) = active_job_id {
+        return Err(ServiceError::Conflict(format!(
+            "provider runtime cannot change while job {job_id} can still dispatch through it; pause is not sufficient, cancel or finish the job first"
+        )));
+    }
+    Ok(())
+}
+
 async fn delete_provider(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, ServiceError> {
+    let _model_lifecycle_guard = state.model_lifecycle.lock().await;
+    ensure_provider_runtime_mutation_allowed(&state, id).await?;
     let profile = state
         .catalog
         .read()
@@ -3427,12 +4665,12 @@ async fn update_provider(
     Path(id): Path<Uuid>,
     Json(input): Json<ProviderProfileInput>,
 ) -> Result<Json<ProviderProfileView>, ServiceError> {
-    let updates_model = input.model.is_some();
-    let _model_lifecycle_guard = if updates_model {
-        Some(state.model_lifecycle.lock().await)
-    } else {
-        None
-    };
+    // Every PATCH currently rebuilds the capability snapshot and replaces the registered
+    // runtime, even when the visible edit appears innocuous. Serialize the complete persistence
+    // and replacement window with validation/dispatch so an admitted paid request can never be
+    // redirected to a different endpoint, consent class, adapter, or credential.
+    let _model_lifecycle_guard = state.model_lifecycle.lock().await;
+    ensure_provider_runtime_mutation_allowed(&state, id).await?;
     let credential = input.credential;
     let catalog = state.catalog.read().await;
     let old_secret_id = catalog.provider_secret_ids.get(&id).copied();
@@ -3554,14 +4792,15 @@ async fn provider_action(
     Path((id, action)): Path<(Uuid, String)>,
     input: Option<Json<ProviderActionInput>>,
 ) -> Result<Json<serde_json::Value>, ServiceError> {
-    let _model_lifecycle_guard = if matches!(
-        action.as_str(),
-        "load-model" | "unload-model" | "switch-model"
-    ) {
+    let mutates_runtime = action != "logs";
+    let _model_lifecycle_guard = if mutates_runtime {
         Some(state.model_lifecycle.lock().await)
     } else {
         None
     };
+    if mutates_runtime {
+        ensure_provider_runtime_mutation_allowed(&state, id).await?;
+    }
     let profile = state
         .catalog
         .read()
@@ -3572,7 +4811,13 @@ async fn provider_action(
         .ok_or(ServiceError::NotFound)?;
     let runtime_id = audiobookai_providers::ProviderId::new(id.to_string())
         .map_err(|error| ServiceError::Internal(error.to_string()))?;
-    if !state.providers.profile_ids().await.contains(&runtime_id) {
+    let runtime_registered = state.providers.profile_ids().await.contains(&runtime_id);
+    if !runtime_registered && !mutates_runtime {
+        return Err(ServiceError::Conflict(
+            "the provider runtime is unavailable; refresh it before requesting logs".to_owned(),
+        ));
+    }
+    if !runtime_registered {
         state.sync_provider_runtime(id).await?;
     }
     match action.as_str() {
@@ -4009,6 +5254,195 @@ async fn preflight_preview(
         .map(Json)
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VoiceAuditionCandidateInput {
+    candidate_id: String,
+    provider_profile_id: Uuid,
+    voice_id: Uuid,
+    model: Option<String>,
+    #[serde(default)]
+    performance: audiobookai_core::PerformanceSettings,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VoiceAuditionInput {
+    text: Option<String>,
+    character_id: Option<Uuid>,
+    #[serde(default)]
+    confirm_billable: bool,
+    candidates: Vec<VoiceAuditionCandidateInput>,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VoiceAuditionResult {
+    candidate_id: String,
+    provider_profile_id: Uuid,
+    voice_id: Uuid,
+    preview: Option<PreviewView>,
+    error: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VoiceAuditionResponse {
+    results: Vec<VoiceAuditionResult>,
+    potentially_billable: bool,
+}
+
+#[allow(clippy::too_many_lines)]
+async fn voice_auditions(
+    State(state): State<Arc<AppState>>,
+    Path(project_id): Path<Uuid>,
+    Json(input): Json<VoiceAuditionInput>,
+) -> Result<Json<VoiceAuditionResponse>, ServiceError> {
+    if !input.confirm_billable {
+        return Err(ServiceError::Conflict(
+            "confirm that voice auditions may consume provider credits or incur cost".to_owned(),
+        ));
+    }
+    if input.candidates.is_empty() || input.candidates.len() > 6 {
+        return Err(ServiceError::InvalidRequest(
+            "voice auditions require between one and six candidates".to_owned(),
+        ));
+    }
+    let mut ids = HashSet::new();
+    if input.candidates.iter().any(|candidate| {
+        candidate.candidate_id.trim().is_empty() || !ids.insert(&candidate.candidate_id)
+    }) {
+        return Err(ServiceError::InvalidRequest(
+            "voice audition candidate ids must be non-empty and unique".to_owned(),
+        ));
+    }
+
+    // Lock ordering is global model lifecycle, then project character lifecycle. Keep both
+    // guards through validation and dispatch so no candidate can be billed against state that
+    // changed after the batch-wide preflight.
+    let _model_lifecycle_guard = state.model_lifecycle.lock().await;
+    let project_lock = state.character_lifecycle_lock(project_id).await;
+    let _project_guard = project_lock.lock().await;
+    let project = state
+        .database
+        .repositories()
+        .projects
+        .get_project(audiobookai_core::ProjectId::from_uuid(project_id))
+        .await
+        .map_err(|error| ServiceError::Storage(error.to_string()))?
+        .ok_or(ServiceError::NotFound)?;
+
+    // Resolve and validate every candidate before the first potentially billable dispatch.
+    let assignments = {
+        let catalog = state.catalog.read().await;
+        input
+            .candidates
+            .iter()
+            .map(|candidate| {
+                let provider = catalog
+                    .providers
+                    .get(&candidate.provider_profile_id)
+                    .ok_or_else(|| {
+                        ServiceError::InvalidRequest("unknown audition provider".to_owned())
+                    })?;
+                validate_billable_tts_provider_readiness(provider)?;
+                if matches!(provider.mode, ProviderModeView::CloudRemote)
+                    && !project.cloud_consent.book_text
+                {
+                    return Err(ServiceError::Conflict(format!(
+                        "grant project consent before sending audition text to {}",
+                        provider.name
+                    )));
+                }
+                let voice = catalog
+                    .voices
+                    .iter()
+                    .find(|voice| {
+                        voice.id == candidate.voice_id
+                            && voice.provider_profile_id == candidate.provider_profile_id
+                    })
+                    .ok_or_else(|| {
+                        ServiceError::InvalidRequest(
+                            "an audition voice does not belong to its provider".to_owned(),
+                        )
+                    })?;
+                if catalog
+                    .voice_sources
+                    .get(&candidate.voice_id)
+                    .is_none_or(|source| source.trim().is_empty())
+                {
+                    return Err(ServiceError::Conflict(
+                        "an audition voice has no usable provider source".to_owned(),
+                    ));
+                }
+                validate_voice_direction(
+                    &candidate.performance,
+                    &audiobookai_core::TimingSettings::default(),
+                    candidate.model.as_deref().or(provider.model.as_deref()),
+                    provider.capabilities.as_ref(),
+                )?;
+                Ok(VoiceAssignmentView {
+                    provider_profile_id: candidate.provider_profile_id,
+                    provider_name: provider.name.clone(),
+                    voice_id: candidate.voice_id,
+                    voice_name: voice.name.clone(),
+                    model: candidate.model.clone(),
+                    performance: candidate.performance.clone(),
+                    timing: audiobookai_core::TimingSettings::default(),
+                })
+            })
+            .collect::<Result<Vec<_>, ServiceError>>()?
+    };
+
+    let mut results = Vec::with_capacity(input.candidates.len());
+    let text = input.text.clone();
+    let character_id = input.character_id;
+    for (candidate, assignment) in input.candidates.into_iter().zip(assignments) {
+        let preview = crate::conversion::audition(
+            Arc::clone(&state),
+            project_id,
+            text.clone(),
+            character_id,
+            assignment,
+        )
+        .await;
+        let (preview, error) = match preview {
+            Ok(preview) => (Some(preview), None),
+            Err(error) => (None, Some(public_audition_error(&error))),
+        };
+        results.push(VoiceAuditionResult {
+            candidate_id: candidate.candidate_id,
+            provider_profile_id: candidate.provider_profile_id,
+            voice_id: candidate.voice_id,
+            preview,
+            error,
+        });
+    }
+    Ok(Json(VoiceAuditionResponse {
+        results,
+        potentially_billable: true,
+    }))
+}
+
+fn public_audition_error(error: &ServiceError) -> String {
+    match error {
+        ServiceError::InvalidRequest(detail)
+        | ServiceError::Conflict(detail)
+        | ServiceError::Unauthorized(detail)
+        | ServiceError::Forbidden(detail)
+        | ServiceError::RateLimited(detail)
+        | ServiceError::ConflictDetails { detail, .. } => detail.clone(),
+        ServiceError::NotFound => "an audition resource is unavailable".to_owned(),
+        ServiceError::DataDirectoryUnavailable
+        | ServiceError::TlsRequiredForLan(_)
+        | ServiceError::TlsConfiguration(_)
+        | ServiceError::Io(_)
+        | ServiceError::Join(_)
+        | ServiceError::Storage(_)
+        | ServiceError::Internal(_) => "the audition could not be completed".to_owned(),
+    }
+}
+
 async fn list_jobs(State(state): State<Arc<AppState>>) -> Json<Page<JobView>> {
     let catalog = state.catalog.read().await;
     let mut jobs = catalog.jobs.values().cloned().collect::<Vec<_>>();
@@ -4036,6 +5470,11 @@ async fn start_job(
     Json(input): Json<StartJobInput>,
 ) -> Result<(StatusCode, Json<JobView>), ServiceError> {
     let _model_lifecycle_guard = state.model_lifecycle.lock().await;
+    let project_lock = state.character_lifecycle_lock(input.project_id).await;
+    let _project_guard = project_lock.lock().await;
+    if let Some(job) = blocking_character_job(&state, input.project_id).await {
+        return Err(active_job_conflict(&job));
+    }
     let (project, characters, providers) = {
         let catalog = state.catalog.read().await;
         (
@@ -4995,6 +6434,7 @@ pub(crate) async fn persist_provider(
                     reports_audio_seconds: false,
                     reports_cost: false,
                     max_input_characters: None,
+                    model_performance: capabilities.model_performance.clone(),
                 }),
                 character_detection: capabilities.character_detection.then_some({
                     CharacterDetectionCapabilities {
@@ -5234,7 +6674,7 @@ async fn priced_assignment_estimates(
     let mut remaining_characters = total_characters;
     for character in characters
         .iter()
-        .filter(|character| !character.canonical_name.eq_ignore_ascii_case("narrator"))
+        .filter(|character| !matches!(character.role, audiobookai_core::CharacterRole::Narrator))
     {
         let count = character
             .evidence
@@ -5251,7 +6691,7 @@ async fn priced_assignment_estimates(
     }
     if let Some(narrator) = characters
         .iter()
-        .find(|character| character.canonical_name.eq_ignore_ascii_case("narrator"))
+        .find(|character| matches!(character.role, audiobookai_core::CharacterRole::Narrator))
     {
         by_character.insert(narrator.id, remaining_characters);
     }
@@ -6065,11 +7505,17 @@ fn status_check(
     }
 }
 
-fn new_job(project_id: Uuid, project_title: String, units: Vec<JobUnitView>) -> JobView {
+fn new_job(
+    project_id: Uuid,
+    project_title: String,
+    kind: crate::models::JobKindView,
+    units: Vec<JobUnitView>,
+) -> JobView {
     JobView {
         id: Uuid::new_v4(),
         project_id,
         project_title,
+        kind,
         status: JobStatusView::Queued,
         progress: 0.0,
         current_stage: None,
@@ -6341,13 +7787,75 @@ fn default_capabilities(
             _ => Vec::new(),
         },
         max_concurrency: Some(1),
+        model_performance: default_model_performance(kind),
     }
 }
 
-fn provider_capabilities_are_fresh(profile: &ProviderProfileView) -> bool {
+fn default_model_performance(
+    kind: &ProviderKindView,
+) -> Vec<audiobookai_core::ModelPerformanceCapabilities> {
+    use audiobookai_core::{
+        ModelPerformanceCapabilities, PerformanceCapabilities, PerformanceRange,
+    };
+
+    if !matches!(kind, ProviderKindView::Elevenlabs) {
+        return Vec::new();
+    }
+    let performance = PerformanceCapabilities {
+        speed: Some(PerformanceRange::new(0.7, 1.2)),
+        pitch: None,
+        stability: Some(PerformanceRange::new(0.0, 1.0)),
+        similarity: Some(PerformanceRange::new(0.0, 1.0)),
+        style: Some(PerformanceRange::new(0.0, 1.0)),
+        speaker_boost: true,
+        delivery_cues: Vec::new(),
+    };
+    [
+        "eleven_multilingual_v2",
+        "eleven_flash_v2_5",
+        "eleven_turbo_v2_5",
+    ]
+    .into_iter()
+    .map(|model| ModelPerformanceCapabilities {
+        model: model.to_owned(),
+        performance: performance.clone(),
+    })
+    .collect()
+}
+
+pub(crate) fn provider_capabilities_are_fresh(profile: &ProviderProfileView) -> bool {
     profile
         .capability_updated_at
         .is_some_and(|observed_at| observed_at + ChronoDuration::hours(24) > Utc::now())
+}
+
+pub(crate) fn validate_billable_tts_provider_readiness(
+    profile: &ProviderProfileView,
+) -> Result<(), ServiceError> {
+    if !provider_capabilities_are_fresh(profile)
+        || !profile
+            .capabilities
+            .as_ref()
+            .is_some_and(|capabilities| capabilities.tts)
+    {
+        return Err(ServiceError::Conflict(format!(
+            "refresh provider '{}' to verify its current TTS capability",
+            profile.name
+        )));
+    }
+    if !matches!(profile.status, ProviderStatusView::Online) {
+        return Err(ServiceError::Conflict(format!(
+            "provider '{}' must be online before paid synthesis",
+            profile.name
+        )));
+    }
+    if matches!(profile.mode, ProviderModeView::CloudRemote) && !profile.credential_configured {
+        return Err(ServiceError::Conflict(format!(
+            "configure a credential for cloud provider '{}' before paid synthesis",
+            profile.name
+        )));
+    }
+    Ok(())
 }
 
 fn assign_bool(value: &serde_json::Value, key: &str, target: &mut bool) {
@@ -6427,6 +7935,86 @@ fn json_f32(value: &serde_json::Value, key: &str) -> Result<f32, ServiceError> {
 mod tests {
     use super::*;
 
+    fn billable_tts_provider_fixture() -> ProviderProfileView {
+        ProviderProfileView {
+            id: Uuid::new_v4(),
+            name: "TTS fixture".to_owned(),
+            kind: ProviderKindView::Localai,
+            mode: ProviderModeView::ExternalEndpoint,
+            endpoint: Some("http://127.0.0.1:8080".to_owned()),
+            executable_path: None,
+            working_directory: None,
+            arguments: Vec::new(),
+            status: ProviderStatusView::Online,
+            model: Some("tts-model".to_owned()),
+            credential_configured: false,
+            capabilities: Some(default_capabilities(
+                &ProviderKindView::Localai,
+                ProviderModeView::ExternalEndpoint,
+            )),
+            capability_source: Some("test".to_owned()),
+            capability_updated_at: Some(Utc::now()),
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn billable_tts_readiness_requires_fresh_online_and_configured_cloud_provider() {
+        let ready = billable_tts_provider_fixture();
+        validate_billable_tts_provider_readiness(&ready).expect("fresh local provider");
+
+        let mut stale = ready.clone();
+        stale.capability_updated_at = Some(Utc::now() - ChronoDuration::hours(25));
+        assert!(validate_billable_tts_provider_readiness(&stale).is_err());
+
+        let mut offline = ready.clone();
+        offline.status = ProviderStatusView::Offline;
+        assert!(validate_billable_tts_provider_readiness(&offline).is_err());
+
+        let mut cloud = ready;
+        cloud.mode = ProviderModeView::CloudRemote;
+        assert!(validate_billable_tts_provider_readiness(&cloud).is_err());
+        cloud.credential_configured = true;
+        validate_billable_tts_provider_readiness(&cloud).expect("configured cloud provider");
+    }
+
+    #[test]
+    fn project_mutation_admission_includes_regeneration_and_proof_export() {
+        for kind in [
+            crate::models::JobKindView::CharacterDetection,
+            crate::models::JobKindView::Conversion,
+            crate::models::JobKindView::SegmentRegeneration,
+            crate::models::JobKindView::Export,
+        ] {
+            assert!(
+                blocks_project_mutation(kind),
+                "{kind:?} must block mutation"
+            );
+        }
+        for kind in [
+            crate::models::JobKindView::Preview,
+            crate::models::JobKindView::QualityControl,
+            crate::models::JobKindView::CacheCleanup,
+        ] {
+            assert!(
+                !blocks_project_mutation(kind),
+                "{kind:?} must not block mutation"
+            );
+        }
+    }
+
+    #[test]
+    fn character_review_revision_uses_the_public_camel_case_contract() {
+        let input: ReviewInput = serde_json::from_value(serde_json::json!({
+            "approved": true,
+            "expectedCharacterRevision": 7,
+        }))
+        .expect("review input");
+
+        assert!(input.approved);
+        assert_eq!(input.expected_character_revision, 7);
+    }
+
     fn project_fixture() -> ProjectDetail {
         let now = Utc::now();
         ProjectDetail {
@@ -6461,6 +8049,7 @@ mod tests {
                 status: ChapterDisplayStatus::Pending,
             }],
             character_review_status: ReviewStatus::NotStarted,
+            character_revision: 0,
             output_name: None,
         }
     }
@@ -6562,6 +8151,7 @@ mod tests {
         let project = project_fixture();
         let characters = vec![crate::models::CharacterView {
             id: Uuid::new_v4(),
+            role: audiobookai_core::CharacterRole::Narrator,
             canonical_name: "Narrator".to_owned(),
             aliases: Vec::new(),
             confidence: 1.0,
@@ -6572,6 +8162,8 @@ mod tests {
                 voice_id: Uuid::new_v4(),
                 voice_name: "Fixture voice".to_owned(),
                 model: None,
+                performance: audiobookai_core::PerformanceSettings::default(),
+                timing: audiobookai_core::TimingSettings::default(),
             }),
             evidence: Vec::new(),
         }];
@@ -6601,6 +8193,7 @@ mod tests {
         project.character_review_status = ReviewStatus::Approved;
         let characters = vec![crate::models::CharacterView {
             id: Uuid::new_v4(),
+            role: audiobookai_core::CharacterRole::Narrator,
             canonical_name: "Narrator".to_owned(),
             aliases: Vec::new(),
             confidence: 1.0,
@@ -6611,6 +8204,8 @@ mod tests {
                 voice_id,
                 voice_name: "Local voice".to_owned(),
                 model: None,
+                performance: audiobookai_core::PerformanceSettings::default(),
+                timing: audiobookai_core::TimingSettings::default(),
             }),
             evidence: Vec::new(),
         }];
@@ -6866,6 +8461,7 @@ mod tests {
         let other_provider_id = Uuid::new_v4();
         let character = crate::models::CharacterView {
             id: Uuid::new_v4(),
+            role: audiobookai_core::CharacterRole::Character,
             canonical_name: "Character".to_owned(),
             aliases: Vec::new(),
             confidence: 1.0,
@@ -6876,6 +8472,8 @@ mod tests {
                 voice_id: Uuid::new_v4(),
                 voice_name: "Voice".to_owned(),
                 model: Some("gemma3:latest".to_owned()),
+                performance: audiobookai_core::PerformanceSettings::default(),
+                timing: audiobookai_core::TimingSettings::default(),
             }),
             evidence: Vec::new(),
         };
@@ -7024,6 +8622,8 @@ mod tests {
             voice_profile_id: audiobookai_core::VoiceProfileId::from_uuid(voice_id),
             provider_profile_id: audiobookai_core::ProviderProfileId::from_uuid(provider_id),
             model: Some("gemma3:latest".to_owned()),
+            performance: audiobookai_core::PerformanceSettings::default(),
+            timing: audiobookai_core::TimingSettings::default(),
             settings: BTreeMap::new(),
             created_at: now_at,
             updated_at: now_at,
@@ -7103,6 +8703,117 @@ mod tests {
             .expect("reference lock acquisition timed out")
             .expect("reference waiter stopped");
         waiter.await.expect("reference waiter");
+    }
+
+    #[tokio::test]
+    async fn runtime_affecting_provider_patch_waits_for_dispatch_lifecycle() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let database = audiobookai_storage::Database::open_in(directory.path())
+            .await
+            .expect("database");
+        let state = Arc::new(
+            AppState::new(
+                crate::ServiceConfig {
+                    bind: "127.0.0.1:0".parse().expect("address"),
+                    data_dir: directory.path().to_path_buf(),
+                    bundled_sidecar_dir: None,
+                    tls: None,
+                    lan_hostnames: Vec::new(),
+                    allow_insecure_lan: false,
+                    desktop_bootstrap: false,
+                },
+                database,
+            )
+            .await
+            .expect("state"),
+        );
+        let lifecycle_guard = state.model_lifecycle.lock().await;
+        let contender = Arc::clone(&state);
+        let missing_provider_id = Uuid::new_v4();
+        let mut patch = tokio::spawn(async move {
+            update_provider(
+                State(contender),
+                Path(missing_provider_id),
+                Json(ProviderProfileInput {
+                    name: None,
+                    kind: None,
+                    mode: None,
+                    endpoint: Some(Some("http://127.0.0.1:9999/".to_owned())),
+                    executable_path: None,
+                    working_directory: None,
+                    arguments: None,
+                    model: None,
+                    credential: None,
+                }),
+            )
+            .await
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut patch)
+                .await
+                .is_err(),
+            "provider routing changes must wait for the dispatch validation window"
+        );
+        drop(lifecycle_guard);
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), patch)
+                .await
+                .expect("provider patch timed out")
+                .expect("provider patch task"),
+            Err(ServiceError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn consent_revocation_waits_for_an_in_flight_dispatch_boundary() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let database = audiobookai_storage::Database::open_in(directory.path())
+            .await
+            .expect("database");
+        let state = Arc::new(
+            AppState::new(
+                crate::ServiceConfig {
+                    bind: "127.0.0.1:0".parse().expect("address"),
+                    data_dir: directory.path().to_path_buf(),
+                    bundled_sidecar_dir: None,
+                    tls: None,
+                    lan_hostnames: Vec::new(),
+                    allow_insecure_lan: false,
+                    desktop_bootstrap: false,
+                },
+                database,
+            )
+            .await
+            .expect("state"),
+        );
+        let project_id = Uuid::new_v4();
+        let lifecycle = state.dispatch_consent_lifecycle_lock(project_id).await;
+        let dispatch_guard = lifecycle.read().await;
+        let contender = Arc::clone(&state);
+        let mut revocation = tokio::spawn(async move {
+            update_project(
+                State(contender),
+                Path(project_id),
+                Json(serde_json::json!({ "consentCloudText": false })),
+            )
+            .await
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut revocation)
+                .await
+                .is_err(),
+            "consent revocation must wait until the provider dispatch returns"
+        );
+        drop(dispatch_guard);
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), revocation)
+                .await
+                .expect("consent revocation timed out")
+                .expect("consent revocation task"),
+            Err(ServiceError::NotFound)
+        ));
     }
 
     #[test]
@@ -7214,6 +8925,7 @@ mod tests {
                 project_id,
                 vec![crate::models::CharacterView {
                     id: Uuid::new_v4(),
+                    role: audiobookai_core::CharacterRole::Character,
                     canonical_name: "Character".to_owned(),
                     aliases: Vec::new(),
                     confidence: 1.0,
@@ -7224,6 +8936,8 @@ mod tests {
                         voice_id: Uuid::new_v4(),
                         voice_name: "Voice".to_owned(),
                         model: Some(model_alias.to_string_lossy().into_owned()),
+                        performance: audiobookai_core::PerformanceSettings::default(),
+                        timing: audiobookai_core::TimingSettings::default(),
                     }),
                     evidence: Vec::new(),
                 }],

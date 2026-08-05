@@ -14,6 +14,12 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 use uuid::Uuid;
 
+use audiobookai_core::Validate as _;
+pub use audiobookai_core::{
+    DeliveryCue, ModelPerformanceCapabilities, PerformanceCapabilities, PerformanceRange,
+    PerformanceSettings, TimingSettings,
+};
+
 use crate::{ProviderError, Result};
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -77,7 +83,7 @@ pub enum ParameterSupport {
     NullableValue,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProviderCapabilities {
     pub streaming: bool,
     pub cancellation: bool,
@@ -89,6 +95,9 @@ pub struct ProviderCapabilities {
     pub max_concurrency: u16,
     pub temperature: ParameterSupport,
     pub reasoning: BTreeSet<ReasoningMode>,
+    /// Exact, positive declarations of performance controls supported by individual TTS models.
+    #[serde(default)]
+    pub model_performance: Vec<ModelPerformanceCapabilities>,
     pub source: CapabilitySource,
 }
 
@@ -105,11 +114,79 @@ impl Default for ProviderCapabilities {
             max_concurrency: 1,
             temperature: ParameterSupport::Unsupported,
             reasoning: BTreeSet::new(),
+            model_performance: Vec::new(),
             source: CapabilitySource::BuiltIn {
                 adapter_version: env!("CARGO_PKG_VERSION").to_owned(),
             },
         }
     }
+}
+
+impl ProviderCapabilities {
+    /// Returns performance capabilities only for an exact model identifier match.
+    #[must_use]
+    pub fn performance_for_model(&self, model: &str) -> Option<&PerformanceCapabilities> {
+        self.model_performance
+            .iter()
+            .find(|descriptor| descriptor.model == model)
+            .map(|descriptor| &descriptor.performance)
+    }
+
+    /// Replaces model-bound performance declarations after validating their shape and uniqueness.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error for blank or duplicate model identifiers and invalid numeric
+    /// capability ranges.
+    pub fn set_model_performance(
+        &mut self,
+        descriptors: Vec<ModelPerformanceCapabilities>,
+    ) -> Result<()> {
+        let mut models = BTreeSet::new();
+        for descriptor in &descriptors {
+            if descriptor.model.trim().is_empty() {
+                return Err(ProviderError::Configuration(
+                    "performance capability model id must not be empty".to_owned(),
+                ));
+            }
+            if !models.insert(descriptor.model.as_str()) {
+                return Err(ProviderError::Configuration(
+                    "performance capability model ids must be unique".to_owned(),
+                ));
+            }
+            validate_performance_capability_ranges(&descriptor.performance)?;
+            let mut delivery_cues = BTreeSet::new();
+            if descriptor
+                .performance
+                .delivery_cues
+                .iter()
+                .any(|cue| !delivery_cues.insert(*cue))
+            {
+                return Err(ProviderError::Configuration(
+                    "performance delivery cues must be unique per model".to_owned(),
+                ));
+            }
+        }
+        self.model_performance = descriptors;
+        Ok(())
+    }
+}
+
+fn validate_performance_capability_ranges(capabilities: &PerformanceCapabilities) -> Result<()> {
+    for (name, range) in [
+        ("speed", capabilities.speed),
+        ("pitch", capabilities.pitch),
+        ("stability", capabilities.stability),
+        ("similarity", capabilities.similarity),
+        ("style", capabilities.style),
+    ] {
+        if range.is_some_and(|range| !range.is_valid()) {
+            return Err(ProviderError::Configuration(format!(
+                "performance capability range for {name} is invalid"
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -367,10 +444,86 @@ pub struct SynthesisRequest {
     pub model: Option<String>,
     pub voice: String,
     pub format: AudioFormat,
+    #[serde(default, skip_serializing_if = "PerformanceSettings::is_empty")]
+    pub performance: PerformanceSettings,
     #[serde(default)]
     pub options: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     pub pronunciation_dictionary_ids: Vec<String>,
+}
+
+impl SynthesisRequest {
+    /// Checks typed performance controls against the exact selected-model declaration.
+    ///
+    /// Empty settings always preserve provider defaults. Any requested setting without a positive
+    /// model-bound declaration is rejected rather than silently omitted.
+    pub fn validate_performance(
+        &self,
+        capabilities: &ProviderCapabilities,
+        effective_model: &str,
+    ) -> Result<()> {
+        if let Some(issue) = self.performance.validation_issues().into_iter().next() {
+            return Err(ProviderError::Configuration(issue.message));
+        }
+        if self.performance.is_empty() {
+            return Ok(());
+        }
+        let supported = capabilities.performance_for_model(effective_model).ok_or(
+            ProviderError::Unsupported {
+                feature: "voice performance controls for the selected model",
+            },
+        )?;
+        validate_numeric_setting("speed", self.performance.speed, supported.speed)?;
+        validate_numeric_setting("pitch", self.performance.pitch, supported.pitch)?;
+        validate_numeric_setting("stability", self.performance.stability, supported.stability)?;
+        validate_numeric_setting(
+            "similarity",
+            self.performance.similarity,
+            supported.similarity,
+        )?;
+        validate_numeric_setting("style", self.performance.style, supported.style)?;
+        if self.performance.speaker_boost.is_some() && !supported.speaker_boost {
+            return Err(ProviderError::Unsupported {
+                feature: "speaker boost for the selected model",
+            });
+        }
+        if let Some(cue) = self.performance.delivery_cue
+            && !supported.delivery_cues.contains(&cue)
+        {
+            return Err(ProviderError::Unsupported {
+                feature: "the selected delivery cue for the selected model",
+            });
+        }
+        Ok(())
+    }
+}
+
+fn validate_numeric_setting(
+    name: &'static str,
+    requested: Option<f64>,
+    supported: Option<PerformanceRange>,
+) -> Result<()> {
+    let Some(value) = requested else {
+        return Ok(());
+    };
+    let range = supported.ok_or(ProviderError::Unsupported {
+        feature: match name {
+            "speed" => "speed control for the selected model",
+            "pitch" => "pitch control for the selected model",
+            "stability" => "stability control for the selected model",
+            "similarity" => "similarity control for the selected model",
+            "style" => "style control for the selected model",
+            _ => "the requested performance control for the selected model",
+        },
+    })?;
+    if range.contains(value) {
+        Ok(())
+    } else {
+        Err(ProviderError::Configuration(format!(
+            "{name} must be between {} and {} for the selected provider/model",
+            range.minimum, range.maximum
+        )))
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -731,5 +884,110 @@ mod tests {
         ] {
             assert!(EndpointConfig::external(Url::parse(endpoint).unwrap(), credential()).is_ok());
         }
+    }
+
+    #[test]
+    fn performance_capabilities_are_exact_model_bound_and_fail_closed() {
+        let mut capabilities = ProviderCapabilities::default();
+        capabilities
+            .set_model_performance(vec![ModelPerformanceCapabilities {
+                model: "verified-model".to_owned(),
+                performance: PerformanceCapabilities {
+                    speed: Some(PerformanceRange::new(0.7, 1.2)),
+                    ..PerformanceCapabilities::default()
+                },
+            }])
+            .unwrap();
+        let mut request = SynthesisRequest {
+            request_id: Uuid::new_v4(),
+            text: "Hello".to_owned(),
+            model: Some("verified-model".to_owned()),
+            voice: "voice".to_owned(),
+            format: AudioFormat::Wav,
+            performance: PerformanceSettings {
+                speed: Some(1.1),
+                ..PerformanceSettings::default()
+            },
+            options: BTreeMap::new(),
+            pronunciation_dictionary_ids: Vec::new(),
+        };
+        assert!(
+            request
+                .validate_performance(&capabilities, "verified-model")
+                .is_ok()
+        );
+        assert!(
+            request
+                .validate_performance(&capabilities, "VERIFIED-MODEL")
+                .is_err()
+        );
+        request.performance.speed = Some(1.3);
+        assert!(
+            request
+                .validate_performance(&capabilities, "verified-model")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn capability_descriptor_rejects_duplicates_and_invalid_ranges() {
+        let descriptor = ModelPerformanceCapabilities {
+            model: "model".to_owned(),
+            performance: PerformanceCapabilities::default(),
+        };
+        let mut capabilities = ProviderCapabilities::default();
+        assert!(
+            capabilities
+                .set_model_performance(vec![descriptor.clone(), descriptor])
+                .is_err()
+        );
+        assert!(
+            capabilities
+                .set_model_performance(vec![ModelPerformanceCapabilities {
+                    model: "model".to_owned(),
+                    performance: PerformanceCapabilities {
+                        pitch: Some(PerformanceRange::new(2.0, 1.0)),
+                        ..PerformanceCapabilities::default()
+                    },
+                }])
+                .is_err()
+        );
+        assert!(
+            capabilities
+                .set_model_performance(vec![ModelPerformanceCapabilities {
+                    model: "model".to_owned(),
+                    performance: PerformanceCapabilities {
+                        delivery_cues: vec![DeliveryCue::Whisper, DeliveryCue::Whisper],
+                        ..PerformanceCapabilities::default()
+                    },
+                }])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn synthesis_request_serializes_only_explicit_typed_performance() {
+        let mut request = SynthesisRequest {
+            request_id: Uuid::new_v4(),
+            text: "Hello".to_owned(),
+            model: Some("model".to_owned()),
+            voice: "voice".to_owned(),
+            format: AudioFormat::Wav,
+            performance: PerformanceSettings::default(),
+            options: BTreeMap::new(),
+            pronunciation_dictionary_ids: Vec::new(),
+        };
+        let default = serde_json::to_value(&request).unwrap();
+        assert!(default.get("performance").is_none());
+        assert!(default.get("timing").is_none());
+
+        request.performance.speed = Some(1.1);
+        request.performance.delivery_cue = Some(DeliveryCue::Whisper);
+        let configured = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            configured["performance"],
+            serde_json::json!({"speed": 1.1, "delivery_cue": "whisper"})
+        );
+        assert!(configured.get("timing").is_none());
     }
 }

@@ -20,12 +20,39 @@ SQLite is authoritative. WAL, foreign keys, a busy timeout, embedded migrations,
 and an application lock prevent multiple local writers. Large immutable files
 live in a BLAKE3-addressed object store; SQLite records ownership, cache request
 fingerprints, pinning, and provenance. Files are streamed to a same-filesystem
-temporary path, validated and synced, atomically renamed, and only then linked
-from a committed database transaction.
+temporary path, validated and synced, promoted with an atomic no-clobber link
+(or an exclusive-copy fallback), and only then linked from committed metadata.
+
+Export admission atomically reserves the normalized final destination, its path
+hierarchy, and the implicit single-file manifest sidecar. Reservations are
+owned by the durable job across restart and retry. Failed or cancelled jobs
+release claims only before promotion starts; interrupted promotion stays
+fail-closed, while completed jobs rely on their finished files to block reuse.
+Job-private FFmpeg auxiliaries and promotion markers are replaceable on retry,
+but public output and manifest promotion never overwrites an existing path. If
+an exclusive-copy fallback fails after publishing its destination name, the
+partial output remains protected by the fail-closed promotion claim instead of
+being removed through a pathname that another process could have replaced.
+FFmpeg renders only inside a non-symlinked, owner-private job directory; the
+canonical public export root is revalidated immediately before promotion.
 
 Imported EPUBs are copied into the managed library. Text is represented as
 stable paragraph IDs and offsets; AI suggestions and manual speaker overrides
 are separate records so rerunning detection cannot erase reviewed work.
+
+Proofing is revisioned separately from source import. Segment edits, review
+states, selected takes, and immutable take history are stored durably; selecting
+a take is atomic. Regeneration jobs bind their estimate and input revision before
+provider dispatch, while proof exports snapshot the exact graph and selected
+takes they consume. This permits a reviewed project to be re-exported without a
+provider call and prevents a stale edit or take from being silently substituted.
+
+Distribution metadata and target policies are also versioned. Quality reports
+bind their policy, metadata, manifest, and inspected artifact identities. A
+package is assembled only from one completed export and records checksums for
+its delivery files. Requirements that cannot be established mechanically stay
+visible as manual blockers; the service never treats an unverified attestation
+or an older report as current retailer readiness.
 
 The desktop installation's application-data directory is authoritative for the
 managed library and content cache. Their resolved paths are visible but

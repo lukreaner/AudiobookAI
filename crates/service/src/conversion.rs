@@ -16,11 +16,14 @@ use std::{
 use async_trait::async_trait;
 use audiobookai_core::{
     Artifact, ArtifactId, ArtifactKind, AttemptId, BackgroundMusicSettings, Book, Chapter,
-    ChapterId, DialogueSpan, DuckingSettings, ExportFormat, ExportLayout, ExportProfile,
-    ExportProfileId, FileFingerprint, Job, JobAttempt, JobId, JobKind, JobState, JobUnit,
-    JobUnitId, JobUnitKind, JobUnitState, Paragraph, Project, ProjectId, ProvenanceQuality,
-    ProviderProfileId, RateCardId, ReservationId, Speaker, SpeakerOverride, UsageEvent,
-    UsageEventId, UsageQuantities, UsageWorkload, Validate, VoiceProfileId,
+    ChapterId, CharacterId, DialogueSpan, DuckingSettings, ExportFormat, ExportLayout,
+    ExportProfile, ExportProfileId, FileFingerprint, Job, JobAttempt, JobId, JobKind, JobState,
+    JobUnit, JobUnitId, JobUnitKind, JobUnitState, Paragraph, PerformanceSettings,
+    ProductionSegment, ProductionSegmentSource, Project, ProjectId, ProofExportSelection,
+    ProofExportSnapshot, ProofExportSnapshotId, ProofingPlan, ProofingPlanStatus,
+    ProvenanceQuality, ProviderProfileId, RateCardId, ReservationId, SegmentId, SegmentReviewState,
+    SegmentSelection, SegmentTake, SegmentTakeId, Speaker, SpeakerOverride, TimingSettings,
+    UsageEvent, UsageEventId, UsageQuantities, UsageWorkload, Validate, VoiceProfileId,
 };
 use audiobookai_media::{
     BackgroundMusic, BookMetadata as MediaBookMetadata, CacheFingerprint, ChapterAudio,
@@ -30,8 +33,10 @@ use audiobookai_media::{
 };
 use audiobookai_providers::{
     AudioChunk, AudioChunkSink, AudioFormat, CancellationFlag, ProviderError, ProviderId,
-    ProviderUsage, SynthesisRequest, SynthesisResponse, TtsProvider, UsageSource,
+    ProviderUsage, StreamingSynthesisResponse, SynthesisRequest, SynthesisResponse, TtsProvider,
+    UsageSource,
 };
+use audiobookai_storage::{OutputDestinationReservation, OutputReservationState, StorageError};
 use axum::{
     body::Body,
     http::{HeaderMap, HeaderValue, StatusCode, header},
@@ -40,6 +45,7 @@ use axum::{
 use bytes::{Bytes, BytesMut};
 use chrono::Utc;
 use futures::{StreamExt, TryStreamExt, future::BoxFuture, stream};
+use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
@@ -54,7 +60,7 @@ use crate::{
         ExportArtifactView, ExportFormatView, ExportOptionsInput, JobStageView, JobStatusView,
         JobUnitStatusView, JobUnitView, JobView, PreviewView, ProjectDisplayStatus,
         PronunciationKindView, PronunciationRuleView, PronunciationScopeView, ProviderKindView,
-        ProviderModeView, ProviderProfileView, StartJobInput, UsageRowView,
+        ProviderModeView, ProviderProfileView, StartJobInput, UsageRowView, VoiceAssignmentView,
     },
     runtime::{
         FailureClass as RetryFailureClass, RetryEvent, RetryEventOutcome, RetryJournal,
@@ -65,36 +71,57 @@ use crate::{
 const NORMALIZATION_VERSION: &str = "48k-flac-segment-v1";
 const MAX_PREVIEW_CHARACTERS: usize = 500;
 const RANGE_CHUNK_BYTES: usize = 64 * 1024;
+const RECOVERED_PRODUCTION_CONFLICT: &str = "legacy state contained multiple active production jobs for this project; this conflicting job was failed without redispatch";
 
 type ProviderSemaphoreRegistry = HashMap<Uuid, (u16, Arc<Semaphore>)>;
 
 static PROVIDER_SEMAPHORES: OnceLock<StdMutex<ProviderSemaphoreRegistry>> = OnceLock::new();
 static PLAYBACK_HUBS: OnceLock<StdMutex<HashMap<Uuid, Arc<PlaybackHub>>>> = OnceLock::new();
-static ACTIVE_WORKERS: OnceLock<StdMutex<BTreeSet<Uuid>>> = OnceLock::new();
+// A value of `true` records a start request that arrived while the current owner was still
+// publishing its terminal state or reconciling accounting. The owner consumes that request and
+// runs another iteration; if removal wins the mutex race, the requester becomes the new owner.
+// Either ordering therefore leaves exactly one worker responsible for the durable job state.
+static ACTIVE_WORKERS: OnceLock<StdMutex<HashMap<Uuid, bool>>> = OnceLock::new();
+static OUTPUT_ADMISSION_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct SpeakerAssignment {
     character_id: Uuid,
     character_name: String,
     provider_id: Uuid,
     provider_name: String,
     provider_kind: ProviderKindView,
+    #[serde(default)]
+    provider_mode: Option<ProviderModeView>,
     provider_endpoint: Option<String>,
+    #[serde(default)]
+    provider_snapshot_id: Option<Uuid>,
     provider_version: Option<String>,
     provider_concurrency: u16,
     voice_id: Uuid,
     voice_source: String,
     voice_name: String,
     model: Option<String>,
+    #[serde(default)]
+    performance: PerformanceSettings,
+    #[serde(default)]
+    timing: TimingSettings,
 }
 
-#[derive(Clone, Debug)]
-struct SegmentPlan {
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct SegmentPlan {
+    id: SegmentId,
+    proofing: bool,
     key: String,
     chapter_id: Uuid,
+    paragraph_id: Uuid,
+    source_content_hash: String,
+    byte_start: u64,
+    byte_end: u64,
     chapter_title: String,
     segment_ordinal: u32,
     playback_ordinal: usize,
+    original_text: String,
     text: String,
     context: Option<String>,
     assignment: SpeakerAssignment,
@@ -110,13 +137,13 @@ struct TtsUsageContext {
     rate_card_id: Option<RateCardId>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct ChapterPlan {
     chapter: Chapter,
     segments: Vec<SegmentPlan>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct ConversionPlan {
     project: Project,
     book: Book,
@@ -147,20 +174,45 @@ struct PersistedUnitPlan {
     export: JobUnit,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportPromotionMarker {
+    schema_version: u32,
+    job_id: JobId,
+    final_output: String,
+    #[serde(default)]
+    split_directory_created: bool,
+    files: Vec<ExportPromotionFile>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportPromotionFile {
+    file_name: String,
+    duration_ms: u64,
+    fingerprint: FileFingerprint,
+}
+
 /// Creates a durable conversion and starts its in-process worker.
+#[allow(clippy::too_many_lines)]
 pub async fn start_conversion(
     state: Arc<AppState>,
     input: StartJobInput,
 ) -> Result<JobView, ServiceError> {
     validate_export_input(&input.export)?;
     let _shutdown_admission = state.admit_shutdown_sensitive_work().await?;
+    let output_admission = OUTPUT_ADMISSION_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
     let job_id = JobId::new();
     let (export_profile, music_path) =
         create_export_profile(&state, job_id, input.project_id, &input.export).await?;
     let plan = load_conversion_plan(&state, input.project_id, export_profile, music_path).await?;
-    ensure_output_is_available(&plan.export).await?;
     let units = build_job_units(job_id, &plan);
     let now = Utc::now();
+    let output_reservation =
+        prepare_output_reservation(job_id, plan.project.id, &plan.export, now).await?;
     let total = u64::try_from(unit_count(&units)).unwrap_or(u64::MAX);
     let mut job = Job {
         id: job_id,
@@ -183,30 +235,57 @@ pub async fn start_conversion(
         .database
         .repositories()
         .jobs
-        .insert(&job)
+        .insert_with_output_reservation(&job, &output_reservation)
         .await
-        .map_err(storage_error)?;
-    persist_units(&state, &units).await?;
-
-    match reserve_job_budgets(&state, &job, &plan).await {
-        Ok(reservation_id) => {
-            if let Some(reservation_id) = reservation_id {
-                let expected = job.revision;
-                job.reservation_id = Some(reservation_id);
-                job.updated_at = Utc::now();
-                job = state
-                    .database
-                    .repositories()
-                    .jobs
-                    .update(&job, expected)
-                    .await
-                    .map_err(storage_error)?;
-            }
-        }
+        .map_err(output_reservation_admission_error)?;
+    drop(output_admission);
+    let reservation_id = match reserve_job_budgets(&state, &job, &plan).await {
+        Ok(reservation_id) => reservation_id,
         Err(error) => {
             mark_domain_job_failed(&state, job_id, &error.to_string()).await;
             return Err(error);
         }
+    };
+    if let Some(reservation_id) = reservation_id {
+        let expected = job.revision;
+        job.reservation_id = Some(reservation_id);
+        job.updated_at = Utc::now();
+        job = match state
+            .database
+            .repositories()
+            .jobs
+            .update(&job, expected)
+            .await
+        {
+            Ok(job) => job,
+            Err(error) => {
+                release_unattached_reservation(&state, reservation_id).await;
+                mark_domain_job_failed(&state, job_id, &error.to_string()).await;
+                return Err(storage_error(error));
+            }
+        }
+    }
+
+    let (proofing_plan, proofing_segments) = match build_proofing_plan(&state, &job, &plan).await {
+        Ok(value) => value,
+        Err(error) => {
+            mark_domain_job_failed(&state, job_id, &error.to_string()).await;
+            let _ = reconcile_job_budgets(&state, job_id).await;
+            return Err(error);
+        }
+    };
+    let durable_units = ordered_units(&units);
+    if let Err(error) = state
+        .database
+        .repositories()
+        .proofing
+        .replace_plan_with_units(&proofing_plan, &proofing_segments, &durable_units)
+        .await
+    {
+        let error = storage_error(error);
+        mark_domain_job_failed(&state, job_id, &error.to_string()).await;
+        let _ = reconcile_job_budgets(&state, job_id).await;
+        return Err(error);
     }
 
     let view = job_view(&job, &plan.project.metadata.title, &units);
@@ -222,12 +301,336 @@ pub async fn start_conversion(
         "job.queued",
         serde_json::json!({"jobId": job_id, "projectId": input.project_id}),
     );
-    tokio::spawn(run_conversion_job(Arc::clone(&state), job_id));
+    schedule_conversion_job(Arc::clone(&state), job_id);
     Ok(view)
 }
 
-/// Restarts conversion workers after an application restart without duplicating completed units.
-pub async fn resume_durable_conversions(state: Arc<AppState>) -> Result<(), ServiceError> {
+/// Starts a provider-free export from the exact takes selected in the proofing workbench.
+/// The serialized plan and selection snapshot make the job crash-resumable without consulting
+/// mutable narration or assignment state again.
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn start_proof_export(
+    state: Arc<AppState>,
+    project_id: Uuid,
+    input: ExportOptionsInput,
+    strict_retailer: bool,
+) -> Result<JobView, ServiceError> {
+    validate_export_input(&input)?;
+    let _shutdown_admission = state.admit_shutdown_sensitive_work().await?;
+    let output_admission = OUTPUT_ADMISSION_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+    let repositories = state.database.repositories();
+    let proof = repositories
+        .proofing
+        .get_plan(ProjectId::from_uuid(project_id))
+        .await
+        .map_err(storage_error)?
+        .ok_or_else(|| ServiceError::Conflict("proofing data is unavailable".to_owned()))?;
+    if proof.status != ProofingPlanStatus::Ready {
+        return Err(ServiceError::Conflict(
+            "finish the active proofing plan before exporting".to_owned(),
+        ));
+    }
+    let segments = repositories
+        .proofing
+        .list_active_segments(ProjectId::from_uuid(project_id), None)
+        .await
+        .map_err(storage_error)?;
+    if segments.is_empty() {
+        return Err(ServiceError::Conflict(
+            "the proofing plan contains no production segments".to_owned(),
+        ));
+    }
+    let project = repositories
+        .projects
+        .get_project(ProjectId::from_uuid(project_id))
+        .await
+        .map_err(storage_error)?
+        .ok_or(ServiceError::NotFound)?;
+    let book = repositories
+        .projects
+        .get_book(project.book_id)
+        .await
+        .map_err(storage_error)?
+        .ok_or(ServiceError::NotFound)?;
+    let source_chapters = repositories
+        .projects
+        .list_chapters(project.book_id)
+        .await
+        .map_err(storage_error)?;
+
+    let mut snapshot_selections = Vec::with_capacity(segments.len());
+    let mut selected_artifacts = HashMap::new();
+    let mut planned_segments = HashMap::<Uuid, Vec<SegmentPlan>>::new();
+    for segment in &segments {
+        if strict_retailer && !segment.review_state.is_accepted() {
+            return Err(ServiceError::Conflict(format!(
+                "segment {} must be approved or locked for a retailer export",
+                segment.id
+            )));
+        }
+        if segment.review_state == SegmentReviewState::Flagged {
+            return Err(ServiceError::Conflict(format!(
+                "resolve the flag on segment {} before exporting",
+                segment.id
+            )));
+        }
+        let selection = repositories
+            .proofing
+            .get_selection(segment.id)
+            .await
+            .map_err(storage_error)?
+            .ok_or_else(|| {
+                ServiceError::Conflict(format!("select a take for segment {}", segment.id))
+            })?;
+        let take = repositories
+            .proofing
+            .get_take(selection.take_id)
+            .await
+            .map_err(storage_error)?
+            .ok_or_else(|| ServiceError::Conflict("a selected take is unavailable".to_owned()))?;
+        if take.semantic_input_hash != segment.expected_input_hash {
+            return Err(ServiceError::Conflict(format!(
+                "the selected take for segment {} is stale",
+                segment.id
+            )));
+        }
+        let artifact = load_artifact(&state, take.artifact_id).await?;
+        verify_selected_artifact_integrity(&artifact).await?;
+        let segment_plan = load_proofing_segment_plan(&state, project_id, segment).await?;
+        if segment_semantic_input_hash(&segment_plan)? != segment.expected_input_hash {
+            return Err(ServiceError::Conflict(format!(
+                "the narration inputs for segment {} changed; review or regenerate it first",
+                segment.id
+            )));
+        }
+        let chapter_id = segment_plan.chapter_id;
+        selected_artifacts.insert(segment_plan.key.clone(), take.artifact_id);
+        planned_segments
+            .entry(chapter_id)
+            .or_default()
+            .push(segment_plan);
+        snapshot_selections.push(ProofExportSelection {
+            segment_id: segment.id,
+            take_id: take.id,
+            artifact_id: take.artifact_id,
+        });
+    }
+    let mut chapters = Vec::new();
+    for chapter in source_chapters {
+        let Some(mut chapter_segments) = planned_segments.remove(&chapter.id.as_uuid()) else {
+            continue;
+        };
+        chapter_segments.sort_by_key(|segment| segment.segment_ordinal);
+        chapters.push(ChapterPlan {
+            chapter,
+            segments: chapter_segments,
+        });
+    }
+    if !planned_segments.is_empty() {
+        return Err(ServiceError::Conflict(
+            "a proofing segment no longer belongs to an available chapter".to_owned(),
+        ));
+    }
+
+    let job_id = JobId::new();
+    let (export, music_path) = create_export_profile(&state, job_id, project_id, &input).await?;
+    let rules = state.catalog.read().await.pronunciation_rules.clone();
+    let plan = ConversionPlan {
+        project,
+        book,
+        chapters,
+        rules,
+        export,
+        music_path,
+    };
+    let mut units = build_job_units(job_id, &plan);
+    let now = Utc::now();
+    let output_reservation =
+        prepare_output_reservation(job_id, plan.project.id, &plan.export, now).await?;
+    for (key, unit) in &mut units.synthesis {
+        unit.state = JobUnitState::Completed;
+        unit.output_artifact_id = selected_artifacts.get(key).copied();
+        unit.updated_at = now;
+    }
+    let snapshot = ProofExportSnapshot {
+        id: ProofExportSnapshotId::new(),
+        project_id: ProjectId::from_uuid(project_id),
+        job_id,
+        export_profile_id: plan.export.id,
+        plan_revision: proof.plan_revision,
+        plan_hash: proof.plan_hash.clone(),
+        selections: snapshot_selections,
+        created_at: now,
+    };
+    units.export.payload.insert(
+        "proofExportPlan".to_owned(),
+        serde_json::to_value(&plan).map_err(internal_error)?,
+    );
+    units.export.payload.insert(
+        "proofExportSnapshotId".to_owned(),
+        serde_json::json!(snapshot.id),
+    );
+    let completed = u64::try_from(units.synthesis.len()).unwrap_or(u64::MAX);
+    let job = Job {
+        id: job_id,
+        project_id: ProjectId::from_uuid(project_id),
+        kind: JobKind::Export,
+        state: JobState::Queued,
+        export_profile_id: Some(plan.export.id),
+        reservation_id: None,
+        progress_completed: completed,
+        progress_total: u64::try_from(unit_count(&units)).unwrap_or(u64::MAX),
+        status_message: Some("Queued proofing export".to_owned()),
+        allow_budget_override: false,
+        created_at: now,
+        started_at: None,
+        finished_at: None,
+        updated_at: now,
+        revision: 0,
+    };
+    repositories
+        .proofing
+        .insert_export_job_graph_with_output_reservation(
+            &job,
+            &ordered_units(&units),
+            &snapshot,
+            &output_reservation,
+        )
+        .await
+        .map_err(output_reservation_admission_error)?;
+    drop(output_admission);
+
+    let view = job_view(&job, &plan.project.metadata.title, &units);
+    state
+        .catalog
+        .write()
+        .await
+        .jobs
+        .insert(job_id.as_uuid(), view.clone());
+    state.events.publish(
+        "job.created",
+        serde_json::json!({"jobId": job_id, "projectId": project_id, "kind": "proof_export"}),
+    );
+    schedule_conversion_job(Arc::clone(&state), job_id);
+    Ok(view)
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RegenerationQuote {
+    pub segment_id: SegmentId,
+    pub segment_revision: u64,
+    pub semantic_input_hash: String,
+    pub provider_profile_id: ProviderProfileId,
+    pub provider_name: String,
+    pub model: Option<String>,
+    pub characters: u64,
+    pub monetary_cost_micros: Option<i64>,
+    pub currency: Option<String>,
+    pub credits: Option<i64>,
+    pub rate_card_id: Option<RateCardId>,
+}
+
+pub(crate) async fn quote_segment_regeneration(
+    state: &AppState,
+    project_id: Uuid,
+    segment_id: SegmentId,
+) -> Result<RegenerationQuote, ServiceError> {
+    let segment = state
+        .database
+        .repositories()
+        .proofing
+        .get_segment(segment_id)
+        .await
+        .map_err(storage_error)?
+        .ok_or(ServiceError::NotFound)?;
+    if segment.project_id.as_uuid() != project_id || !segment.active {
+        return Err(ServiceError::NotFound);
+    }
+    let plan = load_proofing_segment_plan(state, project_id, &segment).await?;
+    let semantic_input_hash = segment_semantic_input_hash(&plan)?;
+    if semantic_input_hash != segment.expected_input_hash {
+        return Err(ServiceError::ConflictDetails {
+            code: "proofing_plan_dirty",
+            detail: "update the proofing plan before regenerating this segment".to_owned(),
+            meta: serde_json::json!({"segmentId": segment_id}),
+        });
+    }
+    let characters = u64::try_from(plan.text.chars().count()).unwrap_or(u64::MAX);
+    let estimate = crate::accounting::rate_usage_estimate(
+        state,
+        ProviderProfileId::from_uuid(plan.assignment.provider_id),
+        UsageWorkload::Tts,
+        plan.assignment.model.clone(),
+        UsageQuantities {
+            characters: Some(characters),
+            ..UsageQuantities::default()
+        },
+    )
+    .await?;
+    Ok(RegenerationQuote {
+        segment_id,
+        segment_revision: segment.revision,
+        semantic_input_hash,
+        provider_profile_id: estimate.provider_profile_id,
+        provider_name: plan.assignment.provider_name,
+        model: plan.assignment.model,
+        characters,
+        monetary_cost_micros: estimate.cost.as_ref().map(|cost| cost.micros),
+        currency: estimate.cost.as_ref().map(|cost| cost.currency.clone()),
+        credits: estimate.quantities.provider_credits,
+        rate_card_id: estimate.rate_card_id,
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn start_segment_regeneration(
+    state: Arc<AppState>,
+    project_id: Uuid,
+    segment_id: SegmentId,
+    expected_segment_revision: u64,
+    allow_budget_override: bool,
+) -> Result<JobView, ServiceError> {
+    let _shutdown_admission = state.admit_shutdown_sensitive_work().await?;
+    let segment = state
+        .database
+        .repositories()
+        .proofing
+        .get_segment(segment_id)
+        .await
+        .map_err(storage_error)?
+        .ok_or(ServiceError::NotFound)?;
+    if segment.project_id.as_uuid() != project_id || !segment.active {
+        return Err(ServiceError::NotFound);
+    }
+    if segment.revision != expected_segment_revision {
+        return Err(ServiceError::ConflictDetails {
+            code: "stale_segment_revision",
+            detail: "the segment changed after it was estimated".to_owned(),
+            meta: serde_json::json!({
+                "segmentId": segment_id,
+                "currentRevision": segment.revision,
+            }),
+        });
+    }
+    if segment.review_state == SegmentReviewState::Locked {
+        return Err(ServiceError::ConflictDetails {
+            code: "segment_locked",
+            detail: "unlock this segment before regenerating it".to_owned(),
+            meta: serde_json::json!({"segmentId": segment_id}),
+        });
+    }
+    let segment_plan =
+        load_dispatchable_proofing_segment_plan(&state, project_id, &segment).await?;
+    if segment_semantic_input_hash(&segment_plan)? != segment.expected_input_hash {
+        return Err(ServiceError::ConflictDetails {
+            code: "estimate_changed",
+            detail: "the segment synthesis inputs changed after estimation".to_owned(),
+            meta: serde_json::json!({"segmentId": segment_id}),
+        });
+    }
     let active = state
         .database
         .repositories()
@@ -235,24 +638,844 @@ pub async fn resume_durable_conversions(state: Arc<AppState>) -> Result<(), Serv
         .list_active()
         .await
         .map_err(storage_error)?;
+    if let Some(existing) = active.into_iter().find(|job| {
+        job.kind == JobKind::SegmentRegeneration && job.project_id.as_uuid() == project_id
+    }) {
+        return Err(ServiceError::ConflictDetails {
+            code: "active_segment_regeneration",
+            detail: "another segment regeneration is already active for this project".to_owned(),
+            meta: serde_json::json!({"activeJobId": existing.id}),
+        });
+    }
+    let estimate = crate::accounting::rate_usage_estimate(
+        &state,
+        ProviderProfileId::from_uuid(segment_plan.assignment.provider_id),
+        UsageWorkload::Tts,
+        segment_plan.assignment.model.clone(),
+        UsageQuantities {
+            characters: u64::try_from(segment_plan.text.chars().count()).ok(),
+            ..UsageQuantities::default()
+        },
+    )
+    .await?;
+    let now = Utc::now();
+    let take_id = SegmentTakeId::new();
+    let mut job = Job {
+        id: JobId::new(),
+        project_id: ProjectId::from_uuid(project_id),
+        kind: JobKind::SegmentRegeneration,
+        // A terminal staging state makes a crash before budget admission fail closed. The job is
+        // moved to Queued only after its graph and reservation association are both durable.
+        state: JobState::Failed,
+        export_profile_id: None,
+        reservation_id: None,
+        progress_completed: 0,
+        progress_total: 1,
+        status_message: Some("Segment regeneration was interrupted before admission".to_owned()),
+        allow_budget_override,
+        created_at: now,
+        started_at: None,
+        finished_at: Some(now),
+        updated_at: now,
+        revision: 0,
+    };
+    let unit = JobUnit {
+        id: JobUnitId::new(),
+        job_id: job.id,
+        kind: JobUnitKind::SynthesisSegment,
+        state: JobUnitState::Ready,
+        chapter_id: Some(ChapterId::from_uuid(segment_plan.chapter_id)),
+        segment_id: Some(segment_id),
+        provider_profile_id: Some(ProviderProfileId::from_uuid(
+            segment_plan.assignment.provider_id,
+        )),
+        dependencies: Vec::new(),
+        attempt_count: 0,
+        next_attempt_at: None,
+        output_artifact_id: None,
+        payload: BTreeMap::from([
+            (
+                "title".to_owned(),
+                serde_json::json!(format!("Regenerate {}", segment_plan.chapter_title)),
+            ),
+            ("progress".to_owned(), serde_json::json!(0.0)),
+            ("segmentKey".to_owned(), serde_json::json!(segment_plan.key)),
+            ("takeId".to_owned(), serde_json::json!(take_id)),
+            (
+                "takeArtifactId".to_owned(),
+                serde_json::json!(ArtifactId::new()),
+            ),
+            (
+                "cacheOperation".to_owned(),
+                serde_json::json!(format!("regeneration:{take_id}")),
+            ),
+            ("autoSelect".to_owned(), serde_json::json!(false)),
+            (
+                "segmentPlan".to_owned(),
+                serde_json::to_value(&segment_plan).map_err(internal_error)?,
+            ),
+        ]),
+        created_at: now,
+        updated_at: now,
+    };
+    let repositories = state.database.repositories();
+    repositories
+        .proofing
+        .insert_job_graph(&job, std::slice::from_ref(&unit), None)
+        .await
+        .map_err(storage_error)?;
+    let policy = retry_policy(&state, &segment_plan).await?;
+    let reservation_multiplier = retry_reservation_multiplier(&policy);
+    let reservation_estimates = vec![estimate; reservation_multiplier];
+    let reservation_id = match crate::accounting::reserve_for_estimates(
+        &state,
+        &job,
+        &reservation_estimates,
+    )
+    .await
+    {
+        Ok(reservation_id) => reservation_id,
+        Err(error) => {
+            update_staged_job_failure(&state, job.id, &error.to_string()).await;
+            return Err(error);
+        }
+    };
+    let expected = job.revision;
+    job.reservation_id = reservation_id;
+    job.transition(JobState::Queued, Utc::now())
+        .map_err(|error| ServiceError::Internal(error.to_string()))?;
+    job.finished_at = None;
+    job.status_message = Some("Queued segment regeneration".to_owned());
+    job = match repositories.jobs.update(&job, expected).await {
+        Ok(job) => job,
+        Err(error) => {
+            if let Some(reservation_id) = reservation_id {
+                release_unattached_reservation(&state, reservation_id).await;
+            }
+            update_staged_job_failure(&state, job.id, &error.to_string()).await;
+            return Err(storage_error(error));
+        }
+    };
+    let project_title = state
+        .catalog
+        .read()
+        .await
+        .projects
+        .get(&project_id)
+        .map_or_else(
+            || "Audiobook".to_owned(),
+            |project| project.summary.title.clone(),
+        );
+    let view = single_unit_job_view(&job, &project_title, &unit);
+    state
+        .catalog
+        .write()
+        .await
+        .jobs
+        .insert(job.id.as_uuid(), view.clone());
+    state.events.publish(
+        "job.queued",
+        serde_json::json!({"jobId": job.id, "projectId": project_id, "segmentId": segment_id}),
+    );
+    schedule_segment_regeneration_job(Arc::clone(&state), job.id);
+    Ok(view)
+}
+
+fn single_unit_job_view(job: &Job, title: &str, unit: &JobUnit) -> JobView {
+    JobView {
+        id: job.id.as_uuid(),
+        project_id: job.project_id.as_uuid(),
+        project_title: title.to_owned(),
+        kind: crate::models::JobKindView::SegmentRegeneration,
+        status: job_status_view(job.state),
+        progress: progress_ratio(job.progress_completed, job.progress_total),
+        current_stage: job.status_message.clone(),
+        started_at: job.started_at,
+        updated_at: job.updated_at,
+        estimated_remaining_seconds: None,
+        units: vec![unit_view(unit)],
+        progressive_playback_url: None,
+        uncertain_charge: false,
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn load_proofing_segment_plan(
+    state: &AppState,
+    project_id: Uuid,
+    segment: &ProductionSegment,
+) -> Result<SegmentPlan, ServiceError> {
+    load_proofing_segment_plan_for(state, project_id, segment, AssignmentPurpose::Semantic).await
+}
+
+async fn load_dispatchable_proofing_segment_plan(
+    state: &AppState,
+    project_id: Uuid,
+    segment: &ProductionSegment,
+) -> Result<SegmentPlan, ServiceError> {
+    load_proofing_segment_plan_for(state, project_id, segment, AssignmentPurpose::Dispatch).await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn load_proofing_segment_plan_for(
+    state: &AppState,
+    project_id: Uuid,
+    segment: &ProductionSegment,
+    purpose: AssignmentPurpose,
+) -> Result<SegmentPlan, ServiceError> {
+    let project = state
+        .database
+        .repositories()
+        .projects
+        .get_project(ProjectId::from_uuid(project_id))
+        .await
+        .map_err(storage_error)?
+        .ok_or(ServiceError::NotFound)?;
+    let (characters, voices, providers, rules, chapter_title) = {
+        let catalog = state.catalog.read().await;
+        let characters = catalog
+            .characters
+            .get(&project_id)
+            .cloned()
+            .unwrap_or_default();
+        let chapter_title = segment
+            .chapter_id
+            .and_then(|id| {
+                catalog
+                    .projects
+                    .get(&project_id)
+                    .and_then(|project| {
+                        project
+                            .chapters
+                            .iter()
+                            .find(|chapter| chapter.id == id.as_uuid())
+                    })
+                    .map(|chapter| chapter.title.clone())
+            })
+            .unwrap_or_else(|| "Production credit".to_owned());
+        (
+            characters,
+            catalog.voice_sources.clone(),
+            catalog.providers.clone(),
+            catalog.pronunciation_rules.clone(),
+            chapter_title,
+        )
+    };
+    let character_id = match &segment.speaker {
+        Speaker::Character(id) => id.as_uuid(),
+        Speaker::Narrator => characters
+            .iter()
+            .find(|character| character.role == audiobookai_core::CharacterRole::Narrator)
+            .map(|character| character.id)
+            .ok_or_else(|| ServiceError::Conflict("the narrator is unavailable".to_owned()))?,
+        Speaker::Named(name) => characters
+            .iter()
+            .find(|character| character.canonical_name.eq_ignore_ascii_case(name))
+            .map(|character| character.id)
+            .ok_or_else(|| {
+                ServiceError::Conflict("the segment speaker is unavailable".to_owned())
+            })?,
+    };
+    let character = characters
+        .iter()
+        .find(|character| character.id == character_id)
+        .cloned()
+        .ok_or_else(|| ServiceError::Conflict("the segment speaker is unavailable".to_owned()))?;
+    let assignments = build_assignments_for(
+        &project,
+        std::slice::from_ref(&character),
+        &voices,
+        &providers,
+        state,
+        purpose,
+    )
+    .await?;
+    let mut assignment = assignments
+        .get(&character_id)
+        .cloned()
+        .ok_or_else(|| ServiceError::Conflict("the segment speaker has no voice".to_owned()))?;
+    assignment.performance = assignment
+        .performance
+        .overlay(&segment.performance_override);
+    assignment.timing = TimingSettings {
+        pause_before_ms: segment
+            .timing_override
+            .pause_before_ms
+            .or(assignment.timing.pause_before_ms),
+        pause_after_ms: segment
+            .timing_override
+            .pause_after_ms
+            .or(assignment.timing.pause_after_ms),
+    };
+    let base_text = segment
+        .narration_text_override
+        .as_deref()
+        .unwrap_or(&segment.original_text);
+    let (text, applied_rule_ids, dictionary_revision) = apply_pronunciation_rules(
+        base_text,
+        &rules,
+        project_id,
+        character_id,
+        project.metadata.language.as_deref(),
+    )?;
+    let context = match (&segment.context_before, &segment.context_after) {
+        (Some(before), Some(after)) => Some(format!("{before}\n---\n{after}")),
+        (Some(value), None) | (None, Some(value)) => Some(value.clone()),
+        (None, None) => None,
+    };
+    Ok(SegmentPlan {
+        id: segment.id,
+        proofing: true,
+        key: segment.stable_key.clone(),
+        chapter_id: segment
+            .chapter_id
+            .ok_or_else(|| {
+                ServiceError::Conflict("credit regeneration is not available yet".to_owned())
+            })?
+            .as_uuid(),
+        paragraph_id: segment
+            .paragraph_id
+            .ok_or_else(|| ServiceError::Conflict("segment source is unavailable".to_owned()))?
+            .as_uuid(),
+        source_content_hash: segment.source_content_hash.clone(),
+        byte_start: segment.byte_start.unwrap_or_default(),
+        byte_end: segment.byte_end.unwrap_or_default(),
+        chapter_title,
+        segment_ordinal: segment.ordinal,
+        playback_ordinal: usize::try_from(segment.ordinal).unwrap_or(usize::MAX),
+        original_text: segment.original_text.clone(),
+        text,
+        context,
+        assignment,
+        applied_rule_ids,
+        dictionary_revision,
+    })
+}
+
+async fn build_proofing_plan(
+    state: &AppState,
+    job: &Job,
+    conversion: &ConversionPlan,
+) -> Result<(ProofingPlan, Vec<ProductionSegment>), ServiceError> {
+    let repositories = state.database.repositories();
+    let previous = repositories
+        .proofing
+        .get_plan(conversion.project.id)
+        .await
+        .map_err(storage_error)?;
+    let now = Utc::now();
+    let narrator_id = state
+        .catalog
+        .read()
+        .await
+        .characters
+        .get(&conversion.project.id.as_uuid())
+        .and_then(|characters| {
+            characters
+                .iter()
+                .find(|character| character.role == audiobookai_core::CharacterRole::Narrator)
+        })
+        .map(|character| character.id);
+    let mut segments = Vec::new();
+    let mut plan_hasher = blake3::Hasher::new();
+    for chapter in &conversion.chapters {
+        for segment in &chapter.segments {
+            let expected_input_hash = segment_semantic_input_hash(segment)?;
+            plan_hasher.update(segment.key.as_bytes());
+            plan_hasher.update(&[0]);
+            plan_hasher.update(expected_input_hash.as_bytes());
+            plan_hasher.update(&[0]);
+            let speaker = if narrator_id == Some(segment.assignment.character_id) {
+                Speaker::Narrator
+            } else {
+                Speaker::Character(CharacterId::from_uuid(segment.assignment.character_id))
+            };
+            segments.push(ProductionSegment {
+                id: segment.id,
+                project_id: conversion.project.id,
+                chapter_id: Some(ChapterId::from_uuid(segment.chapter_id)),
+                paragraph_id: Some(audiobookai_core::ParagraphId::from_uuid(
+                    segment.paragraph_id,
+                )),
+                source: ProductionSegmentSource::EpubRange,
+                stable_key: segment.key.clone(),
+                ordinal: segment.segment_ordinal,
+                source_content_hash: segment.source_content_hash.clone(),
+                byte_start: Some(segment.byte_start),
+                byte_end: Some(segment.byte_end),
+                speaker,
+                original_text: segment.original_text.clone(),
+                narration_text_override: None,
+                effective_text: segment.text.clone(),
+                context_before: segment.context.clone(),
+                context_after: None,
+                performance_override: PerformanceSettings::default(),
+                timing_override: TimingSettings::default(),
+                expected_input_hash,
+                review_state: SegmentReviewState::Unreviewed,
+                active: true,
+                revision: 0,
+                created_at: now,
+                updated_at: now,
+            });
+        }
+    }
+    let plan = ProofingPlan {
+        project_id: conversion.project.id,
+        source_conversion_job_id: job.id,
+        plan_revision: previous
+            .as_ref()
+            .map_or(1, |value| value.plan_revision.saturating_add(1)),
+        plan_hash: plan_hasher.finalize().to_hex().to_string(),
+        status: ProofingPlanStatus::Incomplete,
+        dirty_reasons: Vec::new(),
+        created_at: previous.map_or(now, |value| value.created_at),
+        updated_at: now,
+    };
+    Ok((plan, segments))
+}
+
+/// Restarts conversion workers after an application restart without duplicating completed units.
+pub async fn resume_durable_conversions(state: Arc<AppState>) -> Result<(), ServiceError> {
+    release_orphaned_admission_reservations(&state).await?;
+    recover_terminal_paid_reservations(&state).await?;
+    state
+        .database
+        .repositories()
+        .jobs
+        .release_terminal_output_reservations()
+        .await
+        .map_err(storage_error)?;
+    let active = state
+        .database
+        .repositories()
+        .jobs
+        .list_active()
+        .await
+        .map_err(storage_error)?;
+
+    // Older databases could contain more than one active project-production job because the
+    // invariant was previously enforced only at API admission time. Resolve every conflicting
+    // record durably before any worker is spawned. Retaining the oldest record matches the job
+    // that would already have blocked later admissions; the UUID tie-break makes legacy rows with
+    // identical timestamps deterministic.
+    let recovered_conflicts = recovered_production_conflicts(&active);
+    for job in active
+        .iter()
+        .filter(|job| recovered_conflicts.contains(&job.id))
+    {
+        fail_recovered_production_conflict(&state, job).await?;
+    }
+
     for job in active {
-        if job.kind != JobKind::Conversion {
+        if recovered_conflicts.contains(&job.id) {
             continue;
+        }
+        if job.kind == JobKind::Preview {
+            recover_interrupted_preview(&state, &job).await?;
+            continue;
+        }
+        if !matches!(
+            job.kind,
+            JobKind::Conversion | JobKind::SegmentRegeneration | JobKind::Export
+        ) {
+            continue;
+        }
+        if fail_recovered_interrupted_paid_job(&state, &job).await? {
+            continue;
+        }
+        if matches!(job.kind, JobKind::Conversion | JobKind::Export) {
+            let recovery = {
+                let _output_admission = OUTPUT_ADMISSION_LOCK
+                    .get_or_init(|| tokio::sync::Mutex::new(()))
+                    .lock()
+                    .await;
+                ensure_existing_job_output_reservation(&state, &job).await
+            };
+            if let Err(error) = recovery {
+                let message = format!(
+                    "legacy export job could not acquire its output destination before restart: {error}"
+                );
+                fail_interrupted_paid_job(&state, job.id, &message).await?;
+                continue;
+            }
         }
         match job.state {
             JobState::Queued | JobState::Running => {
-                tokio::spawn(run_conversion_job(Arc::clone(&state), job.id));
+                if job.kind == JobKind::SegmentRegeneration {
+                    schedule_segment_regeneration_job(Arc::clone(&state), job.id);
+                } else {
+                    schedule_conversion_job(Arc::clone(&state), job.id);
+                }
             }
             JobState::Pausing => {
-                let _ = transition_job(&state, job.id, JobState::Paused, "Paused").await;
+                transition_job(&state, job.id, JobState::Paused, "Paused").await?;
             }
             JobState::Cancelling => {
-                let _ = transition_job(&state, job.id, JobState::Cancelled, "Cancelled").await;
+                transition_job(&state, job.id, JobState::Cancelled, "Cancelled").await?;
             }
             JobState::Paused | JobState::Cancelled | JobState::Failed | JobState::Completed => {}
         }
     }
     Ok(())
+}
+
+fn recovered_production_conflicts(active: &[Job]) -> BTreeSet<JobId> {
+    let mut projects = BTreeMap::<ProjectId, Vec<&Job>>::new();
+    for job in active.iter().filter(|job| {
+        matches!(
+            job.kind,
+            JobKind::CharacterDetection
+                | JobKind::Conversion
+                | JobKind::SegmentRegeneration
+                | JobKind::Export
+        )
+    }) {
+        projects.entry(job.project_id).or_default().push(job);
+    }
+
+    let mut conflicts = BTreeSet::new();
+    for jobs in projects.values_mut() {
+        jobs.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.to_string().cmp(&right.id.to_string()))
+        });
+        conflicts.extend(jobs.iter().skip(1).map(|job| job.id));
+    }
+    conflicts
+}
+
+async fn fail_recovered_production_conflict(
+    state: &AppState,
+    job: &Job,
+) -> Result<(), ServiceError> {
+    if job.kind == JobKind::CharacterDetection {
+        return crate::workflows::fail_recovered_production_conflict(
+            state,
+            job,
+            RECOVERED_PRODUCTION_CONFLICT,
+        )
+        .await;
+    }
+
+    let interrupted = interrupted_paid_dispatches(state, job.id).await?;
+    let uncertainty_recorded = record_recovered_paid_dispatches(state, &interrupted).await?;
+    let message = if interrupted.is_empty() {
+        RECOVERED_PRODUCTION_CONFLICT.to_owned()
+    } else {
+        format!(
+            "{RECOVERED_PRODUCTION_CONFLICT}; one or more provider requests may have been charged and were not retried automatically"
+        )
+    };
+    fail_interrupted_paid_job(state, job.id, &message).await?;
+    if uncertainty_recorded {
+        reconcile_job_budgets(state, job.id).await?;
+    }
+    Ok(())
+}
+
+async fn fail_recovered_interrupted_paid_job(
+    state: &AppState,
+    job: &Job,
+) -> Result<bool, ServiceError> {
+    let interrupted = interrupted_paid_dispatches(state, job.id).await?;
+    if interrupted.is_empty() {
+        return Ok(false);
+    }
+    let uncertainty_recorded = record_recovered_paid_dispatches(state, &interrupted).await?;
+    let message = match job.kind {
+        JobKind::SegmentRegeneration => {
+            "the application stopped while a paid regeneration dispatch was in progress; the provider may have charged it, so it was not retried automatically"
+        }
+        JobKind::Conversion | JobKind::Export => {
+            "the application stopped while one or more paid synthesis dispatches were in progress; the provider may have charged them, so they were not retried automatically"
+        }
+        JobKind::CharacterDetection
+        | JobKind::Preview
+        | JobKind::QualityControl
+        | JobKind::CacheCleanup => {
+            return Err(ServiceError::Internal(
+                "paid synthesis recovery was requested for an unsupported job kind".to_owned(),
+            ));
+        }
+    };
+    fail_interrupted_paid_job(state, job.id, message).await?;
+    if uncertainty_recorded {
+        reconcile_job_budgets(state, job.id).await?;
+    }
+    Ok(true)
+}
+
+async fn record_recovered_paid_dispatches(
+    state: &AppState,
+    units: &[JobUnit],
+) -> Result<bool, ServiceError> {
+    let mut uncertainty_recorded = true;
+    for unit in units {
+        if let Err(error) = record_interrupted_paid_unit_uncertainty(state, unit).await {
+            // Legacy rows may not contain a complete segment snapshot. Keep their reservation
+            // active for manual reconciliation instead of treating an unknown paid request as
+            // zero usage.
+            uncertainty_recorded = false;
+            let mut unresolved = unit.clone();
+            unresolved.payload.insert(
+                "uncertainUsageUnresolved".to_owned(),
+                serde_json::json!(true),
+            );
+            state
+                .database
+                .repositories()
+                .jobs
+                .upsert_unit(&unresolved)
+                .await
+                .map_err(storage_error)?;
+            tracing::warn!(diagnostic_code = "production.recovery.usage_unresolved", job_id = %unit.job_id, unit_id = %unit.id, %error, "interrupted production usage could not be reconstructed; reservation retained");
+        }
+    }
+    Ok(uncertainty_recorded)
+}
+
+async fn recover_interrupted_preview(state: &AppState, job: &Job) -> Result<(), ServiceError> {
+    let units = state
+        .database
+        .repositories()
+        .jobs
+        .list_units(job.id)
+        .await
+        .map_err(storage_error)?;
+    let mut uncertainty_recorded = true;
+    for unit in units.iter().filter(|unit| {
+        unit.kind == JobUnitKind::SynthesisSegment
+            && matches!(unit.state, JobUnitState::Running | JobUnitState::Retrying)
+    }) {
+        if let Err(error) = record_interrupted_paid_unit_uncertainty(state, unit).await {
+            // Legacy preview units did not persist their segment snapshot. Fail the job without
+            // redispatch, but retain its reservation instead of incorrectly treating usage as zero.
+            uncertainty_recorded = false;
+            let mut unresolved = unit.clone();
+            unresolved.payload.insert(
+                "uncertainUsageUnresolved".to_owned(),
+                serde_json::json!(true),
+            );
+            state
+                .database
+                .repositories()
+                .jobs
+                .upsert_unit(&unresolved)
+                .await
+                .map_err(storage_error)?;
+            tracing::warn!(diagnostic_code = "preview.recovery.usage_unresolved", job_id = %job.id, %error, "interrupted preview usage could not be reconstructed; reservation retained");
+        }
+    }
+    let message =
+        "the application stopped during a billable preview; it was not redispatched automatically";
+    fail_interrupted_paid_job(state, job.id, message).await?;
+    if uncertainty_recorded {
+        crate::accounting::finalize_job_reservation(state, job.id).await?;
+    }
+    Ok(())
+}
+
+async fn recover_terminal_paid_reservations(state: &AppState) -> Result<(), ServiceError> {
+    let rows = sqlx::query(
+        "SELECT j.id, j.state FROM jobs j \
+         JOIN budget_reservations r ON r.id = j.reservation_id \
+         WHERE j.kind IN \
+         ('conversion', 'segment_regeneration', 'export', 'preview', 'character_detection') \
+         AND j.state IN ('failed', 'cancelled', 'completed') \
+         AND r.status IN ('active', 'expired')",
+    )
+    .fetch_all(state.database.pool())
+    .await
+    .map_err(storage_error)?;
+    for row in rows {
+        let job_id = JobId::from_str(row.get::<&str, _>("id")).map_err(internal_error)?;
+        let recover_interrupted_dispatch = row.get::<&str, _>("state") == "failed";
+        let mut uncertainty_recorded = true;
+        for mut unit in state
+            .database
+            .repositories()
+            .jobs
+            .list_units(job_id)
+            .await
+            .map_err(storage_error)?
+        {
+            if unit
+                .payload
+                .get("uncertainUsageUnresolved")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                uncertainty_recorded = false;
+            }
+            if recover_interrupted_dispatch
+                && unit.kind == JobUnitKind::SynthesisSegment
+                && matches!(unit.state, JobUnitState::Running | JobUnitState::Retrying)
+            {
+                if let Err(error) = record_interrupted_paid_unit_uncertainty(state, &unit).await {
+                    uncertainty_recorded = false;
+                    unit.payload.insert(
+                        "uncertainUsageUnresolved".to_owned(),
+                        serde_json::json!(true),
+                    );
+                    tracing::warn!(diagnostic_code = "paid_job.recovery.usage_unresolved", %job_id, %error, "interrupted paid usage could not be reconstructed; reservation retained");
+                }
+                update_unit_state(
+                    state,
+                    &mut unit,
+                    JobUnitState::Failed,
+                    Some("interrupted provider dispatch may have been charged"),
+                )
+                .await?;
+            }
+        }
+        if uncertainty_recorded {
+            crate::accounting::finalize_job_reservation(state, job_id).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn release_orphaned_admission_reservations(state: &AppState) -> Result<(), ServiceError> {
+    let rows = sqlx::query(
+        "SELECT r.id, r.job_id, r.usage_sequence_start FROM budget_reservations r \
+         JOIN jobs j ON j.id = r.job_id \
+         WHERE r.status IN ('active', 'expired') \
+         AND (j.reservation_id IS NULL OR j.reservation_id != r.id)",
+    )
+    .fetch_all(state.database.pool())
+    .await
+    .map_err(storage_error)?;
+    let mut released_any = false;
+    for row in rows {
+        let reservation_id =
+            ReservationId::from_str(row.get::<&str, _>("id")).map_err(internal_error)?;
+        let job_id = JobId::from_str(row.get::<&str, _>("job_id")).map_err(internal_error)?;
+        let usage_sequence_start = row.get::<i64, _>("usage_sequence_start");
+        let usage_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM usage_ledger WHERE job_id = ? AND sequence > ?",
+        )
+        .bind(job_id.to_string())
+        .bind(usage_sequence_start)
+        .fetch_one(state.database.pool())
+        .await
+        .map_err(storage_error)?;
+        if usage_count > 0 {
+            tracing::warn!(diagnostic_code = "budget.admission.orphaned_with_usage", %job_id, %reservation_id, "an unattached reservation has usage and was retained for manual reconciliation");
+            continue;
+        }
+        state
+            .database
+            .repositories()
+            .budgets
+            .release(reservation_id, Utc::now())
+            .await
+            .map_err(storage_error)?;
+        released_any = true;
+    }
+    if released_any {
+        crate::accounting::refresh_budget_views(state).await?;
+    }
+    Ok(())
+}
+
+async fn interrupted_paid_dispatches(
+    state: &AppState,
+    job_id: JobId,
+) -> Result<Vec<JobUnit>, ServiceError> {
+    Ok(state
+        .database
+        .repositories()
+        .jobs
+        .list_units(job_id)
+        .await
+        .map_err(storage_error)?
+        .into_iter()
+        .filter(|unit| {
+            unit.kind == JobUnitKind::SynthesisSegment
+                && matches!(unit.state, JobUnitState::Running | JobUnitState::Retrying)
+        })
+        .collect())
+}
+
+async fn record_interrupted_paid_unit_uncertainty(
+    state: &AppState,
+    unit: &JobUnit,
+) -> Result<(), ServiceError> {
+    let segment = unit
+        .payload
+        .get("segmentPlan")
+        .cloned()
+        .ok_or_else(|| {
+            ServiceError::Conflict(
+                "interrupted paid synthesis has no durable input snapshot".to_owned(),
+            )
+        })
+        .and_then(|value| serde_json::from_value::<SegmentPlan>(value).map_err(internal_error))?;
+    let existing = sqlx::query_scalar::<_, String>(
+        "SELECT payload FROM job_attempts WHERE job_unit_id = ? AND uncertain_charge = 1 \
+         ORDER BY ordinal DESC LIMIT 1",
+    )
+    .bind(unit.id.to_string())
+    .fetch_optional(state.database.pool())
+    .await
+    .map_err(storage_error)?;
+    let attempt = if let Some(payload) = existing {
+        serde_json::from_str::<JobAttempt>(&payload).map_err(internal_error)?
+    } else {
+        let maximum = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT MAX(ordinal) FROM job_attempts WHERE job_unit_id = ?",
+        )
+        .bind(unit.id.to_string())
+        .fetch_one(state.database.pool())
+        .await
+        .map_err(storage_error)?
+        .unwrap_or(0);
+        let ordinal = u16::try_from(maximum.saturating_add(1)).map_err(|_| {
+            ServiceError::Conflict(
+                "interrupted regeneration exhausted its durable attempt counter".to_owned(),
+            )
+        })?;
+        let now = Utc::now();
+        let attempt = JobAttempt {
+            id: AttemptId::new(),
+            job_unit_id: unit.id,
+            ordinal,
+            started_at: unit.updated_at,
+            finished_at: Some(now),
+            failure_class: Some(audiobookai_core::FailureClass::TimeoutAfterDispatch),
+            error_code: Some("application_interrupted_after_dispatch".to_owned()),
+            redacted_error: Some(
+                "application stopped before the paid provider response was durably recorded"
+                    .to_owned(),
+            ),
+            provider_request_id: None,
+            uncertain_charge: true,
+        };
+        state
+            .database
+            .repositories()
+            .jobs
+            .insert_attempt(&attempt)
+            .await
+            .map_err(storage_error)?;
+        attempt
+    };
+    append_tts_usage(
+        state,
+        unit.job_id,
+        &segment,
+        Some(attempt.id),
+        &ProviderUsage {
+            source: UsageSource::Estimated,
+            characters: u64::try_from(segment.text.chars().count()).ok(),
+            ..ProviderUsage::default()
+        },
+        true,
+        None,
+    )
+    .await
 }
 
 /// Persists a pause boundary for every active durable job before desktop shutdown.
@@ -266,7 +1489,13 @@ pub async fn checkpoint_jobs_for_shutdown(state: Arc<AppState>) -> Result<usize,
         .map_err(storage_error)?;
     let mut checkpointed = 0_usize;
     for job in active {
-        if !matches!(job.kind, JobKind::Conversion | JobKind::CharacterDetection) {
+        if !matches!(
+            job.kind,
+            JobKind::Conversion
+                | JobKind::CharacterDetection
+                | JobKind::SegmentRegeneration
+                | JobKind::Export
+        ) {
             continue;
         }
         match job.state {
@@ -374,6 +1603,7 @@ async fn create_export_profile(
             "the export directory must be an absolute path".to_owned(),
         ));
     }
+    ensure_output_directory_not_reserved(state, &output_directory).await?;
     tokio::fs::create_dir_all(&output_directory).await?;
     let output_directory = tokio::fs::canonicalize(&output_directory).await?;
     let file_name = safe_file_component(
@@ -613,7 +1843,7 @@ async fn load_conversion_plan(
     let assignments = build_assignments(&project, &characters, &voices, &providers, state).await?;
     let narrator_id = characters
         .iter()
-        .find(|character| character.canonical_name.eq_ignore_ascii_case("narrator"))
+        .find(|character| matches!(character.role, audiobookai_core::CharacterRole::Narrator))
         .map(|character| character.id)
         .ok_or_else(|| {
             ServiceError::Conflict("the reviewed character set has no narrator".to_owned())
@@ -660,12 +1890,37 @@ async fn load_conversion_plan(
     })
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AssignmentPurpose {
+    Semantic,
+    Dispatch,
+}
+
 async fn build_assignments(
     project: &Project,
     characters: &[crate::models::CharacterView],
     voice_sources: &HashMap<Uuid, String>,
     providers: &HashMap<Uuid, ProviderProfileView>,
     state: &AppState,
+) -> Result<HashMap<Uuid, SpeakerAssignment>, ServiceError> {
+    build_assignments_for(
+        project,
+        characters,
+        voice_sources,
+        providers,
+        state,
+        AssignmentPurpose::Dispatch,
+    )
+    .await
+}
+
+async fn build_assignments_for(
+    project: &Project,
+    characters: &[crate::models::CharacterView],
+    voice_sources: &HashMap<Uuid, String>,
+    providers: &HashMap<Uuid, ProviderProfileView>,
+    state: &AppState,
+    purpose: AssignmentPurpose,
 ) -> Result<HashMap<Uuid, SpeakerAssignment>, ServiceError> {
     let mut result = HashMap::new();
     for character in characters {
@@ -683,23 +1938,16 @@ async fn build_assignments(
                     character.canonical_name
                 ))
             })?;
-        if !provider
-            .capabilities
-            .as_ref()
-            .is_some_and(|capabilities| capabilities.tts)
-        {
-            return Err(ServiceError::Conflict(format!(
-                "the provider assigned to '{}' has no verified TTS capability",
-                character.canonical_name
-            )));
-        }
-        if matches!(provider.mode, ProviderModeView::CloudRemote)
-            && !project.cloud_consent.book_text
-        {
-            return Err(ServiceError::Conflict(format!(
-                "grant project consent before sending book text to {}",
-                provider.name
-            )));
+        if purpose == AssignmentPurpose::Dispatch {
+            crate::api::validate_billable_tts_provider_readiness(provider)?;
+            if matches!(provider.mode, ProviderModeView::CloudRemote)
+                && !project.cloud_consent.book_text
+            {
+                return Err(ServiceError::Conflict(format!(
+                    "grant project consent before sending book text to {}",
+                    provider.name
+                )));
+            }
         }
         let voice_source = voice_sources
             .get(&assignment.voice_id)
@@ -724,6 +1972,31 @@ async fn build_assignments(
             .as_ref()
             .and_then(|profile| profile.capability_snapshot.as_ref())
             .and_then(|snapshot| snapshot.provider_version.clone());
+        let provider_snapshot_id = domain_provider
+            .as_ref()
+            .and_then(|profile| profile.capability_snapshot.as_ref())
+            .map(|snapshot| snapshot.id.as_uuid());
+        let model = assignment.model.clone().or_else(|| provider.model.clone());
+        if purpose == AssignmentPurpose::Dispatch {
+            crate::api::validate_voice_direction(
+                &assignment.performance,
+                &assignment.timing,
+                model.as_deref(),
+                provider.capabilities.as_ref(),
+            )?;
+        } else {
+            if let Some(issue) = assignment
+                .performance
+                .validation_issues()
+                .into_iter()
+                .next()
+            {
+                return Err(ServiceError::InvalidRequest(issue.message));
+            }
+            if let Some(issue) = assignment.timing.validation_issues().into_iter().next() {
+                return Err(ServiceError::InvalidRequest(issue.message));
+            }
+        }
         result.insert(
             character.id,
             SpeakerAssignment {
@@ -732,17 +2005,102 @@ async fn build_assignments(
                 provider_id: assignment.provider_profile_id,
                 provider_name: provider.name.clone(),
                 provider_kind: provider.kind.clone(),
+                provider_mode: Some(provider.mode),
                 provider_endpoint: provider.endpoint.clone(),
+                provider_snapshot_id,
                 provider_version,
                 provider_concurrency: concurrency,
                 voice_id: assignment.voice_id,
                 voice_source,
                 voice_name: assignment.voice_name.clone(),
-                model: assignment.model.clone().or_else(|| provider.model.clone()),
+                model,
+                performance: assignment.performance.clone(),
+                timing: assignment.timing.clone(),
             },
         );
     }
     Ok(result)
+}
+
+async fn validate_segment_dispatch_boundary(
+    state: &AppState,
+    project_id: Uuid,
+    segment: &SegmentPlan,
+) -> Result<(), ProviderError> {
+    let (profile, voice_source, voice_belongs_to_provider, cloud_text_consent) = {
+        let catalog = state.catalog.read().await;
+        let profile = catalog
+            .providers
+            .get(&segment.assignment.provider_id)
+            .cloned()
+            .ok_or_else(|| ProviderError::Configuration("TTS provider was removed".to_owned()))?;
+        let voice_source = catalog
+            .voice_sources
+            .get(&segment.assignment.voice_id)
+            .cloned();
+        let voice_belongs_to_provider = catalog.voices.iter().any(|voice| {
+            voice.id == segment.assignment.voice_id
+                && voice.provider_profile_id == segment.assignment.provider_id
+        });
+        let cloud_text_consent = catalog
+            .projects
+            .get(&project_id)
+            .is_some_and(|project| project.consent_cloud_text);
+        (
+            profile,
+            voice_source,
+            voice_belongs_to_provider,
+            cloud_text_consent,
+        )
+    };
+    crate::api::validate_billable_tts_provider_readiness(&profile)
+        .map_err(|error| ProviderError::Configuration(error.to_string()))?;
+    if profile.kind != segment.assignment.provider_kind
+        || Some(profile.mode) != segment.assignment.provider_mode
+        || profile.endpoint != segment.assignment.provider_endpoint
+    {
+        return Err(ProviderError::Configuration(
+            "TTS provider routing changed after this job was admitted".to_owned(),
+        ));
+    }
+    if matches!(profile.mode, ProviderModeView::CloudRemote) && !cloud_text_consent {
+        return Err(ProviderError::Configuration(
+            "cloud-text consent is not active for this dispatch".to_owned(),
+        ));
+    }
+    if !voice_belongs_to_provider
+        || voice_source.as_deref() != Some(segment.assignment.voice_source.as_str())
+    {
+        return Err(ProviderError::Configuration(
+            "the selected provider voice changed after this job was admitted".to_owned(),
+        ));
+    }
+    crate::api::validate_voice_direction(
+        &segment.assignment.performance,
+        &segment.assignment.timing,
+        segment.assignment.model.as_deref(),
+        profile.capabilities.as_ref(),
+    )
+    .map_err(|error| ProviderError::Configuration(error.to_string()))?;
+
+    let current_snapshot_id = state
+        .database
+        .repositories()
+        .providers
+        .get(ProviderProfileId::from_uuid(segment.assignment.provider_id))
+        .await
+        .map_err(|error| ProviderError::Process(error.to_string()))?
+        .and_then(|provider| provider.capability_snapshot)
+        .map(|snapshot| snapshot.id.as_uuid());
+    if segment.assignment.provider_snapshot_id.is_none()
+        || current_snapshot_id != segment.assignment.provider_snapshot_id
+    {
+        return Err(ProviderError::Configuration(
+            "TTS provider capability or credential snapshot changed after this job was admitted"
+                .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 async fn load_detection_spans(
@@ -846,8 +2204,8 @@ fn segment_chapter(
             let Some(text) = paragraph.text.get(start..end) else {
                 continue;
             };
-            let text = text.trim();
-            if text.is_empty() {
+            let original_text = text.trim();
+            if original_text.is_empty() {
                 continue;
             }
             let assignment = assignments.get(&character_id).cloned().ok_or_else(|| {
@@ -857,7 +2215,7 @@ fn segment_chapter(
                 ))
             })?;
             let (text, applied_rule_ids, dictionary_revision) = apply_pronunciation_rules(
-                text,
+                original_text,
                 rules,
                 project.id.as_uuid(),
                 character_id,
@@ -866,11 +2224,18 @@ fn segment_chapter(
             let segment_ordinal = u32::try_from(output.len()).unwrap_or(u32::MAX);
             let key = segment_key(chapter.id.as_uuid(), paragraph_id, start, end, character_id);
             output.push(SegmentPlan {
+                id: SegmentId::new(),
+                proofing: true,
                 key,
                 chapter_id: chapter.id.as_uuid(),
+                paragraph_id,
+                source_content_hash: paragraph.content_hash.clone(),
+                byte_start: u64::try_from(start).unwrap_or(u64::MAX),
+                byte_end: u64::try_from(end).unwrap_or(u64::MAX),
                 chapter_title: chapter.title.clone(),
                 segment_ordinal,
                 playback_ordinal: 0,
+                original_text: original_text.to_owned(),
                 text,
                 context: None,
                 assignment,
@@ -1032,7 +2397,7 @@ fn trailing_characters(value: &str, count: usize) -> String {
     characters.into_iter().collect()
 }
 
-fn apply_pronunciation_rules(
+pub(crate) fn apply_pronunciation_rules(
     text: &str,
     rules: &[PronunciationRuleView],
     project_id: Uuid,
@@ -1115,13 +2480,15 @@ fn build_job_units(job_id: JobId, plan: &ConversionPlan) -> PersistedUnitPlan {
     let mut synthesis_by_chapter = HashMap::<Uuid, Vec<JobUnitId>>::new();
     for chapter in &plan.chapters {
         for segment in &chapter.segments {
+            let take_id = SegmentTakeId::new();
+            let take_artifact_id = ArtifactId::new();
             let unit = JobUnit {
                 id: JobUnitId::new(),
                 job_id,
                 kind: JobUnitKind::SynthesisSegment,
                 state: JobUnitState::Ready,
                 chapter_id: Some(ChapterId::from_uuid(segment.chapter_id)),
-                segment_id: None,
+                segment_id: segment.proofing.then_some(segment.id),
                 provider_profile_id: Some(ProviderProfileId::from_uuid(
                     segment.assignment.provider_id,
                 )),
@@ -1131,6 +2498,18 @@ fn build_job_units(job_id: JobId, plan: &ConversionPlan) -> PersistedUnitPlan {
                 output_artifact_id: None,
                 payload: BTreeMap::from([
                     ("segmentKey".to_owned(), serde_json::json!(segment.key)),
+                    ("takeId".to_owned(), serde_json::json!(take_id)),
+                    (
+                        "takeArtifactId".to_owned(),
+                        serde_json::json!(take_artifact_id),
+                    ),
+                    ("cacheOperation".to_owned(), serde_json::json!("conversion")),
+                    ("autoSelect".to_owned(), serde_json::json!(true)),
+                    (
+                        "segmentPlan".to_owned(),
+                        serde_json::to_value(segment)
+                            .expect("a validated conversion segment plan is serializable"),
+                    ),
                     (
                         "title".to_owned(),
                         serde_json::json!(format!(
@@ -1258,48 +2637,20 @@ fn unit_count(units: &PersistedUnitPlan) -> usize {
     units.synthesis.len() + units.assembly.len() + 2 + usize::from(units.mix.is_some())
 }
 
-async fn persist_units(state: &AppState, units: &PersistedUnitPlan) -> Result<(), ServiceError> {
-    for unit in units.synthesis.values() {
-        state
-            .database
-            .repositories()
-            .jobs
-            .upsert_unit(unit)
-            .await
-            .map_err(storage_error)?;
-    }
-    for unit in units.assembly.values() {
-        state
-            .database
-            .repositories()
-            .jobs
-            .upsert_unit(unit)
-            .await
-            .map_err(storage_error)?;
-    }
+fn ordered_units(units: &PersistedUnitPlan) -> Vec<JobUnit> {
+    let mut ordered = Vec::with_capacity(unit_count(units));
+    let mut synthesis = units.synthesis.values().cloned().collect::<Vec<_>>();
+    synthesis.sort_by_key(|unit| unit.id);
+    ordered.extend(synthesis);
+    let mut assembly = units.assembly.values().cloned().collect::<Vec<_>>();
+    assembly.sort_by_key(|unit| unit.id);
+    ordered.extend(assembly);
     if let Some(unit) = &units.mix {
-        state
-            .database
-            .repositories()
-            .jobs
-            .upsert_unit(unit)
-            .await
-            .map_err(storage_error)?;
+        ordered.push(unit.clone());
     }
-    state
-        .database
-        .repositories()
-        .jobs
-        .upsert_unit(&units.normalize)
-        .await
-        .map_err(storage_error)?;
-    state
-        .database
-        .repositories()
-        .jobs
-        .upsert_unit(&units.export)
-        .await
-        .map_err(storage_error)
+    ordered.push(units.normalize.clone());
+    ordered.push(units.export.clone());
+    ordered
 }
 
 async fn load_unit_plan(
@@ -1315,9 +2666,10 @@ async fn load_unit_plan(
         .await
         .map_err(storage_error)?;
     if existing.is_empty() {
-        let units = build_job_units(job_id, plan);
-        persist_units(state, &units).await?;
-        return Ok(units);
+        return Err(ServiceError::Conflict(
+            "the durable job graph is missing; the job was not admitted and cannot be resumed"
+                .to_owned(),
+        ));
     }
     let mut synthesis = HashMap::new();
     let mut assembly = HashMap::new();
@@ -1343,7 +2695,7 @@ async fn load_unit_plan(
             JobUnitKind::MusicMix => mix = Some(unit),
             JobUnitKind::Normalization => normalize = Some(unit),
             JobUnitKind::FinalExport => export = Some(unit),
-            JobUnitKind::DetectionBatch => {}
+            JobUnitKind::DetectionBatch | JobUnitKind::QualityControl => {}
         }
     }
     let expected_keys = plan
@@ -1362,6 +2714,16 @@ async fn load_unit_plan(
                 .to_owned(),
         ));
     }
+    for segment in plan
+        .chapters
+        .iter()
+        .flat_map(|chapter| chapter.segments.iter())
+    {
+        let unit = synthesis
+            .get(&segment.key)
+            .expect("the durable synthesis key set was checked above");
+        validate_durable_segment_snapshot(unit, segment)?;
+    }
     Ok(PersistedUnitPlan {
         synthesis,
         assembly,
@@ -1369,6 +2731,48 @@ async fn load_unit_plan(
         normalize: normalize.expect("checked above"),
         export: export.expect("checked above"),
     })
+}
+
+fn validate_durable_segment_snapshot(
+    unit: &JobUnit,
+    current: &SegmentPlan,
+) -> Result<(), ServiceError> {
+    let snapshot = unit
+        .payload
+        .get("segmentPlan")
+        .cloned()
+        .ok_or_else(|| {
+            ServiceError::Conflict(
+                "the conversion predates durable narration snapshots; start a new conversion"
+                    .to_owned(),
+            )
+        })
+        .and_then(|value| serde_json::from_value::<SegmentPlan>(value).map_err(internal_error))?;
+    let operation = unit
+        .payload
+        .get("cacheOperation")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("conversion");
+    let semantic_matches =
+        segment_semantic_input_hash(&snapshot)? == segment_semantic_input_hash(current)?;
+    let provider_identity_matches = snapshot.assignment.provider_kind
+        == current.assignment.provider_kind
+        && snapshot.assignment.provider_mode == current.assignment.provider_mode
+        && snapshot.assignment.provider_endpoint == current.assignment.provider_endpoint
+        && snapshot.assignment.provider_snapshot_id == current.assignment.provider_snapshot_id;
+    let snapshot_cache_key = segment_cache_fingerprint(&snapshot, operation)
+        .key()
+        .map_err(media_error)?;
+    let current_cache_key = segment_cache_fingerprint(current, operation)
+        .key()
+        .map_err(media_error)?;
+    if !semantic_matches || !provider_identity_matches || snapshot_cache_key != current_cache_key {
+        return Err(ServiceError::Conflict(
+            "the narration inputs changed after this job was admitted; start a new conversion"
+                .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn job_view(job: &Job, title: &str, units: &PersistedUnitPlan) -> JobView {
@@ -1388,11 +2792,21 @@ fn job_view(job: &Job, title: &str, units: &PersistedUnitPlan) -> JobView {
         JobStageView::Mix => 3,
         JobStageView::Normalize => 4,
         JobStageView::Export => 5,
+        JobStageView::QualityControl => 6,
     });
     JobView {
         id: job.id.as_uuid(),
         project_id: job.project_id.as_uuid(),
         project_title: title.to_owned(),
+        kind: match job.kind {
+            JobKind::CharacterDetection => crate::models::JobKindView::CharacterDetection,
+            JobKind::Preview => crate::models::JobKindView::Preview,
+            JobKind::Conversion => crate::models::JobKindView::Conversion,
+            JobKind::SegmentRegeneration => crate::models::JobKindView::SegmentRegeneration,
+            JobKind::Export => crate::models::JobKindView::Export,
+            JobKind::QualityControl => crate::models::JobKindView::QualityControl,
+            JobKind::CacheCleanup => crate::models::JobKindView::CacheCleanup,
+        },
         status: job_status_view(job.state),
         progress: progress_ratio(job.progress_completed, job.progress_total),
         current_stage: job.status_message.clone(),
@@ -1421,13 +2835,18 @@ fn unit_view(unit: &JobUnit) -> JobUnitView {
             JobUnitKind::MusicMix => JobStageView::Mix,
             JobUnitKind::Normalization => JobStageView::Normalize,
             JobUnitKind::FinalExport => JobStageView::Export,
+            JobUnitKind::QualityControl => JobStageView::QualityControl,
         },
         status: unit_status_view(unit.state),
-        progress: unit
-            .payload
-            .get("progress")
-            .and_then(serde_json::Value::as_f64)
-            .map_or(0.0, unit_interval_f32),
+        progress: if unit.state == JobUnitState::Completed {
+            100.0
+        } else {
+            unit.payload
+                .get("progress")
+                .and_then(serde_json::Value::as_f64)
+                .map_or(0.0, unit_interval_f32)
+                * 100.0
+        },
         attempt: u32::from(unit.attempt_count),
         last_error: unit
             .payload
@@ -1441,7 +2860,8 @@ const fn job_status_view(state: JobState) -> JobStatusView {
     match state {
         JobState::Queued => JobStatusView::Queued,
         JobState::Running => JobStatusView::Running,
-        JobState::Pausing | JobState::Cancelling => JobStatusView::Pausing,
+        JobState::Pausing => JobStatusView::Pausing,
+        JobState::Cancelling => JobStatusView::Cancelling,
         JobState::Paused => JobStatusView::Paused,
         JobState::Cancelled => JobStatusView::Cancelled,
         JobState::Failed => JobStatusView::Failed,
@@ -1468,7 +2888,7 @@ fn progress_ratio(completed: u64, total: u64) -> f32 {
     } else {
         let scaled = u128::from(completed.min(total)).saturating_mul(10_000) / u128::from(total);
         let basis_points = u16::try_from(scaled).unwrap_or(10_000);
-        f32::from(basis_points) / 10_000.0
+        f32::from(basis_points) / 100.0
     }
 }
 
@@ -1531,30 +2951,187 @@ async fn reserve_job_budgets(
     crate::accounting::reserve_for_estimates(state, job, &estimates).await
 }
 
-async fn run_conversion_job(state: Arc<AppState>, job_id: JobId) {
-    let workers = ACTIVE_WORKERS.get_or_init(|| StdMutex::new(BTreeSet::new()));
-    {
-        let mut workers = workers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !workers.insert(job_id.as_uuid()) {
-            return;
-        }
-    }
-    let result = run_conversion_job_inner(&state, job_id).await;
-    if let Err(error) = result {
-        tracing::warn!(diagnostic_code = "conversion.failed", %job_id, %error, "conversion job failed");
-        if !matches!(error, ServiceError::Conflict(ref message) if message == "job cancelled") {
-            mark_job_failed(&state, job_id, &error.to_string()).await;
-        }
-    }
-    if let Err(error) = reconcile_job_budgets(&state, job_id).await {
-        tracing::warn!(diagnostic_code = "conversion.budget.reconcile.failed", %job_id, %error, "could not reconcile conversion budget reservation");
-    }
-    workers
+fn request_production_worker(job_id: JobId, retry_after_cleanup: bool) -> bool {
+    let workers = ACTIVE_WORKERS.get_or_init(|| StdMutex::new(HashMap::new()));
+    let mut workers = workers
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .remove(&job_id.as_uuid());
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(restart_requested) = workers.get_mut(&job_id.as_uuid()) {
+        *restart_requested |= retry_after_cleanup;
+        false
+    } else {
+        workers.insert(job_id.as_uuid(), false);
+        true
+    }
+}
+
+fn finish_production_worker_iteration(job_id: JobId) -> bool {
+    let workers = ACTIVE_WORKERS.get_or_init(|| StdMutex::new(HashMap::new()));
+    let mut workers = workers
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if workers.get(&job_id.as_uuid()).copied().unwrap_or(false) {
+        workers.insert(job_id.as_uuid(), false);
+        true
+    } else {
+        workers.remove(&job_id.as_uuid());
+        false
+    }
+}
+
+fn schedule_conversion_job(state: Arc<AppState>, job_id: JobId) {
+    if request_production_worker(job_id, false) {
+        tokio::spawn(run_conversion_job(state, job_id));
+    }
+}
+
+fn schedule_segment_regeneration_job(state: Arc<AppState>, job_id: JobId) {
+    if request_production_worker(job_id, false) {
+        tokio::spawn(run_segment_regeneration_job(state, job_id));
+    }
+}
+
+fn schedule_conversion_retry(state: Arc<AppState>, job_id: JobId) {
+    if request_production_worker(job_id, true) {
+        tokio::spawn(run_conversion_job(state, job_id));
+    }
+}
+
+fn schedule_segment_regeneration_retry(state: Arc<AppState>, job_id: JobId) {
+    if request_production_worker(job_id, true) {
+        tokio::spawn(run_segment_regeneration_job(state, job_id));
+    }
+}
+
+async fn run_conversion_job(state: Arc<AppState>, job_id: JobId) {
+    loop {
+        let result = run_conversion_job_inner(&state, job_id).await;
+        if let Err(error) = result {
+            tracing::warn!(diagnostic_code = "conversion.failed", %job_id, %error, "conversion job failed");
+            if !matches!(error, ServiceError::Conflict(ref message) if message == "job cancelled") {
+                mark_job_failed(&state, job_id, &error.to_string()).await;
+            }
+        }
+        if let Err(error) = reconcile_job_budgets(&state, job_id).await {
+            tracing::warn!(diagnostic_code = "conversion.budget.reconcile.failed", %job_id, %error, "could not reconcile conversion budget reservation");
+        }
+        if !finish_production_worker_iteration(job_id) {
+            break;
+        }
+    }
+}
+
+async fn run_segment_regeneration_job(state: Arc<AppState>, job_id: JobId) {
+    loop {
+        let result = run_segment_regeneration_job_inner(&state, job_id).await;
+        if let Err(error) = &result {
+            tracing::warn!(diagnostic_code = "proofing.regeneration.failed", %job_id, %error, "segment regeneration failed");
+            if !matches!(error, ServiceError::Conflict(message) if message == "job cancelled") {
+                mark_job_failed(&state, job_id, &error.to_string()).await;
+            }
+        }
+        if let Err(error) = reconcile_job_budgets(&state, job_id).await {
+            tracing::warn!(diagnostic_code = "proofing.regeneration.budget.reconcile.failed", %job_id, %error, "could not reconcile regeneration budget");
+        }
+        if !finish_production_worker_iteration(job_id) {
+            break;
+        }
+    }
+}
+
+async fn run_segment_regeneration_job_inner(
+    state: &Arc<AppState>,
+    job_id: JobId,
+) -> Result<(), ServiceError> {
+    let repository = state.database.repositories().jobs;
+    let mut job = repository
+        .get(job_id)
+        .await
+        .map_err(storage_error)?
+        .ok_or(ServiceError::NotFound)?;
+    if job.kind != JobKind::SegmentRegeneration {
+        return Err(ServiceError::Conflict(
+            "job is not a segment regeneration".to_owned(),
+        ));
+    }
+    if job.state == JobState::Queued {
+        job = transition_job(
+            state,
+            job_id,
+            JobState::Running,
+            "Regenerating proofing segment",
+        )
+        .await?;
+    }
+    wait_until_runnable(state, job_id).await?;
+    let mut units = repository.list_units(job_id).await.map_err(storage_error)?;
+    let mut unit = units
+        .drain(..)
+        .find(|unit| unit.kind == JobUnitKind::SynthesisSegment)
+        .ok_or_else(|| {
+            ServiceError::Internal("regeneration job has no synthesis unit".to_owned())
+        })?;
+    if unit.state == JobUnitState::Completed {
+        if !job.state.is_terminal() {
+            transition_job(
+                state,
+                job_id,
+                JobState::Completed,
+                "Segment regeneration complete",
+            )
+            .await?;
+        }
+        return Ok(());
+    }
+    if matches!(unit.state, JobUnitState::Running | JobUnitState::Retrying) {
+        record_interrupted_paid_unit_uncertainty(state, &unit).await?;
+        return Err(ServiceError::Conflict(
+            "a previous paid regeneration dispatch was interrupted and may have been charged; automatic redispatch is disabled"
+                .to_owned(),
+        ));
+    }
+    let segment = unit
+        .payload
+        .get("segmentPlan")
+        .cloned()
+        .ok_or_else(|| ServiceError::Internal("regeneration unit has no input snapshot".to_owned()))
+        .and_then(|value| serde_json::from_value::<SegmentPlan>(value).map_err(internal_error))?;
+    let sidecars = resolve_sidecars(state)?;
+    let progress_guard = tokio::sync::Mutex::new(());
+    synthesize_segment(
+        state,
+        job_id,
+        segment,
+        unit.clone(),
+        &sidecars,
+        &progress_guard,
+    )
+    .await?;
+    let completed = transition_job(
+        state,
+        job_id,
+        JobState::Completed,
+        "Segment regeneration complete",
+    )
+    .await?;
+    if let Err(error) = release_job_cache_pins(state, job_id).await {
+        tracing::warn!(diagnostic_code = "proofing.regeneration.cache.unpin.failed", %job_id, %error, "could not release regeneration cache pin");
+    }
+    if let Some(view) = state.catalog.write().await.jobs.get_mut(&job_id.as_uuid()) {
+        view.status = JobStatusView::Complete;
+        view.progress = 100.0;
+        view.current_stage = completed.status_message;
+        view.updated_at = completed.updated_at;
+        if let Some(current) = repository.get_unit(unit.id).await.map_err(storage_error)? {
+            unit = current;
+            view.units = vec![unit_view(&unit)];
+        }
+    }
+    state.events.publish(
+        "job.completed",
+        serde_json::json!({"jobId": job_id, "projectId": job.project_id, "segmentId": unit.segment_id}),
+    );
+    Ok(())
 }
 
 // Durable synthesis, assembly, export, and catalog transitions are deliberately
@@ -1576,20 +3153,25 @@ async fn run_conversion_job_inner(
         job = transition_job(state, job_id, JobState::Running, "Starting conversion").await?;
     }
     wait_until_runnable(state, job_id).await?;
-    let export = load_export_profile(
-        state,
-        job.export_profile_id.ok_or_else(|| {
-            ServiceError::Internal("conversion job has no export profile".to_owned())
-        })?,
-    )
-    .await?;
-    let music_path = if let Some(music) = &export.background_music {
-        Some(artifact_path(state, music.artifact_id).await?)
+    let mut plan = if job.kind == JobKind::Export {
+        load_validated_proof_export_plan(state, &job).await?
     } else {
-        None
+        let export = load_export_profile(
+            state,
+            job.export_profile_id.ok_or_else(|| {
+                ServiceError::Internal("conversion job has no export profile".to_owned())
+            })?,
+        )
+        .await?;
+        let music_path = if let Some(music) = &export.background_music {
+            Some(artifact_path(state, music.artifact_id).await?)
+        } else {
+            None
+        };
+        load_conversion_plan(state, job.project_id.as_uuid(), export, music_path).await?
     };
-    let plan = load_conversion_plan(state, job.project_id.as_uuid(), export, music_path).await?;
     let mut units = load_unit_plan(state, job_id, &plan).await?;
+    bind_persisted_segment_ids(&mut plan, &units);
     synchronize_job_progress(state, job_id, &units).await?;
     refresh_catalog_job(state, job_id, &plan, &units).await?;
     let sidecars = resolve_sidecars(state)?;
@@ -1678,6 +3260,7 @@ async fn run_conversion_job_inner(
             .filter(|artifact| artifact.plan.chapter_id == chapter.chapter.id.as_uuid())
             .cloned()
             .collect::<Vec<_>>();
+        let verify_selected_artifacts = job.kind == JobKind::Export;
         async move {
             assemble_chapter(
                 &state,
@@ -1685,6 +3268,7 @@ async fn run_conversion_job_inner(
                 chapter,
                 unit,
                 artifacts,
+                verify_selected_artifacts,
                 &sidecars,
                 &progress_guard,
             )
@@ -1736,8 +3320,15 @@ async fn run_conversion_job_inner(
         &progress_guard,
     )
     .await?;
-    let completed =
-        transition_job(state, job_id, JobState::Completed, "Conversion complete").await?;
+    let completion_message = if job.kind == JobKind::Export {
+        "Proofing export complete"
+    } else {
+        "Conversion complete"
+    };
+    let completed = transition_job(state, job_id, JobState::Completed, completion_message).await?;
+    if job.kind == JobKind::Conversion {
+        mark_proofing_plan_ready(state, plan.project.id, job_id).await?;
+    }
     if let Err(error) = release_job_cache_pins(state, job_id).await {
         tracing::warn!(diagnostic_code = "conversion.cache.unpin.failed", %job_id, %error, "could not release completed job cache pins");
     }
@@ -1745,16 +3336,23 @@ async fn run_conversion_job_inner(
     if let Err(error) = enforce_cache_limit(state, cache_limit).await {
         tracing::warn!(diagnostic_code = "conversion.cache.prune.failed", %job_id, %error, "could not enforce the cache limit after conversion");
     }
-    update_export_catalog(state, &plan, &export_artifacts, manifest_artifact.id).await?;
+    update_export_catalog(
+        state,
+        job_id,
+        &plan,
+        &export_artifacts,
+        manifest_artifact.id,
+    )
+    .await?;
     {
         let mut catalog = state.catalog.write().await;
         if let Some(project) = catalog.projects.get_mut(&plan.project.id.as_uuid()) {
             project.summary.status = ProjectDisplayStatus::Completed;
-            project.summary.progress = 1.0;
+            project.summary.progress = 100.0;
         }
         if let Some(view) = catalog.jobs.get_mut(&job_id.as_uuid()) {
             view.status = JobStatusView::Complete;
-            view.progress = 1.0;
+            view.progress = 100.0;
             view.current_stage = completed.status_message;
             view.updated_at = completed.updated_at;
         }
@@ -1764,6 +3362,164 @@ async fn run_conversion_job_inner(
         serde_json::json!({"jobId": job_id, "projectId": plan.project.id}),
     );
     Ok(())
+}
+
+async fn mark_proofing_plan_ready(
+    state: &AppState,
+    project_id: ProjectId,
+    job_id: JobId,
+) -> Result<(), ServiceError> {
+    let project_lock = state.character_lifecycle_lock(project_id.as_uuid()).await;
+    let _project_guard = project_lock.lock().await;
+    let repository = state.database.repositories().proofing;
+    let Some(mut plan) = repository
+        .get_plan(project_id)
+        .await
+        .map_err(storage_error)?
+    else {
+        return Ok(());
+    };
+    if plan.source_conversion_job_id != job_id {
+        return Ok(());
+    }
+    let expected_revision = plan.plan_revision;
+    plan.status = ProofingPlanStatus::Ready;
+    plan.dirty_reasons.clear();
+    plan.updated_at = Utc::now();
+    repository
+        .update_plan(&plan, expected_revision)
+        .await
+        .map_err(storage_error)
+}
+
+async fn load_required_proof_export_snapshot(
+    state: &AppState,
+    job: &Job,
+) -> Result<ProofExportSnapshot, ServiceError> {
+    let payload = sqlx::query_scalar::<_, String>(
+        "SELECT payload FROM proof_export_snapshots WHERE job_id = ?",
+    )
+    .bind(job.id.to_string())
+    .fetch_optional(state.database.pool())
+    .await
+    .map_err(storage_error)?
+    .ok_or_else(|| {
+        ServiceError::Conflict(
+            "proof export audit snapshot is missing; refusing an unaudited export".to_owned(),
+        )
+    })?;
+    let snapshot: ProofExportSnapshot = serde_json::from_str(&payload).map_err(internal_error)?;
+    if snapshot.job_id != job.id
+        || snapshot.project_id != job.project_id
+        || Some(snapshot.export_profile_id) != job.export_profile_id
+    {
+        return Err(ServiceError::Conflict(
+            "proof export audit snapshot does not match its durable job".to_owned(),
+        ));
+    }
+    Ok(snapshot)
+}
+
+async fn load_validated_proof_export_plan(
+    state: &AppState,
+    job: &Job,
+) -> Result<ConversionPlan, ServiceError> {
+    let units = state
+        .database
+        .repositories()
+        .jobs
+        .list_units(job.id)
+        .await
+        .map_err(storage_error)?;
+    let export = units
+        .iter()
+        .find(|unit| unit.kind == JobUnitKind::FinalExport)
+        .ok_or_else(|| {
+            ServiceError::Conflict("proof export has no durable export unit".to_owned())
+        })?;
+    let plan = export
+        .payload
+        .get("proofExportPlan")
+        .cloned()
+        .ok_or_else(|| ServiceError::Conflict("proof export has no durable plan".to_owned()))
+        .and_then(|value| {
+            serde_json::from_value::<ConversionPlan>(value).map_err(internal_error)
+        })?;
+    let expected_snapshot_id = export
+        .payload
+        .get("proofExportSnapshotId")
+        .cloned()
+        .ok_or_else(|| {
+            ServiceError::Conflict("proof export unit has no audit snapshot id".to_owned())
+        })
+        .and_then(|value| {
+            serde_json::from_value::<ProofExportSnapshotId>(value).map_err(internal_error)
+        })?;
+    let snapshot = load_required_proof_export_snapshot(state, job).await?;
+    if snapshot.id != expected_snapshot_id
+        || plan.project.id != job.project_id
+        || Some(plan.export.id) != job.export_profile_id
+    {
+        return Err(ServiceError::Conflict(
+            "proof export plan and audit snapshot do not match the durable job".to_owned(),
+        ));
+    }
+    let expected = snapshot
+        .selections
+        .iter()
+        .map(|selection| (selection.segment_id, selection.artifact_id))
+        .collect::<BTreeMap<_, _>>();
+    if expected.len() != snapshot.selections.len() {
+        return Err(ServiceError::Conflict(
+            "proof export snapshot contains duplicate segment selections".to_owned(),
+        ));
+    }
+    let actual = units
+        .iter()
+        .filter(|unit| unit.kind == JobUnitKind::SynthesisSegment)
+        .map(|unit| {
+            unit.segment_id.zip(unit.output_artifact_id).ok_or_else(|| {
+                ServiceError::Conflict(
+                    "proof export synthesis unit is missing its selected artifact".to_owned(),
+                )
+            })
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    let synthesis_count = units
+        .iter()
+        .filter(|unit| unit.kind == JobUnitKind::SynthesisSegment)
+        .count();
+    if actual.len() != synthesis_count {
+        return Err(ServiceError::Conflict(
+            "proof export job graph contains duplicate segment units".to_owned(),
+        ));
+    }
+    if actual != expected {
+        return Err(ServiceError::Conflict(
+            "proof export job graph differs from its reviewed take snapshot".to_owned(),
+        ));
+    }
+    for selection in &snapshot.selections {
+        let artifact = load_artifact(state, selection.artifact_id).await?;
+        verify_selected_artifact_integrity(&artifact).await?;
+    }
+    Ok(plan)
+}
+
+fn bind_persisted_segment_ids(plan: &mut ConversionPlan, units: &PersistedUnitPlan) {
+    for segment in plan
+        .chapters
+        .iter_mut()
+        .flat_map(|chapter| chapter.segments.iter_mut())
+    {
+        if let Some(id) = units
+            .synthesis
+            .get(&segment.key)
+            .and_then(|unit| unit.segment_id)
+        {
+            segment.id = id;
+        }
+    }
 }
 
 async fn load_export_profile(
@@ -1936,21 +3692,46 @@ struct StreamedSynthesis {
     progressive_decode_complete: bool,
 }
 
-async fn synthesize_provider_audio(
+#[derive(Debug)]
+enum ProviderSynthesisDispatch {
+    Complete(StreamedSynthesis),
+    Streaming {
+        metadata: StreamingSynthesisResponse,
+        sink: Arc<ProviderStreamSink>,
+        decoder_task: Option<tokio::task::JoinHandle<bool>>,
+        job_id: JobId,
+        playback_ordinal: usize,
+    },
+}
+
+impl ProviderSynthesisDispatch {
+    fn usage(&self) -> &ProviderUsage {
+        match self {
+            Self::Complete(streamed) => &streamed.response.usage,
+            Self::Streaming { metadata, .. } => &metadata.usage,
+        }
+    }
+}
+
+/// Performs only the provider-owned portion of synthesis.
+///
+/// A successful return is the billing boundary consumed by the retry journal. Streaming sink
+/// validation and local decoder completion deliberately happen later so they cannot turn a paid
+/// provider success into a retryable provider failure.
+async fn dispatch_provider_audio(
     provider: Arc<dyn TtsProvider>,
     request: SynthesisRequest,
     sidecars: &SidecarPair,
     job_id: JobId,
     playback_ordinal: usize,
-) -> Result<StreamedSynthesis, ProviderError> {
+) -> Result<ProviderSynthesisDispatch, ProviderError> {
     if !provider.capabilities().streaming {
-        return provider
-            .synthesize(request)
-            .await
-            .map(|response| StreamedSynthesis {
+        return provider.synthesize(request).await.map(|response| {
+            ProviderSynthesisDispatch::Complete(StreamedSynthesis {
                 response,
                 progressive_decode_complete: false,
-            });
+            })
+        });
     }
 
     // Start decoding with the provider request rather than waiting for a subscriber. A listener
@@ -1989,29 +3770,52 @@ async fn synthesize_provider_audio(
             return Err(error);
         }
     };
-    let audio = match sink.finish().await {
-        Ok(audio) => audio,
-        Err(error) => {
-            if let Some(decoder) = decoder_task {
-                let _ = decoder.await;
-            }
-            reset_playback_segment(job_id, playback_ordinal);
-            return Err(error);
-        }
-    };
-    let progressive_decode_complete = if let Some(decoder) = decoder_task {
-        decoder.await.unwrap_or(false)
-    } else {
-        false
-    };
-    Ok(StreamedSynthesis {
-        response: SynthesisResponse {
-            audio,
-            content_type: metadata.content_type,
-            usage: metadata.usage,
-        },
-        progressive_decode_complete,
+    Ok(ProviderSynthesisDispatch::Streaming {
+        metadata,
+        sink,
+        decoder_task,
+        job_id,
+        playback_ordinal,
     })
+}
+
+async fn finish_provider_audio(
+    dispatch: ProviderSynthesisDispatch,
+) -> Result<StreamedSynthesis, ProviderError> {
+    match dispatch {
+        ProviderSynthesisDispatch::Complete(streamed) => Ok(streamed),
+        ProviderSynthesisDispatch::Streaming {
+            metadata,
+            sink,
+            decoder_task,
+            job_id,
+            playback_ordinal,
+        } => {
+            let audio = match sink.finish().await {
+                Ok(audio) => audio,
+                Err(error) => {
+                    if let Some(decoder) = decoder_task {
+                        let _ = decoder.await;
+                    }
+                    reset_playback_segment(job_id, playback_ordinal);
+                    return Err(error);
+                }
+            };
+            let progressive_decode_complete = if let Some(decoder) = decoder_task {
+                decoder.await.unwrap_or(false)
+            } else {
+                false
+            };
+            Ok(StreamedSynthesis {
+                response: SynthesisResponse {
+                    audio,
+                    content_type: metadata.content_type,
+                    usage: metadata.usage,
+                },
+                progressive_decode_complete,
+            })
+        }
+    }
 }
 
 fn spawn_stream_playback_decoder(
@@ -2126,7 +3930,12 @@ async fn synthesize_segment(
     )
     .await?;
     let cache = cache(state);
-    let fingerprint = segment_cache_fingerprint(&segment, "conversion");
+    let cache_operation = unit
+        .payload
+        .get("cacheOperation")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("conversion");
+    let fingerprint = segment_cache_fingerprint(&segment, cache_operation);
     let cache_key = fingerprint
         .key()
         .map_err(|error| ServiceError::Internal(error.to_string()))?;
@@ -2166,6 +3975,7 @@ async fn synthesize_segment(
             model: segment.assignment.model.clone(),
             voice: segment.assignment.voice_source.clone(),
             format: requested_audio_format(&segment.assignment),
+            performance: segment.assignment.performance.clone(),
             options: BTreeMap::new(),
             pronunciation_dictionary_ids: Vec::new(),
         };
@@ -2182,6 +3992,10 @@ async fn synthesize_segment(
         )
         .await?;
         let policy = retry_policy(state, &segment).await?;
+        let dispatch_project_id = segment_project_id(state, segment.chapter_id).await?;
+        let dispatch_consent_lock = state
+            .dispatch_consent_lifecycle_lock(dispatch_project_id)
+            .await;
         let journal = AttemptJournal::new(
             Arc::clone(state),
             unit.id,
@@ -2198,7 +4012,12 @@ async fn synthesize_segment(
             let request = request.clone();
             let sidecars = sidecars.clone();
             let dispatch_estimate = dispatch_estimate.clone();
+            let dispatch_consent_lock = Arc::clone(&dispatch_consent_lock);
+            let dispatch_segment = segment.clone();
             async move {
+                let _dispatch_consent_guard = dispatch_consent_lock.read().await;
+                validate_segment_dispatch_boundary(&state, dispatch_project_id, &dispatch_segment)
+                    .await?;
                 crate::accounting::verify_dispatch_is_reserved(&state, job_id, &dispatch_estimate)
                     .await
                     .map_err(|_| {
@@ -2207,7 +4026,7 @@ async fn synthesize_segment(
                                 .to_owned(),
                         )
                     })?;
-                synthesize_provider_audio(provider, request, &sidecars, job_id, playback_ordinal)
+                dispatch_provider_audio(provider, request, &sidecars, job_id, playback_ordinal)
                     .await
             }
         })
@@ -2216,7 +4035,26 @@ async fn synthesize_segment(
         unit.attempt_count = execution.attempts.get();
         let successful_attempt_id =
             attempt_id_for_ordinal(state, unit.id, execution.attempts.get()).await?;
-        let streamed = execution.value;
+        let dispatch = execution.value;
+        // The provider has already accepted and completed a potentially billable request. Record
+        // its usage before any local decoding, cache, probe, or artifact operation can fail.
+        let mut usage = dispatch.usage().clone();
+        if usage.request_id.is_none() {
+            usage.request_id = Some(request.request_id.to_string());
+        }
+        append_tts_usage(
+            state,
+            job_id,
+            &segment,
+            successful_attempt_id,
+            &usage,
+            false,
+            dispatch_estimate.rate_card_id,
+        )
+        .await?;
+        let streamed = finish_provider_audio(dispatch)
+            .await
+            .map_err(|error| ServiceError::Conflict(error.to_string()))?;
         let response = streamed.response;
         let flac = normalize_provider_audio(sidecars, &response, segment.text.chars().count() < 50)
             .await?;
@@ -2259,22 +4097,9 @@ async fn synthesize_segment(
             &artifact,
         )
         .await?;
-        let mut usage = response.usage.clone();
-        if usage.request_id.is_none() {
-            usage.request_id = Some(request.request_id.to_string());
-        }
-        append_tts_usage(
-            state,
-            job_id,
-            &segment,
-            successful_attempt_id,
-            &usage,
-            false,
-            dispatch_estimate.rate_card_id,
-        )
-        .await?;
         (artifact, streamed.progressive_decode_complete)
     };
+    let artifact = persist_proof_take(state, job_id, &segment, &unit, &artifact).await?;
     unit.output_artifact_id = Some(artifact.id);
     update_unit_state(state, &mut unit, JobUnitState::Completed, None).await?;
     increment_job_progress(state, job_id, progress_guard).await?;
@@ -2291,6 +4116,223 @@ async fn synthesize_segment(
         plan: segment,
         artifact,
     })
+}
+
+#[allow(clippy::too_many_lines)]
+async fn persist_proof_take(
+    state: &AppState,
+    job_id: JobId,
+    segment: &SegmentPlan,
+    unit: &JobUnit,
+    source: &Artifact,
+) -> Result<Artifact, ServiceError> {
+    let Some(segment_id) = unit.segment_id else {
+        // Jobs created by versions before the proofing migration remain resumable,
+        // but their transient artifacts cannot be promoted into trustworthy takes.
+        return Ok(source.clone());
+    };
+    let take_id = unit
+        .payload
+        .get("takeId")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<SegmentTakeId>(value).ok())
+        .ok_or_else(|| ServiceError::Internal("proofing unit has no take id".to_owned()))?;
+    if let Some(existing) = state
+        .database
+        .repositories()
+        .proofing
+        .get_take(take_id)
+        .await
+        .map_err(storage_error)?
+    {
+        let artifact = load_artifact(state, existing.artifact_id).await?;
+        verify_selected_artifact_integrity(&artifact).await?;
+        return Ok(artifact);
+    }
+    let artifact_id = unit
+        .payload
+        .get("takeArtifactId")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<ArtifactId>(value).ok())
+        .ok_or_else(|| ServiceError::Internal("proofing unit has no artifact id".to_owned()))?;
+    let project_id = segment_project_id(state, segment.chapter_id).await?;
+    let take_directory = state
+        .config
+        .data_dir
+        .join("library")
+        .join(project_id.to_string())
+        .join("proofing")
+        .join("takes");
+    tokio::fs::create_dir_all(&take_directory).await?;
+    let destination = take_directory.join(format!("{take_id}.flac"));
+    let expected_fingerprint = materialize_proof_take_file(source, &destination).await?;
+    let artifact = if sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM artifacts WHERE id = ?")
+        .bind(artifact_id.to_string())
+        .fetch_one(state.database.pool())
+        .await
+        .map_err(storage_error)?
+        > 0
+    {
+        let existing = load_artifact(state, artifact_id).await?;
+        if Path::new(&existing.path) != destination || existing.fingerprint != expected_fingerprint
+        {
+            return Err(ServiceError::Conflict(
+                "existing proof-take artifact does not match its durable source".to_owned(),
+            ));
+        }
+        existing
+    } else {
+        let artifact = artifact_for_file_with_id(
+            artifact_id,
+            ArtifactKind::SegmentAudio,
+            &destination,
+            Some("audio/flac".to_owned()),
+            source.duration_ms,
+            None,
+            None,
+        )
+        .await?;
+        persist_artifact(state, project_id, &artifact).await?;
+        artifact
+    };
+    // Quality-control builds hold the same project lock through their final provenance
+    // revalidation and persistence. Serialize the durable take/selection mutation with that
+    // window so a report can never commit a half-old proofing identity.
+    let project_lock = state.character_lifecycle_lock(project_id).await;
+    let _project_guard = project_lock.lock().await;
+    if let Some(existing) = state
+        .database
+        .repositories()
+        .proofing
+        .get_take(take_id)
+        .await
+        .map_err(storage_error)?
+    {
+        let artifact = load_artifact(state, existing.artifact_id).await?;
+        verify_selected_artifact_integrity(&artifact).await?;
+        return Ok(artifact);
+    }
+    let ordinal = sqlx::query_scalar::<_, i64>(
+        "SELECT COALESCE(MAX(ordinal), 0) + 1 FROM segment_takes WHERE segment_id = ?",
+    )
+    .bind(segment_id.to_string())
+    .fetch_one(state.database.pool())
+    .await
+    .map_err(storage_error)?;
+    let semantic_input_hash = segment_semantic_input_hash(segment)?;
+    let now = Utc::now();
+    let take = SegmentTake {
+        id: take_id,
+        segment_id,
+        artifact_id: artifact.id,
+        ordinal: u32::try_from(ordinal).unwrap_or(u32::MAX),
+        source_job_id: job_id,
+        source_job_unit_id: unit.id,
+        semantic_input_hash,
+        duration_ms: artifact.duration_ms.unwrap_or_default(),
+        provider_profile_id: Some(ProviderProfileId::from_uuid(segment.assignment.provider_id)),
+        model: segment.assignment.model.clone(),
+        voice_profile_id: Some(VoiceProfileId::from_uuid(segment.assignment.voice_id)),
+        dictionary_revision_hash: segment.dictionary_revision.clone(),
+        normalization_version: NORMALIZATION_VERSION.to_owned(),
+        synthesis_provenance: BTreeMap::from([
+            (
+                "providerName".to_owned(),
+                serde_json::json!(segment.assignment.provider_name),
+            ),
+            (
+                "voiceName".to_owned(),
+                serde_json::json!(segment.assignment.voice_name),
+            ),
+            (
+                "performance".to_owned(),
+                serde_json::json!(segment.assignment.performance),
+            ),
+            (
+                "timing".to_owned(),
+                serde_json::json!(segment.assignment.timing),
+            ),
+        ]),
+        findings: Vec::new(),
+        created_at: now,
+    };
+    let auto_select = unit
+        .payload
+        .get("autoSelect")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let repository = state.database.repositories().proofing;
+    if auto_select {
+        let selection = SegmentSelection {
+            segment_id,
+            take_id,
+            selected_at: now,
+            revision: 0,
+        };
+        repository
+            .insert_take_and_select(&take, &selection)
+            .await
+            .map_err(storage_error)?;
+    } else {
+        repository.insert_take(&take).await.map_err(storage_error)?;
+    }
+    Ok(artifact)
+}
+
+async fn materialize_proof_take_file(
+    source: &Artifact,
+    destination: &Path,
+) -> Result<FileFingerprint, ServiceError> {
+    let source_path = Path::new(&source.path);
+    let source_metadata = tokio::fs::symlink_metadata(source_path).await?;
+    if source_metadata.file_type().is_symlink() || !source_metadata.is_file() {
+        return Err(ServiceError::Conflict(format!(
+            "proof-take source is not a regular managed file: {}",
+            source_path.display()
+        )));
+    }
+    let expected = fingerprint_file(source_path).await?;
+    if expected != source.fingerprint {
+        return Err(ServiceError::Conflict(format!(
+            "proof-take source no longer matches its durable fingerprint: {}",
+            source_path.display()
+        )));
+    }
+
+    match tokio::fs::symlink_metadata(destination).await {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => {
+            return Err(ServiceError::Conflict(format!(
+                "proof-take destination is not a regular managed file: {}",
+                destination.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match tokio::fs::hard_link(source_path, destination).await {
+                Ok(()) => {}
+                Err(_) => copy_file_atomically(source_path, destination).await?,
+            }
+        }
+        Err(error) => return Err(ServiceError::Io(error)),
+    }
+
+    let destination_metadata = tokio::fs::symlink_metadata(destination).await?;
+    if destination_metadata.file_type().is_symlink() || !destination_metadata.is_file() {
+        return Err(ServiceError::Conflict(format!(
+            "proof-take destination was replaced during materialization: {}",
+            destination.display()
+        )));
+    }
+    if fingerprint_file(destination).await? != expected {
+        return Err(ServiceError::Conflict(format!(
+            "existing proof-take file does not match its durable source: {}",
+            destination.display()
+        )));
+    }
+    audiobookai_storage::harden_private_file(destination)
+        .await
+        .map_err(storage_error)?;
+    Ok(expected)
 }
 
 fn provider_semaphore(provider_id: Uuid, requested: u16) -> Arc<Semaphore> {
@@ -2434,10 +4476,47 @@ fn segment_cache_fingerprint(segment: &SegmentPlan, operation: &str) -> CacheFin
         model: segment.assignment.model.clone(),
         voice: segment.assignment.voice_source.clone(),
         reference_audio_hashes: Vec::new(),
+        performance: segment.assignment.performance.clone(),
         settings,
         dictionary_revision: segment.dictionary_revision.clone(),
         normalization_version: NORMALIZATION_VERSION.to_owned(),
     }
+}
+
+pub(crate) fn segment_semantic_input_hash(segment: &SegmentPlan) -> Result<String, ServiceError> {
+    semantic_input_hash(
+        &segment.text,
+        segment.context.as_deref(),
+        segment.assignment.provider_id,
+        segment.assignment.model.as_deref(),
+        segment.assignment.voice_id,
+        &segment.dictionary_revision,
+        &segment.assignment.performance,
+    )
+}
+
+pub(crate) fn semantic_input_hash(
+    text: &str,
+    context: Option<&str>,
+    provider_id: Uuid,
+    model: Option<&str>,
+    voice_id: Uuid,
+    dictionary_revision: &str,
+    performance: &PerformanceSettings,
+) -> Result<String, ServiceError> {
+    let value = serde_json::json!({
+        "schemaVersion": 1,
+        "text": text,
+        "context": context,
+        "providerProfileId": provider_id,
+        "model": model,
+        "voiceProfileId": voice_id,
+        "dictionaryRevision": dictionary_revision,
+        "normalizationVersion": NORMALIZATION_VERSION,
+        "performance": performance,
+    });
+    let bytes = serde_json::to_vec(&value).map_err(internal_error)?;
+    Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 
 fn provider_endpoint_family(assignment: &SpeakerAssignment) -> &'static str {
@@ -2494,6 +4573,167 @@ async fn retry_policy(
         )
     })
     .map_err(internal_error)
+}
+
+fn retry_reservation_multiplier(policy: &RetryPolicy) -> usize {
+    if policy.retries_uncertain_charge() {
+        usize::from(policy.max_attempts())
+    } else {
+        1
+    }
+}
+
+fn provider_mode_matches_runtime(
+    mode: ProviderModeView,
+    runtime: audiobookai_providers::ProviderKind,
+) -> bool {
+    matches!(
+        (mode, runtime),
+        (
+            ProviderModeView::CloudRemote,
+            audiobookai_providers::ProviderKind::CloudRemote
+        ) | (
+            ProviderModeView::ExternalEndpoint,
+            audiobookai_providers::ProviderKind::ExternalEndpoint
+        ) | (
+            ProviderModeView::ManagedChild,
+            audiobookai_providers::ProviderKind::ManagedChild
+        ) | (
+            ProviderModeView::Native,
+            audiobookai_providers::ProviderKind::Native
+        )
+    )
+}
+
+fn persisted_provider_snapshot_matches(expected: Option<Uuid>, current: Option<Uuid>) -> bool {
+    expected.is_some() && expected == current
+}
+
+#[allow(clippy::too_many_lines)]
+async fn validate_regeneration_retry_provider_snapshot(
+    state: &AppState,
+    job: &Job,
+    segment: &SegmentPlan,
+) -> Result<(), ServiceError> {
+    let (profile, voice_matches) = {
+        let catalog = state.catalog.read().await;
+        let profile = catalog
+            .providers
+            .get(&segment.assignment.provider_id)
+            .cloned()
+            .ok_or_else(|| {
+                ServiceError::Conflict(
+                    "the regeneration provider was removed; start a new segment regeneration"
+                        .to_owned(),
+                )
+            })?;
+        let voice_matches = catalog.voices.iter().any(|voice| {
+            voice.id == segment.assignment.voice_id
+                && voice.provider_profile_id == segment.assignment.provider_id
+        }) && catalog
+            .voice_sources
+            .get(&segment.assignment.voice_id)
+            .is_some_and(|source| source == &segment.assignment.voice_source);
+        (profile, voice_matches)
+    };
+    crate::api::validate_billable_tts_provider_readiness(&profile).map_err(|_| {
+        ServiceError::Conflict(
+            "the regeneration provider is no longer ready; start a new segment regeneration"
+                .to_owned(),
+        )
+    })?;
+    if profile.kind != segment.assignment.provider_kind
+        || profile.endpoint != segment.assignment.provider_endpoint
+        || segment.assignment.provider_mode != Some(profile.mode)
+        || !voice_matches
+    {
+        return Err(ServiceError::Conflict(
+            "the regeneration provider or voice changed; start a new segment regeneration"
+                .to_owned(),
+        ));
+    }
+    if segment.assignment.model.is_none() && profile.model.is_some() {
+        return Err(ServiceError::Conflict(
+            "the regeneration provider's default model changed; start a new segment regeneration"
+                .to_owned(),
+        ));
+    }
+    let project = state
+        .database
+        .repositories()
+        .projects
+        .get_project(job.project_id)
+        .await
+        .map_err(storage_error)?
+        .ok_or(ServiceError::NotFound)?;
+    if matches!(profile.mode, ProviderModeView::CloudRemote) && !project.cloud_consent.book_text {
+        return Err(ServiceError::Conflict(
+            "cloud-text consent was revoked; start a new segment regeneration after granting consent"
+                .to_owned(),
+        ));
+    }
+    let domain_provider = state
+        .database
+        .repositories()
+        .providers
+        .get(ProviderProfileId::from_uuid(segment.assignment.provider_id))
+        .await
+        .map_err(storage_error)?
+        .ok_or_else(|| {
+            ServiceError::Conflict(
+                "the regeneration provider profile no longer exists; start a new segment regeneration"
+                    .to_owned(),
+            )
+        })?;
+    let current_snapshot = domain_provider.capability_snapshot.as_ref();
+    if !persisted_provider_snapshot_matches(
+        segment.assignment.provider_snapshot_id,
+        current_snapshot.map(|snapshot| snapshot.id.as_uuid()),
+    ) || segment.assignment.provider_version
+        != current_snapshot.and_then(|snapshot| snapshot.provider_version.clone())
+    {
+        return Err(ServiceError::Conflict(
+            "the regeneration provider capability snapshot changed; start a new segment regeneration"
+                .to_owned(),
+        ));
+    }
+    let runtime_id =
+        ProviderId::new(segment.assignment.provider_id.to_string()).map_err(internal_error)?;
+    let runtime = state
+        .providers
+        .tts(&runtime_id)
+        .await
+        .map_err(|_| {
+            ServiceError::Conflict(
+                "the durable regeneration provider runtime is unavailable; start a new segment regeneration"
+                    .to_owned(),
+            )
+        })?;
+    if runtime.descriptor().id != runtime_id
+        || runtime.descriptor().endpoint_family != provider_endpoint_family(&segment.assignment)
+        || segment
+            .assignment
+            .provider_mode
+            .is_none_or(|mode| !provider_mode_matches_runtime(mode, runtime.descriptor().kind))
+    {
+        return Err(ServiceError::Conflict(
+            "the regeneration provider runtime identity changed; start a new segment regeneration"
+                .to_owned(),
+        ));
+    }
+    crate::api::validate_voice_direction(
+        &segment.assignment.performance,
+        &segment.assignment.timing,
+        segment.assignment.model.as_deref(),
+        profile.capabilities.as_ref(),
+    )
+    .map_err(|_| {
+        ServiceError::Conflict(
+            "the durable voice direction is no longer supported; start a new segment regeneration"
+                .to_owned(),
+        )
+    })?;
+    Ok(())
 }
 
 async fn segment_project_id(state: &AppState, chapter_id: Uuid) -> Result<Uuid, ServiceError> {
@@ -2800,7 +5040,7 @@ async fn append_tts_usage(
         job_id: Some(job_id),
         attempt_id,
         chapter_id: Some(ChapterId::from_uuid(segment.chapter_id)),
-        segment_id: None,
+        segment_id: segment.proofing.then_some(segment.id),
         provider_profile_id: ProviderProfileId::from_uuid(segment.assignment.provider_id),
         provider_family: provider_endpoint_family(&segment.assignment).to_owned(),
         endpoint_family: provider_endpoint_family(&segment.assignment).to_owned(),
@@ -2896,12 +5136,14 @@ fn redacted_endpoint(endpoint: Option<&str>) -> Option<String> {
     })
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn assemble_chapter(
     state: &Arc<AppState>,
     job_id: JobId,
     chapter: ChapterPlan,
     mut unit: JobUnit,
     mut segments: Vec<SegmentArtifact>,
+    verify_selected_artifacts: bool,
     sidecars: &SidecarPair,
     progress_guard: &tokio::sync::Mutex<()>,
 ) -> Result<ChapterArtifact, ServiceError> {
@@ -2939,12 +5181,17 @@ async fn assemble_chapter(
         arguments.extend(["-i".to_owned(), segment.artifact.path.clone()]);
     }
     let mut filter = String::new();
-    for index in 0..segments.len() {
-        write!(
-            filter,
-            "[{index}:a]aresample=48000:async=1:first_pts=0[a{index}];"
-        )
-        .expect("writing to String cannot fail");
+    for (index, segment) in segments.iter().enumerate() {
+        write!(filter, "[{index}:a]aresample=48000:async=1:first_pts=0")
+            .expect("writing to String cannot fail");
+        if let Some(milliseconds) = segment.plan.assignment.timing.pause_before_ms {
+            write!(filter, ",adelay={milliseconds}:all=1").expect("writing to String cannot fail");
+        }
+        if let Some(milliseconds) = segment.plan.assignment.timing.pause_after_ms {
+            let seconds = f64::from(milliseconds) / 1_000.0;
+            write!(filter, ",apad=pad_dur={seconds:.3}").expect("writing to String cannot fail");
+        }
+        write!(filter, "[a{index}];").expect("writing to String cannot fail");
     }
     for index in 0..segments.len() {
         write!(filter, "[a{index}]").expect("writing to String cannot fail");
@@ -2968,6 +5215,17 @@ async fn assemble_chapter(
         "flac".to_owned(),
         temporary.path().to_string_lossy().into_owned(),
     ]);
+    // A pause can begin after the worker's initial proof-export validation. Check the job state
+    // again at the actual input-consumption boundary, then re-hash every selected take before
+    // FFmpeg is allowed to open it.
+    wait_until_runnable(state, job_id).await?;
+    if verify_selected_artifacts {
+        let artifacts = segments
+            .iter()
+            .map(|segment| &segment.artifact)
+            .collect::<Vec<_>>();
+        verify_selected_artifacts_before_use(&artifacts).await?;
+    }
     run_process(&sidecars.ffmpeg, &arguments, "assemble chapter").await?;
     validate_flac(temporary.path()).await?;
     atomic_promote(temporary.path(), &destination).await?;
@@ -3021,32 +5279,54 @@ async fn export_book(
         })
         .collect::<Vec<_>>();
     let output_directory = PathBuf::from(&plan.export.output_directory);
-    tokio::fs::create_dir_all(&output_directory).await?;
+    ensure_export_root_identity(&plan.export).await?;
     let extension = media_export_format(plan.export.format).extension();
     let final_output = if plan.export.layout == ExportLayout::PerChapter {
         output_directory.join(&plan.export.filename_template)
     } else {
         output_directory.join(format!("{}.{}", plan.export.filename_template, extension))
     };
-    if final_output.exists() {
-        return Err(ServiceError::Conflict(format!(
-            "export destination already exists: {}",
-            final_output.display()
-        )));
+    require_output_reservation(state, job_id, plan.project.id, &plan.export, &final_output).await?;
+    if units.export.state == JobUnitState::Completed {
+        return load_completed_export_result(state, job_id).await;
     }
-    let temporary_output = if plan.export.layout == ExportLayout::PerChapter {
-        output_directory.join(format!(
-            ".{}-{}.partial",
-            plan.export.filename_template, job_id
-        ))
-    } else {
-        output_directory.join(format!(
-            ".{}-{}.partial.{}",
-            plan.export.filename_template, job_id, extension
-        ))
-    };
+    let staging_directory = prepare_private_export_staging(state, job_id).await?;
+    let temporary_output =
+        export_staging_output_path(&staging_directory, plan.export.layout, extension);
+    if final_output.exists() {
+        ensure_export_root_identity(&plan.export).await?;
+        let recovered = recover_promoted_export(
+            state,
+            job_id,
+            plan.export.layout,
+            &temporary_output,
+            &final_output,
+        )
+        .await?;
+        state
+            .database
+            .repositories()
+            .jobs
+            .mark_output_promoted(job_id, Utc::now())
+            .await
+            .map_err(storage_error)?;
+        return finalize_export_outputs(
+            state,
+            job_id,
+            plan,
+            chapters,
+            sidecars,
+            units,
+            progress_guard,
+            recovered,
+            &final_output,
+        )
+        .await;
+    }
     if plan.export.layout == ExportLayout::PerChapter {
-        tokio::fs::create_dir_all(&temporary_output).await?;
+        ensure_private_directory(&temporary_output).await?;
+    } else {
+        ensure_private_staging_file_path(&staging_directory, &temporary_output).await?;
     }
     let metadata = MediaBookMetadata {
         title: plan.project.metadata.title.clone(),
@@ -3157,7 +5437,15 @@ async fn export_book(
         .render(&request, &measurements)
         .map_err(media_error)?;
     for auxiliary in &render.auxiliary_files {
-        write_file_atomically(&auxiliary.path, auxiliary.contents.as_bytes()).await?;
+        write_job_staging_file_atomically(
+            &staging_directory,
+            &auxiliary.path,
+            auxiliary.contents.as_bytes(),
+        )
+        .await?;
+    }
+    for path in &render.outputs {
+        ensure_private_staging_file_path(&staging_directory, path).await?;
     }
     for invocation in &render.invocations {
         run_process(
@@ -3180,14 +5468,28 @@ async fn export_book(
         rendered.push((path.clone(), duration));
     }
 
+    persist_export_promotion_marker(state, job_id, &final_output, &rendered).await?;
+    state
+        .database
+        .repositories()
+        .jobs
+        .mark_output_promoting(job_id, Utc::now())
+        .await
+        .map_err(storage_error)?;
+
+    ensure_export_root_identity(&plan.export).await?;
     let final_paths = if plan.export.layout == ExportLayout::PerChapter {
-        tokio::fs::create_dir(&final_output).await?;
+        create_directory_no_clobber(&final_output).await?;
+        ensure_existing_real_directory(&final_output, "split export destination").await?;
+        mark_split_export_directory_created(state, job_id, &final_output).await?;
         let mut final_paths = Vec::new();
         for (path, duration) in rendered {
             let file_name = path.file_name().ok_or_else(|| {
                 ServiceError::Internal("split export has no file name".to_owned())
             })?;
             let destination = final_output.join(file_name);
+            ensure_export_root_identity(&plan.export).await?;
+            ensure_existing_real_directory(&final_output, "split export destination").await?;
             atomic_promote(&path, &destination).await?;
             final_paths.push((destination, duration));
         }
@@ -3198,52 +5500,371 @@ async fn export_book(
             .first()
             .map(|(_, duration)| *duration)
             .ok_or_else(|| ServiceError::Internal("export produced no files".to_owned()))?;
+        ensure_export_root_identity(&plan.export).await?;
         atomic_promote(&temporary_output, &final_output).await?;
         vec![(final_output.clone(), duration)]
     };
+    state
+        .database
+        .repositories()
+        .jobs
+        .mark_output_promoted(job_id, Utc::now())
+        .await
+        .map_err(storage_error)?;
 
+    finalize_export_outputs(
+        state,
+        job_id,
+        plan,
+        chapters,
+        sidecars,
+        units,
+        progress_guard,
+        final_paths,
+        &final_output,
+    )
+    .await
+}
+
+fn export_staging_output_path(
+    staging_directory: &Path,
+    layout: ExportLayout,
+    extension: &str,
+) -> PathBuf {
+    if layout == ExportLayout::PerChapter {
+        staging_directory.join("chapters")
+    } else {
+        staging_directory.join(format!("audiobook.{extension}"))
+    }
+}
+
+fn export_promotion_marker_path(staging_directory: &Path) -> PathBuf {
+    staging_directory.join("export-promotion.json")
+}
+
+async fn persist_export_promotion_marker(
+    state: &AppState,
+    job_id: JobId,
+    final_output: &Path,
+    rendered: &[(PathBuf, u64)],
+) -> Result<(), ServiceError> {
+    let staging_directory = prepare_private_export_staging(state, job_id).await?;
+    let mut files = Vec::with_capacity(rendered.len());
+    for (path, duration_ms) in rendered {
+        ensure_private_staging_file_path(&staging_directory, path).await?;
+        let file_name = path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .ok_or_else(|| ServiceError::Internal("rendered export has no file name".to_owned()))?;
+        files.push(ExportPromotionFile {
+            file_name: file_name.to_owned(),
+            duration_ms: *duration_ms,
+            fingerprint: fingerprint_file(path).await?,
+        });
+    }
+    if files.is_empty() {
+        return Err(ServiceError::Internal(
+            "cannot promote an export without rendered files".to_owned(),
+        ));
+    }
+    let marker = ExportPromotionMarker {
+        schema_version: 1,
+        job_id,
+        final_output: final_output.to_string_lossy().into_owned(),
+        split_directory_created: false,
+        files,
+    };
+    let path = export_promotion_marker_path(&staging_directory);
+    write_job_staging_file_atomically(
+        &staging_directory,
+        &path,
+        &serde_json::to_vec_pretty(&marker).map_err(internal_error)?,
+    )
+    .await
+}
+
+async fn mark_split_export_directory_created(
+    state: &AppState,
+    job_id: JobId,
+    final_output: &Path,
+) -> Result<(), ServiceError> {
+    ensure_existing_real_directory(final_output, "split export destination").await?;
+    let staging_directory = prepare_private_export_staging(state, job_id).await?;
+    let marker_path = export_promotion_marker_path(&staging_directory);
+    ensure_private_staging_file_path(&staging_directory, &marker_path).await?;
+    let mut marker: ExportPromotionMarker =
+        serde_json::from_slice(&tokio::fs::read(&marker_path).await.map_err(|error| {
+            ServiceError::Conflict(format!(
+                "split export directory exists without a readable job-owned promotion marker: {error}"
+            ))
+        })?)
+        .map_err(internal_error)?;
+    if marker.schema_version != 1
+        || marker.job_id != job_id
+        || Path::new(&marker.final_output) != final_output
+        || marker.files.is_empty()
+    {
+        return Err(ServiceError::Conflict(
+            "split export promotion marker does not match this durable job".to_owned(),
+        ));
+    }
+    marker.split_directory_created = true;
+    write_job_staging_file_atomically(
+        &staging_directory,
+        &marker_path,
+        &serde_json::to_vec_pretty(&marker).map_err(internal_error)?,
+    )
+    .await
+}
+
+async fn verify_promoted_file(path: &Path, expected: &FileFingerprint) -> Result<(), ServiceError> {
+    let metadata = tokio::fs::symlink_metadata(path).await.map_err(|error| {
+        ServiceError::Conflict(format!(
+            "promoted export file is unavailable ({}): {error}",
+            path.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(ServiceError::Conflict(format!(
+            "promoted export path is not a regular job-owned file: {}",
+            path.display()
+        )));
+    }
+    let actual = fingerprint_file(path).await?;
+    if &actual != expected {
+        return Err(ServiceError::Conflict(format!(
+            "promoted export file no longer matches its durable marker: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+async fn recover_promoted_export(
+    state: &AppState,
+    job_id: JobId,
+    layout: ExportLayout,
+    temporary_output: &Path,
+    final_output: &Path,
+) -> Result<Vec<(PathBuf, u64)>, ServiceError> {
+    let staging_directory = prepare_private_export_staging(state, job_id).await?;
+    let marker_path = export_promotion_marker_path(&staging_directory);
+    ensure_private_staging_file_path(&staging_directory, &marker_path).await?;
+    if layout == ExportLayout::PerChapter {
+        ensure_existing_real_directory(final_output, "split export destination").await?;
+    }
+    let marker: ExportPromotionMarker =
+        serde_json::from_slice(&tokio::fs::read(&marker_path).await.map_err(|error| {
+            ServiceError::Conflict(format!(
+                "export destination exists without a readable job-owned promotion marker: {error}"
+            ))
+        })?)
+        .map_err(internal_error)?;
+    if marker.schema_version != 1
+        || marker.job_id != job_id
+        || Path::new(&marker.final_output) != final_output
+        || marker.files.is_empty()
+        || (layout == ExportLayout::SingleFile && marker.files.len() != 1)
+    {
+        return Err(ServiceError::Conflict(
+            "export promotion marker does not match this durable job".to_owned(),
+        ));
+    }
+    if layout == ExportLayout::PerChapter && !marker.split_directory_created {
+        return Err(ServiceError::Conflict(
+            "split export directory was not durably created by this job".to_owned(),
+        ));
+    }
+    let mut names = BTreeSet::new();
+    let mut recovered = Vec::with_capacity(marker.files.len());
+    for file in marker.files {
+        let component = Path::new(&file.file_name);
+        if component.file_name().is_none()
+            || component
+                .parent()
+                .is_some_and(|parent| !parent.as_os_str().is_empty())
+            || !names.insert(file.file_name.clone())
+            || file.duration_ms == 0
+        {
+            return Err(ServiceError::Conflict(
+                "export promotion marker contains an invalid output entry".to_owned(),
+            ));
+        }
+        let destination = if layout == ExportLayout::PerChapter {
+            final_output.join(&file.file_name)
+        } else {
+            final_output.to_path_buf()
+        };
+        if destination.exists() {
+            verify_promoted_file(&destination, &file.fingerprint).await?;
+        } else {
+            let source = if layout == ExportLayout::PerChapter {
+                temporary_output.join(&file.file_name)
+            } else {
+                temporary_output.to_path_buf()
+            };
+            verify_promoted_file(&source, &file.fingerprint).await?;
+            atomic_promote(&source, &destination).await?;
+        }
+        recovered.push((destination, file.duration_ms));
+    }
+    if layout == ExportLayout::PerChapter {
+        let _ = tokio::fs::remove_dir(temporary_output).await;
+    }
+    Ok(recovered)
+}
+
+async fn ensure_export_manifest_file(
+    path: &Path,
+    job_id: JobId,
+    value: &serde_json::Value,
+) -> Result<(), ServiceError> {
+    if path.exists() {
+        let existing: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(path).await?).map_err(internal_error)?;
+        if existing == *value {
+            return Ok(());
+        }
+        if existing.get("jobId") == Some(&serde_json::json!(job_id)) {
+            return Err(ServiceError::Conflict(format!(
+                "existing job-owned export manifest does not match the immutable export snapshot: {}",
+                path.display()
+            )));
+        }
+        return Err(ServiceError::Conflict(format!(
+            "export manifest belongs to another job: {}",
+            path.display()
+        )));
+    }
+    write_file_atomically(
+        path,
+        &serde_json::to_vec_pretty(value).map_err(internal_error)?,
+    )
+    .await
+}
+
+async fn ensure_job_artifact(
+    state: &AppState,
+    project_id: Uuid,
+    job_id: JobId,
+    kind: ArtifactKind,
+    path: &Path,
+    media_type: Option<String>,
+    duration_ms: Option<u64>,
+) -> Result<Artifact, ServiceError> {
+    let candidate =
+        artifact_for_file(kind, path, media_type, duration_ms, None, Some(job_id)).await?;
+    let existing = sqlx::query_scalar::<_, String>(
+        "SELECT payload FROM artifacts WHERE pinned_by_job_id = ? AND kind = ? AND path = ? \
+         ORDER BY created_at LIMIT 1",
+    )
+    .bind(job_id.to_string())
+    .bind(artifact_kind_name(kind))
+    .bind(&candidate.path)
+    .fetch_optional(state.database.pool())
+    .await
+    .map_err(storage_error)?;
+    if let Some(existing) = existing {
+        let existing: Artifact = serde_json::from_str(&existing).map_err(internal_error)?;
+        if existing.fingerprint != candidate.fingerprint {
+            return Err(ServiceError::Conflict(format!(
+                "persisted export artifact changed during recovery: {}",
+                candidate.path
+            )));
+        }
+        return Ok(existing);
+    }
+    persist_artifact(state, project_id, &candidate).await?;
+    Ok(candidate)
+}
+
+async fn load_completed_export_result(
+    state: &AppState,
+    job_id: JobId,
+) -> Result<(Vec<Artifact>, Artifact), ServiceError> {
+    let payloads = sqlx::query_scalar::<_, String>(
+        "SELECT payload FROM artifacts WHERE pinned_by_job_id = ? \
+         AND kind IN ('export', 'export_manifest') ORDER BY created_at, id",
+    )
+    .bind(job_id.to_string())
+    .fetch_all(state.database.pool())
+    .await
+    .map_err(storage_error)?;
+    let mut exports = Vec::new();
+    let mut manifest = None;
+    for payload in payloads {
+        let artifact: Artifact = serde_json::from_str(&payload).map_err(internal_error)?;
+        if fingerprint_file(Path::new(&artifact.path)).await? != artifact.fingerprint {
+            return Err(ServiceError::Conflict(format!(
+                "completed export artifact no longer matches its fingerprint: {}",
+                artifact.path
+            )));
+        }
+        match artifact.kind {
+            ArtifactKind::Export => exports.push(artifact),
+            ArtifactKind::ExportManifest => {
+                manifest.get_or_insert(artifact);
+            }
+            _ => unreachable!("query restricts export artifact kinds"),
+        }
+    }
+    exports.sort_by(|left, right| left.path.cmp(&right.path));
+    if exports.is_empty() {
+        return Err(ServiceError::Conflict(
+            "completed export unit has no durable output artifacts".to_owned(),
+        ));
+    }
+    let manifest = manifest.ok_or_else(|| {
+        ServiceError::Conflict("completed export unit has no durable manifest".to_owned())
+    })?;
+    Ok((exports, manifest))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finalize_export_outputs(
+    state: &Arc<AppState>,
+    job_id: JobId,
+    plan: &ConversionPlan,
+    chapters: &[ChapterArtifact],
+    sidecars: &SidecarPair,
+    units: &mut PersistedUnitPlan,
+    progress_guard: &tokio::sync::Mutex<()>,
+    final_paths: Vec<(PathBuf, u64)>,
+    final_output: &Path,
+) -> Result<(Vec<Artifact>, Artifact), ServiceError> {
     let ffmpeg_build = ffmpeg_build_description(sidecars).await?;
     let manifest_value =
         export_manifest_value(state, job_id, plan, chapters, &final_paths, &ffmpeg_build).await?;
-    let manifest_path = if plan.export.layout == ExportLayout::PerChapter {
-        final_output.join("audiobookai-export-manifest.json")
-    } else {
-        final_output.with_file_name(format!(
-            "{}.manifest.json",
-            final_output
-                .file_name()
-                .and_then(std::ffi::OsStr::to_str)
-                .unwrap_or("audiobook")
-        ))
-    };
-    write_file_atomically(
-        &manifest_path,
-        &serde_json::to_vec_pretty(&manifest_value).map_err(internal_error)?,
-    )
-    .await?;
-    let manifest_artifact = artifact_for_file(
+    ensure_export_root_identity(&plan.export).await?;
+    if plan.export.layout == ExportLayout::PerChapter {
+        ensure_existing_real_directory(final_output, "split export destination").await?;
+    }
+    let manifest_path = export_manifest_path(plan.export.layout, final_output);
+    ensure_export_manifest_file(&manifest_path, job_id, &manifest_value).await?;
+    let manifest_artifact = ensure_job_artifact(
+        state,
+        plan.project.id.as_uuid(),
+        job_id,
         ArtifactKind::ExportManifest,
         &manifest_path,
         Some("application/json".to_owned()),
         None,
-        None,
-        Some(job_id),
     )
     .await?;
-    persist_artifact(state, plan.project.id.as_uuid(), &manifest_artifact).await?;
     let mut artifacts = Vec::new();
     for (path, duration) in final_paths {
-        let artifact = artifact_for_file(
-            ArtifactKind::Export,
-            &path,
-            Some(media_type_for_path(&path)),
-            Some(duration),
-            None,
-            Some(job_id),
-        )
-        .await?;
-        persist_artifact(state, plan.project.id.as_uuid(), &artifact).await?;
-        artifacts.push(artifact);
+        artifacts.push(
+            ensure_job_artifact(
+                state,
+                plan.project.id.as_uuid(),
+                job_id,
+                ArtifactKind::Export,
+                &path,
+                Some(media_type_for_path(&path)),
+                Some(duration),
+            )
+            .await?,
+        );
     }
     units.export.output_artifact_id = artifacts.first().map(|artifact| artifact.id);
     if units.export.state != JobUnitState::Completed {
@@ -3306,11 +5927,27 @@ async fn export_manifest_value(
     for rule in &plan.rules {
         dictionary_revisions.insert(rule.id.to_string(), u64::from(rule.order));
     }
+    let job = state
+        .database
+        .repositories()
+        .jobs
+        .get(job_id)
+        .await
+        .map_err(storage_error)?
+        .ok_or(ServiceError::NotFound)?;
+    let proofing_snapshot = if job.kind == JobKind::Export {
+        Some(
+            serde_json::to_value(load_required_proof_export_snapshot(state, &job).await?)
+                .map_err(internal_error)?,
+        )
+    } else {
+        None
+    };
     Ok(serde_json::json!({
         "schemaVersion": 1,
         "projectId": plan.project.id,
         "jobId": job_id,
-        "createdAt": Utc::now(),
+        "createdAt": job.created_at,
         "source": plan.book.source_fingerprint,
         "metadata": plan.project.metadata,
         "outputFormat": format_name(plan.export.format),
@@ -3319,6 +5956,7 @@ async fn export_manifest_value(
         "chapterMarkers": chapter_markers,
         "voiceProvenance": voices.into_values().collect::<Vec<_>>(),
         "dictionaryRevisions": dictionary_revisions,
+        "proofingSnapshot": proofing_snapshot,
         "audio": plan.export.audio,
         "ffmpegBuild": ffmpeg_build,
         "usageTotals": usage,
@@ -3327,17 +5965,22 @@ async fn export_manifest_value(
 
 async fn update_export_catalog(
     state: &AppState,
+    job_id: JobId,
     plan: &ConversionPlan,
     artifacts: &[Artifact],
     manifest_id: ArtifactId,
 ) -> Result<(), ServiceError> {
     let mut views = Vec::new();
-    for artifact in artifacts {
+    let part_count = u32::try_from(artifacts.len()).unwrap_or(u32::MAX);
+    for (part_index, artifact) in artifacts.iter().enumerate() {
         let path = Path::new(&artifact.path);
         let size = tokio::fs::metadata(path).await?.len();
         views.push(ExportArtifactView {
             id: artifact.id.as_uuid(),
             project_id: plan.project.id.as_uuid(),
+            job_id: job_id.as_uuid(),
+            part_index: u32::try_from(part_index).unwrap_or(u32::MAX),
+            part_count,
             project_title: plan.project.metadata.title.clone(),
             format: format_name(plan.export.format).to_owned(),
             split_mode: layout_name(plan.export.layout).to_owned(),
@@ -3545,6 +6188,147 @@ async fn write_file_atomically(destination: &Path, bytes: &[u8]) -> Result<(), S
     atomic_promote(temporary.path(), destination).await
 }
 
+async fn write_job_staging_file_atomically(
+    private_root: &Path,
+    destination: &Path,
+    bytes: &[u8],
+) -> Result<(), ServiceError> {
+    ensure_private_staging_file_path(private_root, destination).await?;
+    let parent = destination.parent().ok_or_else(|| {
+        ServiceError::InvalidRequest("staging destination has no parent directory".to_owned())
+    })?;
+    let temporary = tempfile::Builder::new()
+        .prefix(".audiobookai-staging-write-")
+        .tempfile_in(parent)
+        .map_err(ServiceError::Io)?;
+    tokio::fs::write(temporary.path(), bytes).await?;
+    sync_file(temporary.path()).await?;
+    ensure_private_staging_file_path(private_root, destination).await?;
+    match tokio::fs::symlink_metadata(destination).await {
+        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
+            tokio::fs::remove_file(destination).await?;
+        }
+        Ok(_) => {
+            return Err(ServiceError::Conflict(format!(
+                "job staging destination is not a regular file: {}",
+                destination.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(ServiceError::Io(error)),
+    }
+    atomic_promote(temporary.path(), destination).await
+}
+
+async fn prepare_private_export_staging(
+    state: &AppState,
+    job_id: JobId,
+) -> Result<PathBuf, ServiceError> {
+    let managed_root = tokio::fs::canonicalize(&state.config.data_dir)
+        .await
+        .map_err(|error| {
+            ServiceError::Conflict(format!(
+                "managed application data directory is unavailable ({}): {error}",
+                state.config.data_dir.display()
+            ))
+        })?;
+    let jobs = managed_root.join("jobs");
+    ensure_private_directory(&jobs).await?;
+    let job = jobs.join(job_id.to_string());
+    ensure_private_directory(&job).await?;
+    let staging = job.join("export-staging");
+    ensure_private_directory(&staging).await?;
+    Ok(staging)
+}
+
+async fn ensure_private_directory(path: &Path) -> Result<(), ServiceError> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(ServiceError::Conflict(format!(
+                    "managed export staging component is not a private directory: {}",
+                    path.display()
+                )));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match tokio::fs::create_dir(path).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let metadata = tokio::fs::symlink_metadata(path).await?;
+                    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                        return Err(ServiceError::Conflict(format!(
+                            "managed export staging component was replaced during creation: {}",
+                            path.display()
+                        )));
+                    }
+                }
+                Err(error) => return Err(ServiceError::Io(error)),
+            }
+        }
+        Err(error) => return Err(ServiceError::Io(error)),
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).await?;
+    }
+    Ok(())
+}
+
+async fn ensure_existing_real_directory(
+    path: &Path,
+    description: &str,
+) -> Result<(), ServiceError> {
+    let metadata = tokio::fs::symlink_metadata(path).await.map_err(|error| {
+        ServiceError::Conflict(format!(
+            "{description} is unavailable ({}): {error}",
+            path.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(ServiceError::Conflict(format!(
+            "{description} is not a real directory: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+async fn ensure_private_staging_file_path(
+    private_root: &Path,
+    path: &Path,
+) -> Result<(), ServiceError> {
+    ensure_existing_real_directory(private_root, "managed export staging root").await?;
+    if path == private_root || !path.starts_with(private_root) {
+        return Err(ServiceError::Conflict(format!(
+            "export staging file escapes its job-private directory: {}",
+            path.display()
+        )));
+    }
+    let parent = path.parent().ok_or_else(|| {
+        ServiceError::Conflict("export staging file has no parent directory".to_owned())
+    })?;
+    ensure_existing_real_directory(parent, "managed export staging parent").await?;
+    let canonical_root = tokio::fs::canonicalize(private_root).await?;
+    let canonical_parent = tokio::fs::canonicalize(parent).await?;
+    if !canonical_parent.starts_with(&canonical_root) {
+        return Err(ServiceError::Conflict(format!(
+            "export staging parent resolves outside its job-private directory: {}",
+            path.display()
+        )));
+    }
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => Ok(()),
+        Ok(_) => Err(ServiceError::Conflict(format!(
+            "export staging destination is not a regular private file: {}",
+            path.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(ServiceError::Io(error)),
+    }
+}
+
 async fn sync_file(path: &Path) -> Result<(), ServiceError> {
     tokio::fs::OpenOptions::new()
         .read(true)
@@ -3556,18 +6340,91 @@ async fn sync_file(path: &Path) -> Result<(), ServiceError> {
 }
 
 async fn atomic_promote(source: &Path, destination: &Path) -> Result<(), ServiceError> {
-    if destination.exists() {
-        return Err(ServiceError::Conflict(format!(
-            "refusing to overwrite {}",
-            destination.display()
-        )));
+    sync_file(source).await?;
+    match tokio::fs::hard_link(source, destination).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(ServiceError::Conflict(format!(
+                "refusing to overwrite {}",
+                destination.display()
+            )));
+        }
+        Err(error) => {
+            tracing::debug!(
+                diagnostic_code = "storage.promotion.hard_link.unavailable",
+                %error,
+                source = %source.display(),
+                destination = %destination.display(),
+                "falling back to exclusive-copy promotion"
+            );
+            copy_file_no_clobber(source, destination).await?;
+        }
     }
-    tokio::fs::rename(source, destination).await?;
+    // The destination link already names the complete source inode. Source cleanup is
+    // best-effort so a staging unlink failure cannot turn a successful no-clobber promotion into
+    // an ambiguous retry that sees an existing final path.
+    let _ = tokio::fs::remove_file(source).await;
     #[cfg(unix)]
     if let Some(parent) = destination.parent() {
         tokio::fs::File::open(parent).await?.sync_all().await?;
     }
     Ok(())
+}
+
+async fn copy_file_no_clobber(source: &Path, destination: &Path) -> Result<(), ServiceError> {
+    let mut input = tokio::fs::File::open(source).await?;
+    copy_reader_no_clobber(&mut input, destination).await
+}
+
+async fn copy_reader_no_clobber<R>(input: &mut R, destination: &Path) -> Result<(), ServiceError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut output = match tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)
+        .await
+    {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(ServiceError::Conflict(format!(
+                "refusing to overwrite {}",
+                destination.display()
+            )));
+        }
+        Err(error) => return Err(ServiceError::Io(error)),
+    };
+    if let Err(error) = tokio::io::copy(input, &mut output).await {
+        drop(output);
+        // The destination was created exclusively, but pathname ownership can change after this
+        // handle is opened. Removing by path here could therefore delete a foreign replacement.
+        // Retain the partial file fail-closed instead; public export callers already hold their
+        // durable promotion reservation before this fallback can publish a destination name.
+        return Err(ServiceError::Io(error));
+    }
+    if let Err(error) = output.sync_all().await {
+        drop(output);
+        // As above, never perform path-based cleanup after publishing the destination name.
+        return Err(ServiceError::Io(error));
+    }
+    Ok(())
+}
+
+async fn create_directory_no_clobber(destination: &Path) -> Result<(), ServiceError> {
+    match tokio::fs::create_dir(destination).await {
+        Ok(()) => {
+            #[cfg(unix)]
+            if let Some(parent) = destination.parent() {
+                tokio::fs::File::open(parent).await?.sync_all().await?;
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Err(
+            ServiceError::Conflict(format!("refusing to overwrite {}", destination.display())),
+        ),
+        Err(error) => Err(ServiceError::Io(error)),
+    }
 }
 
 async fn artifact_for_file(
@@ -3635,6 +6492,49 @@ async fn fingerprint_file(path: &Path) -> Result<FileFingerprint, ServiceError> 
         digest: hasher.finalize().to_hex().to_string(),
         size_bytes: size,
     })
+}
+
+async fn verify_selected_artifact_integrity(artifact: &Artifact) -> Result<(), ServiceError> {
+    if artifact.fingerprint.algorithm != "blake3"
+        || artifact.fingerprint.digest.len() != 64
+        || !artifact
+            .fingerprint
+            .digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(ServiceError::Conflict(format!(
+            "selected artifact {} has no known BLAKE3 fingerprint",
+            artifact.id
+        )));
+    }
+    let path = Path::new(&artifact.path);
+    let metadata = tokio::fs::symlink_metadata(path).await.map_err(|error| {
+        ServiceError::Conflict(format!(
+            "selected artifact {} is unavailable: {error}",
+            artifact.id
+        ))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(ServiceError::Conflict(format!(
+            "selected artifact {} is not a regular managed file",
+            artifact.id
+        )));
+    }
+    if fingerprint_file(path).await? != artifact.fingerprint {
+        return Err(ServiceError::Conflict(format!(
+            "selected artifact {} no longer matches its stored BLAKE3 fingerprint",
+            artifact.id
+        )));
+    }
+    Ok(())
+}
+
+async fn verify_selected_artifacts_before_use(artifacts: &[&Artifact]) -> Result<(), ServiceError> {
+    for artifact in artifacts {
+        verify_selected_artifact_integrity(artifact).await?;
+    }
+    Ok(())
 }
 
 async fn persist_artifact(
@@ -3726,10 +6626,9 @@ fn media_type_for_path(path: &Path) -> String {
     value.to_owned()
 }
 
-async fn ensure_output_is_available(profile: &ExportProfile) -> Result<(), ServiceError> {
+fn export_destination(profile: &ExportProfile) -> PathBuf {
     let root = PathBuf::from(&profile.output_directory);
-    tokio::fs::create_dir_all(&root).await?;
-    let destination = if profile.layout == ExportLayout::PerChapter {
+    if profile.layout == ExportLayout::PerChapter {
         root.join(&profile.filename_template)
     } else {
         root.join(format!(
@@ -3737,11 +6636,188 @@ async fn ensure_output_is_available(profile: &ExportProfile) -> Result<(), Servi
             profile.filename_template,
             media_export_format(profile.format).extension()
         ))
+    }
+}
+
+fn export_manifest_path(layout: ExportLayout, final_output: &Path) -> PathBuf {
+    if layout == ExportLayout::PerChapter {
+        final_output.join("audiobookai-export-manifest.json")
+    } else {
+        final_output.with_file_name(format!(
+            "{}.manifest.json",
+            final_output
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .unwrap_or("audiobook")
+        ))
+    }
+}
+
+fn output_destination_key(destination: &Path) -> String {
+    // Export folders are canonicalized before the profile is stored. Case-folding the complete
+    // child path and Unicode-normalizing it is deliberately conservative: it prevents a database
+    // moved between filesystems, or running on normalization-insensitive APFS, from admitting two
+    // paid jobs whose destinations alias there.
+    audiobookai_storage::normalize_output_destination_key(&destination.to_string_lossy())
+}
+
+async fn ensure_export_root_identity(profile: &ExportProfile) -> Result<(), ServiceError> {
+    let expected = Path::new(&profile.output_directory);
+    let metadata = tokio::fs::symlink_metadata(expected)
+        .await
+        .map_err(|error| {
+            ServiceError::Conflict(format!(
+                "reserved export directory is unavailable ({}): {error}",
+                expected.display()
+            ))
+        })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(ServiceError::Conflict(format!(
+            "reserved export directory was replaced by a non-directory or symlink: {}",
+            expected.display()
+        )));
+    }
+    let actual = tokio::fs::canonicalize(expected).await?;
+    if actual != expected {
+        return Err(ServiceError::Conflict(format!(
+            "reserved export directory now resolves to a different location: {} -> {}",
+            expected.display(),
+            actual.display()
+        )));
+    }
+    Ok(())
+}
+
+async fn prospective_canonical_path(path: &Path) -> Result<PathBuf, ServiceError> {
+    if !path.is_absolute() {
+        return Err(ServiceError::InvalidRequest(
+            "the export path must be absolute".to_owned(),
+        ));
+    }
+    let mut cursor = path.to_path_buf();
+    let mut suffix = Vec::new();
+    if let Some(component) = cursor.file_name() {
+        suffix.push(component.to_os_string());
+        cursor = cursor.parent().unwrap_or(Path::new("/")).to_path_buf();
+    }
+    let mut base = loop {
+        match tokio::fs::canonicalize(&cursor).await {
+            Ok(base) => break base,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                let component = cursor.file_name().ok_or_else(|| {
+                    ServiceError::Conflict(format!(
+                        "cannot resolve the export path {}",
+                        path.display()
+                    ))
+                })?;
+                suffix.push(component.to_os_string());
+                cursor = cursor
+                    .parent()
+                    .ok_or_else(|| {
+                        ServiceError::Conflict(format!(
+                            "cannot resolve the export path {}",
+                            path.display()
+                        ))
+                    })?
+                    .to_path_buf();
+            }
+            Err(error) => return Err(ServiceError::Io(error)),
+        }
     };
+    for component in suffix.into_iter().rev() {
+        base.push(component);
+    }
+    Ok(lexically_normalized_path(&base))
+}
+
+fn lexically_normalized_path(path: &Path) -> PathBuf {
+    let mut prefix = None;
+    let mut rooted = false;
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(value) => {
+                prefix = Some(value.as_os_str().to_os_string());
+            }
+            std::path::Component::RootDir => {
+                rooted = true;
+                components.clear();
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                components.pop();
+            }
+            std::path::Component::Normal(value) => components.push(value.to_os_string()),
+        }
+    }
+    let mut normalized = PathBuf::new();
+    if let Some(prefix) = prefix {
+        normalized.push(prefix);
+    }
+    if rooted {
+        normalized.push(std::path::MAIN_SEPARATOR_STR);
+    }
+    for component in components {
+        normalized.push(component);
+    }
+    normalized
+}
+
+async fn ensure_output_directory_not_reserved(
+    state: &AppState,
+    output_directory: &Path,
+) -> Result<(), ServiceError> {
+    let normalized = prospective_canonical_path(output_directory).await?;
+    let key = output_destination_key(&normalized);
+    if let Some(existing) = state
+        .database
+        .repositories()
+        .jobs
+        .find_output_reservation_containing_path(&key)
+        .await
+        .map_err(storage_error)?
+    {
+        return Err(ServiceError::ConflictDetails {
+            code: "output_directory_reserved",
+            detail: format!(
+                "the export directory is inside another job's reserved destination: {}",
+                existing.destination_path
+            ),
+            meta: serde_json::json!({
+                "destination": existing.destination_path,
+                "ownerJobId": existing.job_id,
+                "ownerProjectId": existing.project_id,
+            }),
+        });
+    }
+    Ok(())
+}
+
+async fn prepare_output_reservation(
+    job_id: JobId,
+    project_id: ProjectId,
+    profile: &ExportProfile,
+    now: chrono::DateTime<Utc>,
+) -> Result<OutputDestinationReservation, ServiceError> {
+    let root = PathBuf::from(&profile.output_directory);
+    ensure_export_root_identity(profile).await?;
+    let destination = export_destination(profile);
     if destination.exists() {
         return Err(ServiceError::Conflict(format!(
             "export destination already exists: {}",
             destination.display()
+        )));
+    }
+    let manifest = export_manifest_path(profile.layout, &destination);
+    if manifest.exists() {
+        return Err(ServiceError::Conflict(format!(
+            "export manifest destination already exists: {}",
+            manifest.display()
         )));
     }
     let probe = tempfile::Builder::new()
@@ -3754,7 +6830,100 @@ async fn ensure_output_is_available(profile: &ExportProfile) -> Result<(), Servi
             ))
         })?;
     drop(probe);
-    Ok(())
+    ensure_export_root_identity(profile).await?;
+    Ok(OutputDestinationReservation {
+        job_id,
+        project_id,
+        destination_key: output_destination_key(&destination),
+        destination_path: destination.to_string_lossy().into_owned(),
+        layout: profile.layout,
+        state: OutputReservationState::Reserved,
+        created_at: now,
+        updated_at: now,
+        promoted_at: None,
+    })
+}
+
+fn output_reservation_admission_error(error: StorageError) -> ServiceError {
+    match error {
+        StorageError::Conflict {
+            entity: "output destination",
+            id,
+        } => ServiceError::ConflictDetails {
+            code: "output_destination_reserved",
+            detail: format!("another job already owns the export destination: {id}"),
+            meta: serde_json::json!({"destination": id}),
+        },
+        other => storage_error(other),
+    }
+}
+
+async fn require_output_reservation(
+    state: &AppState,
+    job_id: JobId,
+    project_id: ProjectId,
+    profile: &ExportProfile,
+    destination: &Path,
+) -> Result<OutputDestinationReservation, ServiceError> {
+    let reservation = state
+        .database
+        .repositories()
+        .jobs
+        .get_output_reservation(job_id)
+        .await
+        .map_err(storage_error)?
+        .ok_or_else(|| {
+            ServiceError::Conflict(
+                "export job has no durable output destination reservation".to_owned(),
+            )
+        })?;
+    if reservation.project_id != project_id
+        || reservation.destination_key != output_destination_key(destination)
+        || Path::new(&reservation.destination_path) != destination
+        || reservation.layout != profile.layout
+    {
+        return Err(ServiceError::Conflict(
+            "export job does not own its planned output destination".to_owned(),
+        ));
+    }
+    ensure_export_root_identity(profile).await?;
+    if reservation.state == OutputReservationState::Promoted && !destination.exists() {
+        return Err(ServiceError::Conflict(
+            "the job-owned promoted export destination is missing".to_owned(),
+        ));
+    }
+    Ok(reservation)
+}
+
+async fn ensure_existing_job_output_reservation(
+    state: &AppState,
+    job: &Job,
+) -> Result<(), ServiceError> {
+    let profile = load_export_profile(
+        state,
+        job.export_profile_id.ok_or_else(|| {
+            ServiceError::Conflict("export job has no durable export profile".to_owned())
+        })?,
+    )
+    .await?;
+    let destination = export_destination(&profile);
+    let repository = state.database.repositories().jobs;
+    if repository
+        .get_output_reservation(job.id)
+        .await
+        .map_err(storage_error)?
+        .is_some()
+    {
+        require_output_reservation(state, job.id, job.project_id, &profile, &destination).await?;
+        return Ok(());
+    }
+    ensure_output_directory_not_reserved(state, Path::new(&profile.output_directory)).await?;
+    let reservation =
+        prepare_output_reservation(job.id, job.project_id, &profile, Utc::now()).await?;
+    repository
+        .acquire_output_reservation_for_existing_job(job, &reservation)
+        .await
+        .map_err(output_reservation_admission_error)
 }
 
 async fn transition_job(
@@ -3776,10 +6945,17 @@ async fn transition_job(
     job.transition(next, Utc::now())
         .map_err(|error| ServiceError::Conflict(error.to_string()))?;
     job.status_message = Some(message.to_owned());
-    let job = repository
-        .update(&job, expected)
-        .await
-        .map_err(storage_error)?;
+    let job = if matches!(job.state, JobState::Failed | JobState::Cancelled) {
+        repository
+            .update_terminal_with_output_release(&job, expected)
+            .await
+    } else {
+        repository.update(&job, expected).await
+    }
+    .map_err(storage_error)?;
+    if job.state == JobState::Completed {
+        release_completed_output_reservation(state, job_id).await;
+    }
     if let Some(view) = state.catalog.write().await.jobs.get_mut(&job_id.as_uuid()) {
         view.status = job_status_view(job.state);
         view.current_stage.clone_from(&job.status_message);
@@ -3791,6 +6967,387 @@ async fn transition_job(
         serde_json::json!({"jobId": job_id, "status": job.state, "message": message}),
     );
     Ok(job)
+}
+
+/// Retry/resume must not make an export runnable before it owns the exact destination again.
+async fn transition_export_job_with_reservation(
+    state: &AppState,
+    job_id: JobId,
+    next: JobState,
+    message: &str,
+) -> Result<Job, ServiceError> {
+    let _output_admission = OUTPUT_ADMISSION_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+    let repository = state.database.repositories().jobs;
+    let mut job = repository
+        .get(job_id)
+        .await
+        .map_err(storage_error)?
+        .ok_or(ServiceError::NotFound)?;
+    if !matches!(job.kind, JobKind::Conversion | JobKind::Export) {
+        return transition_job(state, job_id, next, message).await;
+    }
+    let profile = load_export_profile(
+        state,
+        job.export_profile_id.ok_or_else(|| {
+            ServiceError::Conflict("export job has no durable export profile".to_owned())
+        })?,
+    )
+    .await?;
+    let destination = export_destination(&profile);
+    if repository
+        .get_output_reservation(job_id)
+        .await
+        .map_err(storage_error)?
+        .is_some()
+    {
+        require_output_reservation(state, job_id, job.project_id, &profile, &destination).await?;
+        return transition_job(state, job_id, next, message).await;
+    }
+
+    let now = Utc::now();
+    ensure_output_directory_not_reserved(state, Path::new(&profile.output_directory)).await?;
+    let reservation = prepare_output_reservation(job_id, job.project_id, &profile, now).await?;
+    let expected = job.revision;
+    job.transition(next, now)
+        .map_err(|error| ServiceError::Conflict(error.to_string()))?;
+    job.status_message = Some(message.to_owned());
+    let job = repository
+        .update_with_output_reservation(&job, expected, &reservation)
+        .await
+        .map_err(output_reservation_admission_error)?;
+    if let Some(view) = state.catalog.write().await.jobs.get_mut(&job_id.as_uuid()) {
+        view.status = job_status_view(job.state);
+        view.current_stage.clone_from(&job.status_message);
+        view.started_at = job.started_at;
+        view.updated_at = job.updated_at;
+    }
+    state.events.publish(
+        "job.updated",
+        serde_json::json!({"jobId": job_id, "status": job.state, "message": message}),
+    );
+    Ok(job)
+}
+
+#[allow(clippy::too_many_lines)]
+async fn retry_billable_estimates(
+    state: &AppState,
+    job: &Job,
+) -> Result<Vec<crate::accounting::RatedUsageEstimate>, ServiceError> {
+    let persisted_units = state
+        .database
+        .repositories()
+        .jobs
+        .list_units(job.id)
+        .await
+        .map_err(storage_error)?;
+    if persisted_units.iter().any(|unit| {
+        unit.payload
+            .get("uncertainUsageUnresolved")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    }) {
+        return Err(ServiceError::ConflictDetails {
+            code: "retry_usage_unresolved",
+            detail: "this job has unresolved provider usage and cannot be retried safely"
+                .to_owned(),
+            meta: serde_json::json!({"jobId": job.id}),
+        });
+    }
+    if job.kind == JobKind::CharacterDetection {
+        return crate::workflows::prepare_detection_retry_units(state, job.id).await;
+    }
+    if matches!(
+        job.kind,
+        JobKind::Preview | JobKind::QualityControl | JobKind::CacheCleanup
+    ) {
+        return Err(ServiceError::Conflict(
+            "this job kind does not support manual retry".to_owned(),
+        ));
+    }
+
+    let retryable_synthesis = persisted_units
+        .iter()
+        .filter(|unit| {
+            unit.kind == JobUnitKind::SynthesisSegment
+                && !matches!(
+                    unit.state,
+                    JobUnitState::Completed | JobUnitState::Cancelled
+                )
+        })
+        .map(|unit| unit.id)
+        .collect::<HashSet<_>>();
+    if retryable_synthesis.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    match job.kind {
+        JobKind::Conversion => {
+            let export = load_export_profile(
+                state,
+                job.export_profile_id.ok_or_else(|| {
+                    ServiceError::Conflict("conversion job has no export profile".to_owned())
+                })?,
+            )
+            .await?;
+            let music_path = if let Some(music) = &export.background_music {
+                Some(artifact_path(state, music.artifact_id).await?)
+            } else {
+                None
+            };
+            let plan =
+                load_conversion_plan(state, job.project_id.as_uuid(), export, music_path).await?;
+            let units = load_unit_plan(state, job.id, &plan).await?;
+            let multiplier = if plan
+                .project
+                .settings
+                .reliability
+                .retry_possible_duplicate_charge
+            {
+                usize::from(
+                    plan.project
+                        .settings
+                        .reliability
+                        .max_transient_retries
+                        .saturating_add(1),
+                )
+            } else {
+                1
+            };
+            let mut estimates = Vec::new();
+            let mut matched_units = 0_usize;
+            for segment in plan.chapters.iter().flat_map(|chapter| &chapter.segments) {
+                let unit = units.synthesis.get(&segment.key).ok_or_else(|| {
+                    ServiceError::Conflict(
+                        "conversion retry graph no longer matches its narration plan".to_owned(),
+                    )
+                })?;
+                if !retryable_synthesis.contains(&unit.id) {
+                    continue;
+                }
+                matched_units = matched_units.saturating_add(1);
+                let estimate = crate::accounting::rate_usage_estimate(
+                    state,
+                    ProviderProfileId::from_uuid(segment.assignment.provider_id),
+                    UsageWorkload::Tts,
+                    segment.assignment.model.clone(),
+                    UsageQuantities {
+                        characters: u64::try_from(segment.text.chars().count()).ok(),
+                        ..UsageQuantities::default()
+                    },
+                )
+                .await?;
+                for _ in 0..multiplier {
+                    estimates.push(estimate.clone());
+                }
+            }
+            if matched_units != retryable_synthesis.len() {
+                return Err(ServiceError::Conflict(
+                    "conversion retry contains unmatched billable synthesis units".to_owned(),
+                ));
+            }
+            Ok(estimates)
+        }
+        JobKind::SegmentRegeneration => {
+            let mut estimates = Vec::with_capacity(retryable_synthesis.len());
+            for unit in persisted_units
+                .iter()
+                .filter(|unit| retryable_synthesis.contains(&unit.id))
+            {
+                let segment = unit
+                    .payload
+                    .get("segmentPlan")
+                    .cloned()
+                    .ok_or_else(|| {
+                        ServiceError::Conflict(
+                            "regeneration retry is missing its durable segment plan".to_owned(),
+                        )
+                    })
+                    .and_then(|value| {
+                        serde_json::from_value::<SegmentPlan>(value).map_err(internal_error)
+                    })?;
+                validate_regeneration_retry_provider_snapshot(state, job, &segment).await?;
+                let policy = retry_policy(state, &segment).await?;
+                let multiplier = retry_reservation_multiplier(&policy);
+                let estimate = crate::accounting::rate_usage_estimate(
+                    state,
+                    ProviderProfileId::from_uuid(segment.assignment.provider_id),
+                    UsageWorkload::Tts,
+                    segment.assignment.model.clone(),
+                    UsageQuantities {
+                        characters: u64::try_from(segment.text.chars().count()).ok(),
+                        ..UsageQuantities::default()
+                    },
+                )
+                .await?;
+                for _ in 0..multiplier {
+                    estimates.push(estimate.clone());
+                }
+            }
+            Ok(estimates)
+        }
+        JobKind::Export => Err(ServiceError::Conflict(
+            "a provider-free proof export cannot retry synthesis units".to_owned(),
+        )),
+        JobKind::CharacterDetection => unreachable!("handled before synthesis planning"),
+        JobKind::Preview | JobKind::QualityControl | JobKind::CacheCleanup => Err(
+            ServiceError::Conflict("this job kind does not support manual retry".to_owned()),
+        ),
+    }
+}
+
+async fn reset_non_detection_retry_units(
+    state: &AppState,
+    job_id: JobId,
+) -> Result<(), ServiceError> {
+    for mut unit in state
+        .database
+        .repositories()
+        .jobs
+        .list_units(job_id)
+        .await
+        .map_err(storage_error)?
+    {
+        if unit.state == JobUnitState::Failed {
+            let next = if unit.dependencies.is_empty() {
+                JobUnitState::Ready
+            } else {
+                JobUnitState::Blocked
+            };
+            update_unit_state(state, &mut unit, next, None).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn prepare_retry_output_claim(
+    state: &AppState,
+    job: &Job,
+) -> Result<Option<OutputDestinationReservation>, ServiceError> {
+    if !matches!(job.kind, JobKind::Conversion | JobKind::Export) {
+        return Ok(None);
+    }
+    let profile = load_export_profile(
+        state,
+        job.export_profile_id.ok_or_else(|| {
+            ServiceError::Conflict("export job has no durable export profile".to_owned())
+        })?,
+    )
+    .await?;
+    let destination = export_destination(&profile);
+    let repository = state.database.repositories().jobs;
+    if repository
+        .get_output_reservation(job.id)
+        .await
+        .map_err(storage_error)?
+        .is_some()
+    {
+        require_output_reservation(state, job.id, job.project_id, &profile, &destination).await?;
+        return Ok(None);
+    }
+    ensure_output_directory_not_reserved(state, Path::new(&profile.output_directory)).await?;
+    prepare_output_reservation(job.id, job.project_id, &profile, Utc::now())
+        .await
+        .map(Some)
+}
+
+fn retry_admission_error(error: StorageError) -> ServiceError {
+    match error {
+        StorageError::Conflict {
+            entity: "output destination",
+            id,
+        } => output_reservation_admission_error(StorageError::Conflict {
+            entity: "output destination",
+            id,
+        }),
+        error @ (StorageError::BudgetExceeded { .. }
+        | StorageError::Conflict {
+            entity: "active budget reservation",
+            ..
+        }
+        | StorageError::Conflict {
+            entity: "retry budget predecessor",
+            ..
+        }) => ServiceError::Conflict(error.to_string()),
+        other => storage_error(other),
+    }
+}
+
+async fn admit_failed_job_retry(state: &AppState, job_id: JobId) -> Result<Job, ServiceError> {
+    let repository = state.database.repositories().jobs;
+    let job = repository
+        .get(job_id)
+        .await
+        .map_err(storage_error)?
+        .ok_or(ServiceError::NotFound)?;
+    if job.state != JobState::Failed {
+        return Err(ServiceError::Conflict(
+            "only a failed job can be admitted for retry".to_owned(),
+        ));
+    }
+    let _output_admission = if matches!(job.kind, JobKind::Conversion | JobKind::Export) {
+        Some(
+            OUTPUT_ADMISSION_LOCK
+                .get_or_init(|| tokio::sync::Mutex::new(()))
+                .lock()
+                .await,
+        )
+    } else {
+        None
+    };
+
+    let estimates = retry_billable_estimates(state, &job).await?;
+    if job.kind != JobKind::CharacterDetection {
+        reset_non_detection_retry_units(state, job_id).await?;
+    }
+    let output_reservation = prepare_retry_output_claim(state, &job).await?;
+
+    let _budget_lifecycle = crate::accounting::lock_budget_reservation_lifecycle().await;
+    crate::accounting::finalize_job_reservation_locked(state, job_id).await?;
+    let mut current = repository
+        .get(job_id)
+        .await
+        .map_err(storage_error)?
+        .ok_or(ServiceError::NotFound)?;
+    if current.state != JobState::Failed {
+        return Err(ServiceError::Conflict(
+            "job state changed while retry admission was being prepared".to_owned(),
+        ));
+    }
+    let budget_reservation =
+        crate::accounting::prepare_reservation_for_estimates(state, &current, &estimates).await?;
+    let expected = current.revision;
+    current.reservation_id = budget_reservation.as_ref().map(|value| value.id);
+    current
+        .transition(JobState::Queued, Utc::now())
+        .map_err(|error| ServiceError::Conflict(error.to_string()))?;
+    current.finished_at = None;
+    current.status_message = Some("Queued for retry".to_owned());
+    let current = repository
+        .update_with_retry_admission(
+            &current,
+            expected,
+            budget_reservation.as_ref(),
+            output_reservation.as_ref(),
+        )
+        .await
+        .map_err(retry_admission_error)?;
+    if budget_reservation.is_some() {
+        crate::accounting::refresh_budget_views(state).await?;
+    }
+    if let Some(view) = state.catalog.write().await.jobs.get_mut(&job_id.as_uuid()) {
+        view.status = JobStatusView::Queued;
+        view.current_stage.clone_from(&current.status_message);
+        view.started_at = current.started_at;
+        view.updated_at = current.updated_at;
+    }
+    state.events.publish(
+        "job.updated",
+        serde_json::json!({"jobId": job_id, "status": current.state, "message": "Queued for retry"}),
+    );
+    Ok(current)
 }
 
 async fn set_job_message(
@@ -3946,6 +7503,87 @@ async fn wait_until_runnable(state: &AppState, job_id: JobId) -> Result<(), Serv
     }
 }
 
+async fn update_staged_job_failure(state: &AppState, job_id: JobId, message: &str) {
+    let repository = state.database.repositories().jobs;
+    let Ok(Some(mut job)) = repository.get(job_id).await else {
+        return;
+    };
+    if job.state != JobState::Failed {
+        return;
+    }
+    let expected = job.revision;
+    job.status_message = Some(message.to_owned());
+    job.updated_at = Utc::now();
+    let _ = repository.update(&job, expected).await;
+}
+
+async fn release_unattached_reservation(state: &AppState, reservation_id: ReservationId) {
+    if let Err(error) = state
+        .database
+        .repositories()
+        .budgets
+        .release(reservation_id, Utc::now())
+        .await
+    {
+        tracing::warn!(diagnostic_code = "budget.admission.release.failed", %reservation_id, %error, "could not release an unattached admission reservation");
+    }
+    let _ = crate::accounting::refresh_budget_views(state).await;
+}
+
+async fn release_completed_output_reservation(state: &AppState, job_id: JobId) {
+    if let Err(error) = state
+        .database
+        .repositories()
+        .jobs
+        .release_completed_output_reservation(job_id)
+        .await
+    {
+        tracing::warn!(
+            diagnostic_code = "conversion.output_reservation.completed_release.failed",
+            %job_id,
+            %error,
+            "could not release a completed output reservation"
+        );
+    }
+}
+
+async fn fail_interrupted_paid_job(
+    state: &AppState,
+    job_id: JobId,
+    message: &str,
+) -> Result<(), ServiceError> {
+    let repository = state.database.repositories().jobs;
+    mark_job_units_failed(state, job_id, message).await;
+    if let Some(mut job) = repository.get(job_id).await.map_err(storage_error)?
+        && !job.state.is_terminal()
+    {
+        let expected = job.revision;
+        let now = Utc::now();
+        // Paused -> Failed is intentionally not a public lifecycle transition. Crash recovery is
+        // a fail-closed repair, so persist the terminal state directly with complete timestamps.
+        job.state = JobState::Failed;
+        job.status_message = Some(message.to_owned());
+        job.finished_at = Some(now);
+        job.updated_at = now;
+        repository
+            .update_terminal_with_output_release(&job, expected)
+            .await
+            .map_err(storage_error)?;
+    }
+    mark_job_failed(state, job_id, message).await;
+    let recovered = repository
+        .get(job_id)
+        .await
+        .map_err(storage_error)?
+        .ok_or(ServiceError::NotFound)?;
+    if !recovered.state.is_terminal() {
+        return Err(ServiceError::Conflict(format!(
+            "recovered job {job_id} could not be terminalized safely"
+        )));
+    }
+    Ok(())
+}
+
 async fn mark_domain_job_failed(state: &AppState, job_id: JobId, message: &str) {
     let repository = state.database.repositories().jobs;
     let Ok(Some(mut job)) = repository.get(job_id).await else {
@@ -3957,12 +7595,31 @@ async fn mark_domain_job_failed(state: &AppState, job_id: JobId, message: &str) 
     let expected = job.revision;
     if job.transition(JobState::Failed, Utc::now()).is_ok() {
         job.status_message = Some(message.to_owned());
-        let _ = repository.update(&job, expected).await;
+        let _ = repository
+            .update_terminal_with_output_release(&job, expected)
+            .await;
     }
 }
 
 async fn mark_job_failed(state: &AppState, job_id: JobId, message: &str) {
+    mark_job_units_failed(state, job_id, message).await;
+    // Failed becomes externally visible only after every retryable unit is durable. The same
+    // transaction also releases a still-Reserved output claim, closing both retry races.
     mark_domain_job_failed(state, job_id, message).await;
+    let uncertain = message.contains("may have been charged") || message.contains("uncertain");
+    if let Some(view) = state.catalog.write().await.jobs.get_mut(&job_id.as_uuid()) {
+        view.status = JobStatusView::Failed;
+        view.current_stage = Some(message.to_owned());
+        view.uncertain_charge |= uncertain;
+        view.updated_at = Utc::now();
+    }
+    state.events.publish(
+        "job.failed",
+        serde_json::json!({"jobId": job_id, "detail": message, "uncertainCharge": uncertain}),
+    );
+}
+
+async fn mark_job_units_failed(state: &AppState, job_id: JobId, message: &str) {
     let units = state
         .database
         .repositories()
@@ -3978,17 +7635,6 @@ async fn mark_job_failed(state: &AppState, job_id: JobId, message: &str) {
             let _ = update_unit_state(state, &mut unit, JobUnitState::Failed, Some(message)).await;
         }
     }
-    let uncertain = message.contains("may have been charged") || message.contains("uncertain");
-    if let Some(view) = state.catalog.write().await.jobs.get_mut(&job_id.as_uuid()) {
-        view.status = JobStatusView::Failed;
-        view.current_stage = Some(message.to_owned());
-        view.uncertain_charge |= uncertain;
-        view.updated_at = Utc::now();
-    }
-    state.events.publish(
-        "job.failed",
-        serde_json::json!({"jobId": job_id, "detail": message, "uncertainCharge": uncertain}),
-    );
 }
 
 async fn reconcile_job_budgets(state: &AppState, job_id: JobId) -> Result<(), ServiceError> {
@@ -4153,6 +7799,34 @@ pub async fn preview(
     project_id: Uuid,
     requested_text: Option<String>,
 ) -> Result<PreviewView, ServiceError> {
+    preview_with_assignment(state, project_id, requested_text, None, None).await
+}
+
+pub(crate) async fn audition(
+    state: Arc<AppState>,
+    project_id: Uuid,
+    requested_text: Option<String>,
+    character_id: Option<Uuid>,
+    assignment: VoiceAssignmentView,
+) -> Result<PreviewView, ServiceError> {
+    preview_with_assignment(
+        state,
+        project_id,
+        requested_text,
+        character_id,
+        Some(assignment),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn preview_with_assignment(
+    state: Arc<AppState>,
+    project_id: Uuid,
+    requested_text: Option<String>,
+    character_id: Option<Uuid>,
+    assignment_override: Option<VoiceAssignmentView>,
+) -> Result<PreviewView, ServiceError> {
     let sidecars = resolve_sidecars(&state)?;
     let project = state
         .database
@@ -4162,41 +7836,46 @@ pub async fn preview(
         .await
         .map_err(storage_error)?
         .ok_or(ServiceError::NotFound)?;
-    let (narrator, voices, providers, rules) = {
+    let (mut target, voices, providers, rules) = {
         let catalog = state.catalog.read().await;
-        let narrator = catalog
+        let target = catalog
             .characters
             .get(&project_id)
             .and_then(|characters| {
-                characters
-                    .iter()
-                    .find(|character| character.canonical_name.eq_ignore_ascii_case("narrator"))
+                character_id
+                    .and_then(|id| characters.iter().find(|character| character.id == id))
+                    .or_else(|| {
+                        characters.iter().find(|character| {
+                            matches!(character.role, audiobookai_core::CharacterRole::Narrator)
+                        })
+                    })
             })
             .cloned()
             .ok_or_else(|| {
-                ServiceError::Conflict(
-                    "detect characters and assign the narrator voice before previewing".to_owned(),
-                )
+                ServiceError::Conflict("detect characters before previewing a voice".to_owned())
             })?;
         (
-            narrator,
+            target,
             catalog.voice_sources.clone(),
             catalog.providers.clone(),
             catalog.pronunciation_rules.clone(),
         )
     };
+    if let Some(assignment) = assignment_override {
+        target.voice_assignment = Some(assignment);
+    }
     let assignments = build_assignments(
         &project,
-        std::slice::from_ref(&narrator),
+        std::slice::from_ref(&target),
         &voices,
         &providers,
         &state,
     )
     .await?;
     let assignment = assignments
-        .get(&narrator.id)
+        .get(&target.id)
         .cloned()
-        .ok_or_else(|| ServiceError::Conflict("the narrator has no voice".to_owned()))?;
+        .ok_or_else(|| ServiceError::Conflict("the preview character has no voice".to_owned()))?;
     let (chapter, paragraph) = first_selected_paragraph(&state, &project).await?;
     let original = requested_text.unwrap_or(paragraph.text);
     let original = original.trim();
@@ -4213,21 +7892,28 @@ pub async fn preview(
         &original,
         &rules,
         project_id,
-        narrator.id,
+        target.id,
         project.metadata.language.as_deref(),
     )?;
     let segment = SegmentPlan {
+        id: SegmentId::new(),
+        proofing: false,
         key: segment_key(
             chapter.id.as_uuid(),
             paragraph.id.as_uuid(),
             0,
             original.len(),
-            narrator.id,
+            target.id,
         ),
         chapter_id: chapter.id.as_uuid(),
+        paragraph_id: paragraph.id.as_uuid(),
+        source_content_hash: paragraph.content_hash,
+        byte_start: 0,
+        byte_end: u64::try_from(original.len()).unwrap_or(u64::MAX),
         chapter_title: chapter.title,
         segment_ordinal: 0,
         playback_ordinal: 0,
+        original_text: original.clone(),
         text: text.clone(),
         context: None,
         assignment,
@@ -4259,6 +7945,22 @@ pub async fn preview(
         }
     }
 
+    let policy = retry_policy(&state, &segment).await?;
+    let request_character_count = u64::try_from(segment.text.chars().count()).unwrap_or(u64::MAX);
+    let reservation_multiplier = retry_reservation_multiplier(&policy);
+    let reservation_estimate = crate::accounting::rate_usage_estimate(
+        &state,
+        ProviderProfileId::from_uuid(segment.assignment.provider_id),
+        UsageWorkload::Tts,
+        segment.assignment.model.clone(),
+        UsageQuantities {
+            characters: Some(request_character_count),
+            ..UsageQuantities::default()
+        },
+    )
+    .await?;
+    let reservation_estimates = vec![reservation_estimate; reservation_multiplier];
+
     let now = Utc::now();
     let mut job = Job {
         id: JobId::new(),
@@ -4277,18 +7979,11 @@ pub async fn preview(
         updated_at: now,
         revision: 0,
     };
-    state
-        .database
-        .repositories()
-        .jobs
-        .insert(&job)
-        .await
-        .map_err(storage_error)?;
     let mut unit = JobUnit {
         id: JobUnitId::new(),
         job_id: job.id,
         kind: JobUnitKind::SynthesisSegment,
-        state: JobUnitState::Running,
+        state: JobUnitState::Ready,
         chapter_id: Some(chapter.id),
         segment_id: None,
         provider_profile_id: Some(ProviderProfileId::from_uuid(segment.assignment.provider_id)),
@@ -4296,51 +7991,49 @@ pub async fn preview(
         attempt_count: 0,
         next_attempt_at: None,
         output_artifact_id: None,
-        payload: BTreeMap::from([(
-            "title".to_owned(),
-            serde_json::json!("Billable narrator preview"),
-        )]),
+        payload: BTreeMap::from([
+            (
+                "title".to_owned(),
+                serde_json::json!("Billable narrator preview"),
+            ),
+            (
+                "segmentPlan".to_owned(),
+                serde_json::to_value(&segment).map_err(internal_error)?,
+            ),
+        ]),
         created_at: now,
         updated_at: now,
     };
     state
         .database
         .repositories()
-        .jobs
-        .upsert_unit(&unit)
+        .proofing
+        .insert_job_graph(&job, std::slice::from_ref(&unit), None)
         .await
         .map_err(storage_error)?;
-    let policy = retry_policy(&state, &segment).await?;
-    let request_character_count = u64::try_from(segment.text.chars().count()).unwrap_or(u64::MAX);
-    let reservation_multiplier = if policy.retries_uncertain_charge() {
-        usize::from(policy.max_attempts())
-    } else {
-        1
-    };
-    let reservation_estimate = crate::accounting::rate_usage_estimate(
-        &state,
-        ProviderProfileId::from_uuid(segment.assignment.provider_id),
-        UsageWorkload::Tts,
-        segment.assignment.model.clone(),
-        UsageQuantities {
-            characters: Some(request_character_count),
-            ..UsageQuantities::default()
-        },
-    )
-    .await?;
-    let reservation_estimates = vec![reservation_estimate; reservation_multiplier];
     match crate::accounting::reserve_for_estimates(&state, &job, &reservation_estimates).await {
         Ok(Some(reservation_id)) => {
             let expected = job.revision;
             job.reservation_id = Some(reservation_id);
             job.updated_at = Utc::now();
-            job = state
+            job = match state
                 .database
                 .repositories()
                 .jobs
                 .update(&job, expected)
                 .await
-                .map_err(storage_error)?;
+            {
+                Ok(job) => job,
+                Err(error) => {
+                    release_unattached_reservation(&state, reservation_id).await;
+                    let detail = error.to_string();
+                    let _ =
+                        update_unit_state(&state, &mut unit, JobUnitState::Failed, Some(&detail))
+                            .await;
+                    mark_domain_job_failed(&state, job.id, &detail).await;
+                    return Err(storage_error(error));
+                }
+            };
         }
         Ok(None) => {}
         Err(error) => {
@@ -4379,6 +8072,7 @@ pub async fn preview(
             model: segment.assignment.model.clone(),
             voice: segment.assignment.voice_source.clone(),
             format: requested_audio_format(&segment.assignment),
+            performance: segment.assignment.performance.clone(),
             options: BTreeMap::new(),
             pronunciation_dictionary_ids: Vec::new(),
         };
@@ -4403,12 +8097,18 @@ pub async fn preview(
                 rate_card_id: dispatch_estimate.rate_card_id,
             },
         );
+        let dispatch_consent_lock = state.dispatch_consent_lifecycle_lock(project_id).await;
+        update_unit_state(&state, &mut unit, JobUnitState::Running, None).await?;
         let execution = execute_with_retry(&policy, &journal, |_| {
             let state = Arc::clone(&state);
             let provider = Arc::clone(&provider);
             let request = request.clone();
             let dispatch_estimate = dispatch_estimate.clone();
+            let dispatch_consent_lock = Arc::clone(&dispatch_consent_lock);
+            let dispatch_segment = segment.clone();
             async move {
+                let _dispatch_consent_guard = dispatch_consent_lock.read().await;
+                validate_segment_dispatch_boundary(&state, project_id, &dispatch_segment).await?;
                 crate::accounting::verify_dispatch_is_reserved(
                     &state,
                     job.id,
@@ -4430,6 +8130,22 @@ pub async fn preview(
         let successful_attempt_id =
             attempt_id_for_ordinal(&state, unit.id, execution.attempts.get()).await?;
         let response = execution.value;
+        // Persist billable usage at the provider-success boundary. Local media failures after
+        // this point must fail the preview without making accounting look uncharged.
+        let mut usage = response.usage.clone();
+        if usage.request_id.is_none() {
+            usage.request_id = Some(request.request_id.to_string());
+        }
+        append_tts_usage(
+            &state,
+            job.id,
+            &segment,
+            successful_attempt_id,
+            &usage,
+            false,
+            dispatch_estimate.rate_card_id,
+        )
+        .await?;
         let flac = normalize_provider_audio(&sidecars, &response, true).await?;
         let artifact_id = ArtifactId::new();
         let path = cache
@@ -4465,20 +8181,6 @@ pub async fn preview(
         )
         .await?;
         persist_artifact(&state, project_id, &artifact).await?;
-        let mut usage = response.usage.clone();
-        if usage.request_id.is_none() {
-            usage.request_id = Some(request.request_id.to_string());
-        }
-        append_tts_usage(
-            &state,
-            job.id,
-            &segment,
-            successful_attempt_id,
-            &usage,
-            false,
-            dispatch_estimate.rate_card_id,
-        )
-        .await?;
         unit.output_artifact_id = Some(artifact.id);
         update_unit_state(&state, &mut unit, JobUnitState::Completed, None).await?;
         job.progress_completed = 1;
@@ -4564,6 +8266,19 @@ pub async fn job_action(
     action: &str,
 ) -> Result<JobView, ServiceError> {
     let id = JobId::from_uuid(job_id);
+    let initial_job = state
+        .database
+        .repositories()
+        .jobs
+        .get(id)
+        .await
+        .map_err(storage_error)?
+        .ok_or(ServiceError::NotFound)?;
+    let _model_lifecycle_guard = state.model_lifecycle.lock().await;
+    let project_lock = state
+        .character_lifecycle_lock(initial_job.project_id.as_uuid())
+        .await;
+    let _project_guard = project_lock.lock().await;
     let job = state
         .database
         .repositories()
@@ -4572,6 +8287,24 @@ pub async fn job_action(
         .await
         .map_err(storage_error)?
         .ok_or(ServiceError::NotFound)?;
+    if matches!(action, "pause" | "resume" | "cancel" | "retry")
+        && matches!(
+            job.kind,
+            JobKind::Preview | JobKind::QualityControl | JobKind::CacheCleanup
+        )
+    {
+        return Err(ServiceError::ConflictDetails {
+            code: "job_action_unsupported",
+            detail: "this job runs synchronously and does not support lifecycle actions".to_owned(),
+            meta: serde_json::json!({"jobId": job_id, "action": action, "kind": job.kind}),
+        });
+    }
+    if matches!(action, "resume" | "retry")
+        && let Some(active) =
+            crate::api::blocking_project_job(&state, job.project_id.as_uuid(), Some(job_id)).await
+    {
+        return Err(crate::api::active_job_conflict(&active));
+    }
     match (action, job.state) {
         ("pause", JobState::Queued) => {
             transition_job(&state, id, JobState::Running, "Preparing to pause").await?;
@@ -4599,16 +8332,29 @@ pub async fn job_action(
             }
         }
         ("resume", JobState::Paused) => {
-            transition_job(&state, id, JobState::Running, "Resuming job").await?;
+            if matches!(job.kind, JobKind::Conversion | JobKind::Export) {
+                transition_export_job_with_reservation(
+                    &state,
+                    id,
+                    JobState::Running,
+                    "Resuming job",
+                )
+                .await?;
+            } else {
+                transition_job(&state, id, JobState::Running, "Resuming job").await?;
+            }
             match job.kind {
-                JobKind::Conversion => {
-                    tokio::spawn(run_conversion_job(Arc::clone(&state), id));
+                JobKind::Conversion | JobKind::Export => {
+                    schedule_conversion_job(Arc::clone(&state), id);
+                }
+                JobKind::SegmentRegeneration => {
+                    schedule_segment_regeneration_job(Arc::clone(&state), id);
                 }
                 JobKind::CharacterDetection => {
                     crate::workflows::reset_detection_units_for_restart(&state, id, false).await?;
                     crate::workflows::spawn_character_detection(Arc::clone(&state), id.as_uuid());
                 }
-                JobKind::Preview | JobKind::Export | JobKind::CacheCleanup => {}
+                JobKind::Preview | JobKind::QualityControl | JobKind::CacheCleanup => {}
             }
         }
         ("cancel", JobState::Queued | JobState::Running | JobState::Paused) => {
@@ -4620,46 +8366,34 @@ pub async fn job_action(
             )
             .await?;
             match job.kind {
-                JobKind::Conversion => {
-                    tokio::spawn(run_conversion_job(Arc::clone(&state), id));
+                JobKind::Conversion | JobKind::Export => {
+                    schedule_conversion_job(Arc::clone(&state), id);
+                }
+                JobKind::SegmentRegeneration => {
+                    schedule_segment_regeneration_job(Arc::clone(&state), id);
                 }
                 JobKind::CharacterDetection => {
                     crate::workflows::spawn_character_detection(Arc::clone(&state), id.as_uuid());
                 }
-                JobKind::Preview | JobKind::Export | JobKind::CacheCleanup => {}
+                JobKind::Preview | JobKind::QualityControl | JobKind::CacheCleanup => {}
             }
         }
         ("retry", JobState::Failed) => {
-            transition_job(&state, id, JobState::Queued, "Queued for retry").await?;
             if job.kind == JobKind::CharacterDetection {
-                crate::workflows::reset_detection_units_for_restart(&state, id, true).await?;
-            } else {
-                for mut unit in state
-                    .database
-                    .repositories()
-                    .jobs
-                    .list_units(id)
-                    .await
-                    .map_err(storage_error)?
-                {
-                    if unit.state == JobUnitState::Failed {
-                        let next = if unit.dependencies.is_empty() {
-                            JobUnitState::Ready
-                        } else {
-                            JobUnitState::Blocked
-                        };
-                        update_unit_state(&state, &mut unit, next, None).await?;
-                    }
-                }
+                crate::workflows::validate_detection_retry(&state, id).await?;
             }
+            admit_failed_job_retry(&state, id).await?;
             match job.kind {
-                JobKind::Conversion => {
-                    tokio::spawn(run_conversion_job(Arc::clone(&state), id));
+                JobKind::Conversion | JobKind::Export => {
+                    schedule_conversion_retry(Arc::clone(&state), id);
+                }
+                JobKind::SegmentRegeneration => {
+                    schedule_segment_regeneration_retry(Arc::clone(&state), id);
                 }
                 JobKind::CharacterDetection => {
                     crate::workflows::spawn_character_detection(Arc::clone(&state), id.as_uuid());
                 }
-                JobKind::Preview | JobKind::Export | JobKind::CacheCleanup => {}
+                JobKind::Preview | JobKind::QualityControl | JobKind::CacheCleanup => {}
             }
         }
         (known, _) if matches!(known, "pause" | "resume" | "cancel" | "retry") => {
@@ -4691,6 +8425,7 @@ pub async fn list_exports(state: &AppState) -> Result<Vec<ExportArtifactView>, S
     .await
     .map_err(storage_error)?;
     let mut views = Vec::new();
+    let mut manifest_orders = BTreeMap::<JobId, ExportManifestOrder>::new();
     for row in rows {
         let Ok(artifact) = serde_json::from_str::<Artifact>(row.get::<&str, _>("payload")) else {
             continue;
@@ -4701,6 +8436,12 @@ pub async fn list_exports(state: &AppState) -> Result<Vec<ExportArtifactView>, S
         let Ok(project_id) = Uuid::parse_str(row.get::<&str, _>("project_id")) else {
             continue;
         };
+        let Some(job_id) = row.get::<Option<String>, _>("pinned_by_job_id") else {
+            continue;
+        };
+        let Ok(job_id) = JobId::from_str(&job_id) else {
+            continue;
+        };
         let Some(profile_id) = row.get::<Option<String>, _>("export_profile_id") else {
             continue;
         };
@@ -4708,18 +8449,12 @@ pub async fn list_exports(state: &AppState) -> Result<Vec<ExportArtifactView>, S
             continue;
         };
         let profile = load_export_profile(state, profile_id).await?;
-        let manifest_id = if let Some(job_id) = row.get::<Option<String>, _>("pinned_by_job_id") {
-            sqlx::query_scalar::<_, String>(
-                "SELECT id FROM artifacts WHERE pinned_by_job_id = ? AND kind = 'export_manifest' LIMIT 1",
-            )
-            .bind(job_id)
-            .fetch_optional(state.database.pool())
-            .await
-            .map_err(storage_error)?
-            .and_then(|value| Uuid::parse_str(&value).ok())
-        } else {
-            None
-        };
+        if let std::collections::btree_map::Entry::Vacant(entry) = manifest_orders.entry(job_id) {
+            entry.insert(load_export_manifest_order(state, job_id).await?);
+        }
+        let manifest_order = manifest_orders
+            .get(&job_id)
+            .expect("manifest order was inserted immediately above");
         let project_title = state
             .catalog
             .read()
@@ -4734,6 +8469,13 @@ pub async fn list_exports(state: &AppState) -> Result<Vec<ExportArtifactView>, S
         views.push(ExportArtifactView {
             id: artifact.id.as_uuid(),
             project_id,
+            job_id: job_id.as_uuid(),
+            part_index: manifest_order
+                .part_indexes
+                .get(&artifact.id)
+                .copied()
+                .unwrap_or(0),
+            part_count: manifest_order.part_count,
             project_title,
             format: format_name(profile.format).to_owned(),
             split_mode: layout_name(profile.layout).to_owned(),
@@ -4746,13 +8488,104 @@ pub async fn list_exports(state: &AppState) -> Result<Vec<ExportArtifactView>, S
             duration_seconds: artifact.duration_ms.unwrap_or_default().div_ceil(1_000),
             created_at: artifact.created_at,
             download_url: format!("/api/v1/artifacts/{}", artifact.id),
-            manifest_url: manifest_id
+            manifest_url: manifest_order
+                .manifest_id
                 .map_or_else(String::new, |id| format!("/api/v1/artifacts/{id}")),
             chapter_markers: profile.layout == ExportLayout::SingleFile
                 && !matches!(profile.format, ExportFormat::Wav),
         });
     }
     Ok(views)
+}
+
+#[derive(Debug, Default)]
+struct ExportManifestOrder {
+    manifest_id: Option<Uuid>,
+    part_indexes: BTreeMap<ArtifactId, u32>,
+    part_count: u32,
+}
+
+async fn load_export_manifest_order(
+    state: &AppState,
+    job_id: JobId,
+) -> Result<ExportManifestOrder, ServiceError> {
+    let export_rows = sqlx::query_scalar::<_, String>(
+        "SELECT payload FROM artifacts WHERE pinned_by_job_id = ? AND kind = 'export' \
+         ORDER BY created_at ASC, id ASC",
+    )
+    .bind(job_id.to_string())
+    .fetch_all(state.database.pool())
+    .await
+    .map_err(storage_error)?;
+    let exports = export_rows
+        .into_iter()
+        .filter_map(|payload| serde_json::from_str::<Artifact>(&payload).ok())
+        .collect::<Vec<_>>();
+    let manifest = sqlx::query_scalar::<_, String>(
+        "SELECT payload FROM artifacts WHERE pinned_by_job_id = ? AND kind = 'export_manifest' \
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(job_id.to_string())
+    .fetch_optional(state.database.pool())
+    .await
+    .map_err(storage_error)?
+    .and_then(|payload| serde_json::from_str::<Artifact>(&payload).ok());
+    let manifest_id = manifest.as_ref().map(|artifact| artifact.id.as_uuid());
+    let mut manifest_paths = Vec::new();
+    if let Some(manifest) = &manifest
+        && let Ok(contents) = tokio::fs::read_to_string(&manifest.path).await
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents)
+        && let Some(paths) = value
+            .get("outputFiles")
+            .and_then(serde_json::Value::as_array)
+    {
+        manifest_paths.extend(
+            paths
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_owned),
+        );
+    }
+    let ordered_ids = canonical_export_ids(&exports, &manifest_paths);
+    let part_count = u32::try_from(ordered_ids.len()).unwrap_or(u32::MAX);
+    let part_indexes = ordered_ids
+        .into_iter()
+        .enumerate()
+        .map(|(index, id)| (id, u32::try_from(index).unwrap_or(u32::MAX)))
+        .collect();
+    Ok(ExportManifestOrder {
+        manifest_id,
+        part_indexes,
+        part_count,
+    })
+}
+
+pub(crate) async fn canonical_export_artifact_ids(
+    state: &AppState,
+    job_id: JobId,
+) -> Result<Vec<ArtifactId>, ServiceError> {
+    let order = load_export_manifest_order(state, job_id).await?;
+    let mut parts = order.part_indexes.into_iter().collect::<Vec<_>>();
+    parts.sort_by_key(|(_, index)| *index);
+    Ok(parts.into_iter().map(|(id, _)| id).collect())
+}
+
+fn canonical_export_ids(exports: &[Artifact], manifest_paths: &[String]) -> Vec<ArtifactId> {
+    let mut ordered_ids = Vec::with_capacity(exports.len());
+    for path in manifest_paths {
+        if let Some(artifact) = exports.iter().find(|artifact| artifact.path == *path)
+            && !ordered_ids.contains(&artifact.id)
+        {
+            ordered_ids.push(artifact.id);
+        }
+    }
+    let remaining_ids = exports
+        .iter()
+        .map(|artifact| artifact.id)
+        .filter(|id| !ordered_ids.contains(id))
+        .collect::<Vec<_>>();
+    ordered_ids.extend(remaining_ids);
+    ordered_ids
 }
 
 /// Streams an authenticated artifact and honors a single RFC 7233 byte range.
@@ -4889,6 +8722,1201 @@ fn parse_byte_range(value: &HeaderValue, length: u64) -> Result<(u64, u64), ()> 
 mod tests {
     use super::*;
 
+    fn test_segment_plan() -> SegmentPlan {
+        SegmentPlan {
+            id: SegmentId::new(),
+            proofing: true,
+            key: "stable-segment".to_owned(),
+            chapter_id: Uuid::from_u128(1),
+            paragraph_id: Uuid::from_u128(2),
+            source_content_hash: "source".to_owned(),
+            byte_start: 0,
+            byte_end: 5,
+            chapter_title: "Chapter".to_owned(),
+            segment_ordinal: 0,
+            playback_ordinal: 0,
+            original_text: "Hello".to_owned(),
+            text: "Hello".to_owned(),
+            context: None,
+            assignment: SpeakerAssignment {
+                character_id: Uuid::from_u128(3),
+                character_name: "Narrator".to_owned(),
+                provider_id: Uuid::from_u128(4),
+                provider_name: "Provider".to_owned(),
+                provider_kind: ProviderKindView::Elevenlabs,
+                provider_mode: Some(ProviderModeView::CloudRemote),
+                provider_endpoint: None,
+                provider_snapshot_id: Some(Uuid::from_u128(6)),
+                provider_version: Some("1".to_owned()),
+                provider_concurrency: 1,
+                voice_id: Uuid::from_u128(5),
+                voice_source: "voice".to_owned(),
+                voice_name: "Voice".to_owned(),
+                model: Some("eleven_multilingual_v2".to_owned()),
+                performance: PerformanceSettings {
+                    speed: Some(1.0),
+                    ..PerformanceSettings::default()
+                },
+                timing: TimingSettings::default(),
+            },
+            applied_rule_ids: Vec::new(),
+            dictionary_revision: "dictionary".to_owned(),
+        }
+    }
+
+    async fn filesystem_test_state() -> (tempfile::TempDir, Arc<AppState>) {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let database = audiobookai_storage::Database::open_in(directory.path())
+            .await
+            .expect("database");
+        let state = Arc::new(
+            AppState::new(
+                crate::ServiceConfig {
+                    bind: "127.0.0.1:0".parse().expect("address"),
+                    data_dir: directory.path().to_path_buf(),
+                    bundled_sidecar_dir: None,
+                    tls: None,
+                    lan_hostnames: Vec::new(),
+                    allow_insecure_lan: false,
+                    desktop_bootstrap: false,
+                },
+                database,
+            )
+            .await
+            .expect("application state"),
+        );
+        (directory, state)
+    }
+
+    async fn insert_recovery_project(state: &AppState, name: &str) -> ProjectId {
+        let now = Utc::now();
+        let book_id = audiobookai_core::BookId::new();
+        let project_id = ProjectId::new();
+        sqlx::query(
+            "INSERT INTO books (id, managed_epub_path, source_hash, imported_at, payload) \
+             VALUES (?, ?, ?, ?, '{}')",
+        )
+        .bind(book_id.to_string())
+        .bind(format!("/fixtures/{book_id}.epub"))
+        .bind(format!("fixture-{book_id}"))
+        .bind(now.to_rfc3339())
+        .execute(state.database.pool())
+        .await
+        .expect("recovery book fixture");
+        sqlx::query(
+            "INSERT INTO projects \
+             (id, book_id, name, status, created_at, updated_at, revision, payload) \
+             VALUES (?, ?, ?, 'draft', ?, ?, 0, '{}')",
+        )
+        .bind(project_id.to_string())
+        .bind(book_id.to_string())
+        .bind(name)
+        .bind(now.to_rfc3339())
+        .bind(now.to_rfc3339())
+        .execute(state.database.pool())
+        .await
+        .expect("recovery project fixture");
+        project_id
+    }
+
+    fn recovered_job(
+        id: u128,
+        project_id: ProjectId,
+        kind: JobKind,
+        state: JobState,
+        created_at: chrono::DateTime<Utc>,
+    ) -> Job {
+        Job {
+            id: JobId::from_uuid(Uuid::from_u128(id)),
+            project_id,
+            kind,
+            state,
+            export_profile_id: None,
+            reservation_id: None,
+            progress_completed: 0,
+            progress_total: 1,
+            status_message: Some("legacy active job".to_owned()),
+            allow_budget_override: false,
+            created_at,
+            started_at: (state != JobState::Queued).then_some(created_at),
+            finished_at: None,
+            updated_at: created_at,
+            revision: 0,
+        }
+    }
+
+    async fn insert_recovery_export_profile(
+        state: &AppState,
+        project_id: ProjectId,
+        output_directory: &Path,
+    ) -> ExportProfile {
+        let now = Utc::now();
+        let output_directory = tokio::fs::canonicalize(output_directory)
+            .await
+            .expect("canonical recovery output directory");
+        let profile = ExportProfile {
+            id: ExportProfileId::new(),
+            project_id,
+            name: "Recovery M4B".to_owned(),
+            format: ExportFormat::M4b,
+            layout: ExportLayout::SingleFile,
+            output_directory: output_directory.to_string_lossy().into_owned(),
+            filename_template: "legacy-book".to_owned(),
+            audio: audiobookai_core::AudioEncodingSettings::default(),
+            background_music: None,
+            embed_cover: true,
+            embed_chapters: true,
+            write_sidecar_manifest: true,
+            created_at: now,
+            updated_at: now,
+        };
+        sqlx::query(
+            "INSERT INTO export_profiles (id, project_id, name, format, layout, updated_at, payload) \
+             VALUES (?, ?, ?, 'm4b', 'single_file', ?, ?)",
+        )
+        .bind(profile.id.to_string())
+        .bind(project_id.to_string())
+        .bind(&profile.name)
+        .bind(now.to_rfc3339())
+        .bind(serde_json::to_string(&profile).unwrap())
+        .execute(state.database.pool())
+        .await
+        .expect("recovery export profile");
+        profile
+    }
+
+    #[test]
+    fn recovered_project_conflicts_choose_one_deterministic_production_survivor() {
+        let project_id = ProjectId::new();
+        let other_project_id = ProjectId::new();
+        let now = Utc::now();
+        let earlier = now - chrono::Duration::seconds(10);
+        let preview = recovered_job(1, project_id, JobKind::Preview, JobState::Running, earlier);
+        let deterministic_survivor = recovered_job(
+            2,
+            project_id,
+            JobKind::CharacterDetection,
+            JobState::Paused,
+            now,
+        );
+        let same_timestamp =
+            recovered_job(3, project_id, JobKind::Conversion, JobState::Running, now);
+        let newer = recovered_job(
+            4,
+            project_id,
+            JobKind::Export,
+            JobState::Queued,
+            now + chrono::Duration::seconds(1),
+        );
+        let unrelated = recovered_job(
+            5,
+            other_project_id,
+            JobKind::SegmentRegeneration,
+            JobState::Running,
+            now,
+        );
+
+        let conflicts = recovered_production_conflicts(&[
+            preview,
+            deterministic_survivor.clone(),
+            same_timestamp.clone(),
+            newer.clone(),
+            unrelated,
+        ]);
+
+        assert_eq!(conflicts, BTreeSet::from([same_timestamp.id, newer.id]));
+        assert!(!conflicts.contains(&deterministic_survivor.id));
+    }
+
+    #[test]
+    fn worker_handoff_never_drops_an_accepted_retry_at_release_boundary() {
+        // Conversion and proof export share the conversion worker; regeneration uses the same
+        // ownership registry with its own runner. Exercise each scheduling class independently.
+        for job_id in [JobId::new(), JobId::new(), JobId::new()] {
+            assert!(
+                request_production_worker(job_id, false),
+                "the original worker owns the first start"
+            );
+            assert!(
+                !request_production_worker(job_id, true),
+                "a retry while cleanup is active is handed to the owner"
+            );
+            assert!(
+                finish_production_worker_iteration(job_id),
+                "the owner must consume the handed-off retry"
+            );
+            assert!(
+                !finish_production_worker_iteration(job_id),
+                "the owner releases itself after the retry iteration"
+            );
+
+            // If release wins the mutex race, the retry request becomes a fresh owner instead.
+            assert!(
+                request_production_worker(job_id, true),
+                "a retry after release must create a new owner"
+            );
+            assert!(!finish_production_worker_iteration(job_id));
+        }
+
+        let paused_job_id = JobId::new();
+        assert!(request_production_worker(paused_job_id, false));
+        assert!(
+            !request_production_worker(paused_job_id, false),
+            "resume wakes an existing paused owner without requesting a second iteration"
+        );
+        assert!(
+            !finish_production_worker_iteration(paused_job_id),
+            "a successful resumed owner must be released without rerunning a completed job"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_terminalizes_legacy_project_conflicts_before_resuming_survivor() {
+        let (directory, state) = filesystem_test_state().await;
+        let project_id = insert_recovery_project(&state, "Conflicting recovery").await;
+        let output_directory = directory.path().join("survivor-exports");
+        tokio::fs::create_dir_all(&output_directory).await.unwrap();
+        let profile = insert_recovery_export_profile(&state, project_id, &output_directory).await;
+        let now = Utc::now();
+        let mut survivor = recovered_job(
+            10,
+            project_id,
+            JobKind::Conversion,
+            JobState::Paused,
+            now - chrono::Duration::seconds(10),
+        );
+        survivor.export_profile_id = Some(profile.id);
+        let conflicting_export =
+            recovered_job(11, project_id, JobKind::Export, JobState::Queued, now);
+        let conflicting_detection = recovered_job(
+            12,
+            project_id,
+            JobKind::CharacterDetection,
+            JobState::Queued,
+            now + chrono::Duration::seconds(1),
+        );
+        let jobs = state.database.repositories().jobs;
+        jobs.insert(&survivor).await.expect("survivor fixture");
+        jobs.insert(&conflicting_export)
+            .await
+            .expect("export conflict fixture");
+        jobs.insert(&conflicting_detection)
+            .await
+            .expect("detection conflict fixture");
+
+        resume_durable_conversions(Arc::clone(&state))
+            .await
+            .expect("conflicts recovered");
+
+        assert_eq!(
+            jobs.get(survivor.id).await.unwrap().unwrap().state,
+            JobState::Paused
+        );
+        let failed_export = jobs.get(conflicting_export.id).await.unwrap().unwrap();
+        assert_eq!(failed_export.state, JobState::Failed);
+        assert_eq!(
+            failed_export.status_message.as_deref(),
+            Some(RECOVERED_PRODUCTION_CONFLICT)
+        );
+        assert!(
+            jobs.get(conflicting_detection.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state
+                .is_terminal()
+        );
+        assert_eq!(
+            jobs.list_active()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|job| job.id)
+                .collect::<Vec<_>>(),
+            vec![survivor.id]
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_acquires_legacy_export_destination_before_resume() {
+        let (directory, state) = filesystem_test_state().await;
+        let project_id = insert_recovery_project(&state, "Legacy output recovery").await;
+        let output_directory = directory.path().join("exports");
+        tokio::fs::create_dir_all(&output_directory).await.unwrap();
+        let profile = insert_recovery_export_profile(&state, project_id, &output_directory).await;
+        let mut legacy = recovered_job(
+            13,
+            project_id,
+            JobKind::Conversion,
+            JobState::Paused,
+            Utc::now(),
+        );
+        legacy.export_profile_id = Some(profile.id);
+        let jobs = state.database.repositories().jobs;
+        jobs.insert(&legacy)
+            .await
+            .expect("legacy job without claim");
+
+        resume_durable_conversions(Arc::clone(&state))
+            .await
+            .expect("legacy output claim recovered");
+
+        let reservation = jobs
+            .get_output_reservation(legacy.id)
+            .await
+            .unwrap()
+            .expect("recovered output claim");
+        assert_eq!(reservation.state, OutputReservationState::Reserved);
+        assert_eq!(
+            Path::new(&reservation.destination_path),
+            Path::new(&profile.output_directory).join("legacy-book.m4b")
+        );
+        assert_eq!(
+            jobs.get(legacy.id).await.unwrap().unwrap().state,
+            JobState::Paused
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_fails_legacy_export_instead_of_adopting_existing_output() {
+        let (directory, state) = filesystem_test_state().await;
+        let project_id = insert_recovery_project(&state, "Legacy output conflict").await;
+        let output_directory = directory.path().join("exports");
+        tokio::fs::create_dir_all(&output_directory).await.unwrap();
+        let profile = insert_recovery_export_profile(&state, project_id, &output_directory).await;
+        let destination = output_directory.join("legacy-book.m4b");
+        tokio::fs::write(&destination, b"foreign output")
+            .await
+            .unwrap();
+        let mut legacy = recovered_job(
+            15,
+            project_id,
+            JobKind::Export,
+            JobState::Paused,
+            Utc::now(),
+        );
+        legacy.export_profile_id = Some(profile.id);
+        let jobs = state.database.repositories().jobs;
+        jobs.insert(&legacy)
+            .await
+            .expect("legacy job without claim");
+
+        resume_durable_conversions(Arc::clone(&state))
+            .await
+            .expect("legacy conflict terminalized");
+
+        let recovered = jobs.get(legacy.id).await.unwrap().unwrap();
+        assert_eq!(recovered.state, JobState::Failed);
+        assert!(
+            recovered
+                .status_message
+                .as_deref()
+                .is_some_and(|message| message.contains("already exists"))
+        );
+        assert_eq!(jobs.get_output_reservation(legacy.id).await.unwrap(), None);
+        assert_eq!(
+            tokio::fs::read(destination).await.unwrap(),
+            b"foreign output"
+        );
+    }
+
+    #[tokio::test]
+    async fn reserved_destination_is_rejected_before_becoming_an_output_root() {
+        let (directory, state) = filesystem_test_state().await;
+        let project_id = insert_recovery_project(&state, "Hierarchy ownership").await;
+        let export_root = directory.path().join("exports");
+        tokio::fs::create_dir_all(&export_root).await.unwrap();
+        let reserved_destination = tokio::fs::canonicalize(&export_root)
+            .await
+            .unwrap()
+            .join("book.m4b");
+        let owner = recovered_job(
+            14,
+            project_id,
+            JobKind::Conversion,
+            JobState::Paused,
+            Utc::now(),
+        );
+        let now = Utc::now();
+        let reservation = OutputDestinationReservation {
+            job_id: owner.id,
+            project_id,
+            destination_key: output_destination_key(&reserved_destination),
+            destination_path: reserved_destination.to_string_lossy().into_owned(),
+            layout: ExportLayout::SingleFile,
+            state: OutputReservationState::Reserved,
+            created_at: now,
+            updated_at: now,
+            promoted_at: None,
+        };
+        state
+            .database
+            .repositories()
+            .jobs
+            .insert_with_output_reservation(&owner, &reservation)
+            .await
+            .unwrap();
+
+        assert!(
+            ensure_output_directory_not_reserved(&state, &reserved_destination)
+                .await
+                .is_err()
+        );
+        assert!(!reserved_destination.exists());
+        let reserved_manifest = PathBuf::from(format!(
+            "{}.manifest.json",
+            reserved_destination.to_string_lossy()
+        ));
+        assert!(
+            ensure_output_directory_not_reserved(&state, &reserved_manifest)
+                .await
+                .is_err()
+        );
+        assert!(!reserved_manifest.exists());
+    }
+
+    #[tokio::test]
+    async fn unresolved_paid_conflict_is_failed_without_releasing_its_reservation() {
+        let (_directory, state) = filesystem_test_state().await;
+        let project_id = insert_recovery_project(&state, "Uncertain recovery").await;
+        let now = Utc::now();
+        let survivor = recovered_job(
+            20,
+            project_id,
+            JobKind::Conversion,
+            JobState::Paused,
+            now - chrono::Duration::seconds(10),
+        );
+        let reservation_id = ReservationId::new();
+        let mut conflicting = recovered_job(
+            21,
+            project_id,
+            JobKind::SegmentRegeneration,
+            JobState::Running,
+            now,
+        );
+        conflicting.reservation_id = Some(reservation_id);
+        let unit = JobUnit {
+            id: JobUnitId::new(),
+            job_id: conflicting.id,
+            kind: JobUnitKind::SynthesisSegment,
+            state: JobUnitState::Running,
+            chapter_id: None,
+            segment_id: None,
+            provider_profile_id: None,
+            dependencies: Vec::new(),
+            attempt_count: 0,
+            next_attempt_at: None,
+            output_artifact_id: None,
+            payload: BTreeMap::new(),
+            created_at: now,
+            updated_at: now,
+        };
+        let jobs = state.database.repositories().jobs;
+        jobs.insert(&survivor).await.expect("survivor fixture");
+        jobs.insert(&conflicting)
+            .await
+            .expect("paid conflict fixture");
+        jobs.upsert_unit(&unit).await.expect("paid unit fixture");
+        sqlx::query(
+            "INSERT INTO budget_reservations \
+             (id, job_id, status, created_at, expires_at, reconciled_at, payload) \
+             VALUES (?, ?, 'active', ?, NULL, NULL, '{}')",
+        )
+        .bind(reservation_id.to_string())
+        .bind(conflicting.id.to_string())
+        .bind(now.to_rfc3339())
+        .execute(state.database.pool())
+        .await
+        .expect("legacy reservation fixture");
+
+        resume_durable_conversions(Arc::clone(&state))
+            .await
+            .expect("uncertain conflict recovered");
+
+        let recovered = jobs.get(conflicting.id).await.unwrap().unwrap();
+        assert_eq!(recovered.state, JobState::Failed);
+        assert!(
+            recovered
+                .status_message
+                .as_deref()
+                .is_some_and(|message| message.contains("may have been charged"))
+        );
+        let recovered_unit = jobs.get_unit(unit.id).await.unwrap().unwrap();
+        assert_eq!(recovered_unit.state, JobUnitState::Failed);
+        assert_eq!(
+            recovered_unit
+                .payload
+                .get("uncertainUsageUnresolved")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT status FROM budget_reservations WHERE id = ?")
+                .bind(reservation_id.to_string())
+                .fetch_one(state.database.pool())
+                .await
+                .unwrap(),
+            "active"
+        );
+
+        // A second startup keeps the unknown charge and its reservation durable instead of
+        // retroactively releasing it as a zero-usage job.
+        resume_durable_conversions(Arc::clone(&state))
+            .await
+            .expect("idempotent uncertain recovery");
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT status FROM budget_reservations WHERE id = ?")
+                .bind(reservation_id.to_string())
+                .fetch_one(state.database.pool())
+                .await
+                .unwrap(),
+            "active"
+        );
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn startup_reconciles_expired_terminal_detection_cycle_usage() {
+        let (_directory, state) = filesystem_test_state().await;
+        let project_id = insert_recovery_project(&state, "Expired detection accounting").await;
+        let now = Utc::now();
+        let cycle_started_at = now - chrono::Duration::hours(2);
+        let reservation_id = ReservationId::new();
+        let mut job = recovered_job(
+            22,
+            project_id,
+            JobKind::CharacterDetection,
+            JobState::Failed,
+            cycle_started_at - chrono::Duration::minutes(5),
+        );
+        job.reservation_id = Some(reservation_id);
+        job.finished_at = Some(now - chrono::Duration::hours(1));
+        state
+            .database
+            .repositories()
+            .jobs
+            .insert(&job)
+            .await
+            .expect("terminal detection fixture");
+
+        let provider = audiobookai_core::ProviderProfile {
+            id: ProviderProfileId::new(),
+            name: "Detection provider".to_owned(),
+            family: audiobookai_core::ProviderFamily::OpenAiCompatible,
+            role: audiobookai_core::ProviderRole::CharacterDetection,
+            deployment: audiobookai_core::ProviderDeployment::ExternalEndpoint,
+            endpoint: Some("http://127.0.0.1:1234".to_owned()),
+            executable_path: None,
+            working_directory: None,
+            arguments: Vec::new(),
+            environment_secret_ids: BTreeMap::new(),
+            credential_secret_id: None,
+            enabled: true,
+            concurrency_override: None,
+            settings: audiobookai_core::SettingsMap::default(),
+            capability_snapshot: None,
+            created_at: cycle_started_at,
+            updated_at: cycle_started_at,
+        };
+        state
+            .database
+            .repositories()
+            .providers
+            .upsert(&provider)
+            .await
+            .expect("provider fixture");
+        let budget = audiobookai_core::Budget {
+            id: audiobookai_core::BudgetId::new(),
+            name: "Detection characters".to_owned(),
+            scope: audiobookai_core::BudgetScope {
+                kind: audiobookai_core::BudgetScopeKind::Global,
+                provider_profile_id: None,
+            },
+            period: audiobookai_core::BudgetPeriod::Lifetime,
+            metric: audiobookai_core::BudgetMetric::Characters,
+            currency: None,
+            limit: 100,
+            used: 0,
+            warning_threshold_percent: 80,
+            hard: true,
+            enabled: true,
+            period_started_at: cycle_started_at,
+            period_ends_at: None,
+            created_at: cycle_started_at,
+            updated_at: cycle_started_at,
+        };
+        state
+            .database
+            .repositories()
+            .budgets
+            .upsert(&budget)
+            .await
+            .expect("budget fixture");
+        let reservation = audiobookai_core::BudgetReservation {
+            id: reservation_id,
+            job_id: job.id,
+            status: audiobookai_core::ReservationStatus::Active,
+            allocations: vec![audiobookai_core::BudgetAllocation {
+                budget_id: budget.id,
+                reserved_amount: 50,
+                actual_amount: None,
+            }],
+            created_at: cycle_started_at,
+            expires_at: Some(now - chrono::Duration::hours(1)),
+            reconciled_at: None,
+        };
+        state
+            .database
+            .repositories()
+            .budgets
+            .reserve(&reservation)
+            .await
+            .expect("reservation fixture");
+        state
+            .database
+            .repositories()
+            .usage
+            .append(&UsageEvent {
+                id: UsageEventId::new(),
+                occurred_at: cycle_started_at + chrono::Duration::minutes(1),
+                workload: UsageWorkload::CharacterDetection,
+                project_id,
+                job_id: Some(job.id),
+                attempt_id: None,
+                chapter_id: None,
+                segment_id: None,
+                provider_profile_id: provider.id,
+                provider_family: "openai_compatible".to_owned(),
+                endpoint_family: "http://127.0.0.1:1234".to_owned(),
+                model: Some("detection-model".to_owned()),
+                voice_profile_id: None,
+                provider_request_id: None,
+                quantities: UsageQuantities {
+                    characters: Some(12),
+                    ..UsageQuantities::default()
+                },
+                quantity_source: ProvenanceQuality::Reported,
+                cost: None,
+                cost_source: ProvenanceQuality::Unknown,
+                rate_card_id: None,
+                uncertain_charge: false,
+                redacted_raw_usage: BTreeMap::new(),
+            })
+            .await
+            .expect("usage fixture");
+        state
+            .database
+            .repositories()
+            .budgets
+            .get_at(budget.id, now)
+            .await
+            .expect("expire reservation");
+
+        recover_terminal_paid_reservations(&state)
+            .await
+            .expect("startup accounting recovery");
+
+        assert_eq!(
+            state
+                .database
+                .repositories()
+                .budgets
+                .get_reservation(reservation_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            audiobookai_core::ReservationStatus::Reconciled
+        );
+        assert_eq!(
+            state
+                .database
+                .repositories()
+                .budgets
+                .get(budget.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .used,
+            12
+        );
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn semantic_assignment_resolution_does_not_require_dispatch_readiness_or_consent() {
+        let (_directory, state) = filesystem_test_state().await;
+        let now = Utc::now();
+        let project = Project {
+            id: ProjectId::new(),
+            book_id: audiobookai_core::BookId::new(),
+            name: "Semantic fixture".to_owned(),
+            status: audiobookai_core::ProjectStatus::Ready,
+            metadata: audiobookai_core::BookMetadata::default(),
+            cloud_consent: audiobookai_core::CloudConsent::default(),
+            settings: audiobookai_core::ProjectSettings::default(),
+            character_reviewed_at: Some(now),
+            created_at: now,
+            updated_at: now,
+        };
+        let provider_id = Uuid::new_v4();
+        let voice_id = Uuid::new_v4();
+        let character = crate::models::CharacterView {
+            id: Uuid::new_v4(),
+            role: audiobookai_core::CharacterRole::Narrator,
+            canonical_name: "Narrator".to_owned(),
+            aliases: Vec::new(),
+            confidence: 1.0,
+            dialogue_count: 1,
+            voice_assignment: Some(VoiceAssignmentView {
+                provider_profile_id: provider_id,
+                provider_name: "Offline cloud".to_owned(),
+                voice_id,
+                voice_name: "Stored voice".to_owned(),
+                model: Some("stored-model".to_owned()),
+                performance: PerformanceSettings::default(),
+                timing: TimingSettings::default(),
+            }),
+            evidence: Vec::new(),
+        };
+        let provider = ProviderProfileView {
+            id: provider_id,
+            name: "Offline cloud".to_owned(),
+            kind: ProviderKindView::Openai,
+            mode: ProviderModeView::CloudRemote,
+            endpoint: Some("https://example.invalid".to_owned()),
+            executable_path: None,
+            working_directory: None,
+            arguments: Vec::new(),
+            status: crate::models::ProviderStatusView::Offline,
+            model: Some("stored-model".to_owned()),
+            credential_configured: false,
+            capabilities: None,
+            capability_source: None,
+            capability_updated_at: None,
+            last_error: None,
+        };
+        let voices = HashMap::from([(voice_id, "stored-provider-voice".to_owned())]);
+        let providers = HashMap::from([(provider_id, provider)]);
+
+        let semantic = build_assignments_for(
+            &project,
+            std::slice::from_ref(&character),
+            &voices,
+            &providers,
+            &state,
+            AssignmentPurpose::Semantic,
+        )
+        .await
+        .expect("provider-free semantic identity");
+        assert_eq!(semantic[&character.id].voice_id, voice_id);
+        assert!(
+            build_assignments(
+                &project,
+                std::slice::from_ref(&character),
+                &voices,
+                &providers,
+                &state,
+            )
+            .await
+            .is_err(),
+            "dispatch still requires a ready provider and cloud consent"
+        );
+
+        let mut consent_only = providers[&provider_id].clone();
+        consent_only.status = crate::models::ProviderStatusView::Online;
+        consent_only.credential_configured = true;
+        consent_only.capability_updated_at = Some(Utc::now());
+        consent_only.capabilities = Some(crate::models::ProviderCapabilitiesView {
+            tts: true,
+            character_detection: false,
+            streaming: false,
+            voice_cloning: false,
+            pronunciation: false,
+            process_control: false,
+            model_control: false,
+            model_list: false,
+            model_download: false,
+            model_delete: false,
+            model_load: false,
+            model_unload: false,
+            model_switch: false,
+            temperature: "unsupported".to_owned(),
+            reasoning: Vec::new(),
+            max_concurrency: Some(1),
+            model_performance: Vec::new(),
+        });
+        let consent_only = HashMap::from([(provider_id, consent_only)]);
+        assert!(matches!(
+            build_assignments(
+                &project,
+                std::slice::from_ref(&character),
+                &voices,
+                &consent_only,
+                &state,
+            )
+            .await,
+            Err(ServiceError::Conflict(detail)) if detail.contains("consent")
+        ));
+    }
+
+    #[tokio::test]
+    async fn assembly_boundary_rechecks_selected_artifact_integrity() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("selected.flac");
+        tokio::fs::write(&path, b"selected take")
+            .await
+            .expect("selected artifact");
+        let now = Utc::now();
+        let artifact = Artifact {
+            id: ArtifactId::new(),
+            kind: ArtifactKind::SegmentAudio,
+            path: path.to_string_lossy().into_owned(),
+            fingerprint: fingerprint_file(&path).await.expect("fingerprint"),
+            media_type: Some("audio/flac".to_owned()),
+            duration_ms: Some(1_000),
+            cache_key: None,
+            pinned_by_job_id: None,
+            created_at: now,
+            last_accessed_at: now,
+        };
+        verify_selected_artifact_integrity(&artifact)
+            .await
+            .expect("initial proof-export validation");
+
+        let mut unknown = artifact.clone();
+        unknown.fingerprint.algorithm = "sha256".to_owned();
+        assert!(
+            verify_selected_artifacts_before_use(&[&unknown])
+                .await
+                .is_err()
+        );
+
+        tokio::fs::write(&path, b"tampered take")
+            .await
+            .expect("tampered artifact");
+        assert!(
+            verify_selected_artifacts_before_use(&[&artifact])
+                .await
+                .is_err(),
+            "the assembly boundary must reject a take changed after initial validation"
+        );
+    }
+
+    #[tokio::test]
+    async fn proof_take_materialization_rejects_a_retained_partial_file() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let source_path = directory.path().join("source.flac");
+        let destination = directory.path().join("take.flac");
+        tokio::fs::write(&source_path, b"complete normalized take")
+            .await
+            .unwrap();
+        tokio::fs::write(&destination, b"retained partial")
+            .await
+            .unwrap();
+        let source = artifact_for_file(
+            ArtifactKind::SegmentAudio,
+            &source_path,
+            Some("audio/flac".to_owned()),
+            Some(1_000),
+            None,
+            None,
+        )
+        .await
+        .expect("source artifact");
+
+        assert!(matches!(
+            materialize_proof_take_file(&source, &destination).await,
+            Err(ServiceError::Conflict(_))
+        ));
+        assert_eq!(
+            tokio::fs::read(destination).await.unwrap(),
+            b"retained partial",
+            "mismatched partial data must remain fail-closed and never become a take"
+        );
+    }
+
+    #[tokio::test]
+    async fn split_export_promotion_resumes_after_only_some_files_were_moved() {
+        let (directory, state) = filesystem_test_state().await;
+        let job_id = JobId::new();
+        let output_directory = directory.path().join("exports");
+        let staging = prepare_private_export_staging(&state, job_id)
+            .await
+            .expect("private export staging");
+        let temporary = export_staging_output_path(&staging, ExportLayout::PerChapter, "m4b");
+        let final_output = output_directory.join("book");
+        tokio::fs::create_dir_all(&output_directory)
+            .await
+            .expect("public export directory");
+        tokio::fs::create_dir_all(&temporary)
+            .await
+            .expect("temporary export directory");
+        let first = temporary.join("01-first.m4b");
+        let second = temporary.join("02-second.m4b");
+        tokio::fs::write(&first, b"first chapter")
+            .await
+            .expect("first export file");
+        tokio::fs::write(&second, b"second chapter")
+            .await
+            .expect("second export file");
+        persist_export_promotion_marker(
+            &state,
+            job_id,
+            &final_output,
+            &[(first.clone(), 1_000), (second.clone(), 2_000)],
+        )
+        .await
+        .expect("promotion marker");
+
+        tokio::fs::create_dir(&final_output)
+            .await
+            .expect("final export directory");
+        mark_split_export_directory_created(&state, job_id, &final_output)
+            .await
+            .expect("durable split-directory ownership marker");
+        atomic_promote(&first, &final_output.join("01-first.m4b"))
+            .await
+            .expect("first promotion");
+
+        let recovered = recover_promoted_export(
+            &state,
+            job_id,
+            ExportLayout::PerChapter,
+            &temporary,
+            &final_output,
+        )
+        .await
+        .expect("resume promotion");
+        assert_eq!(recovered.len(), 2);
+        assert_eq!(
+            tokio::fs::read(final_output.join("01-first.m4b"))
+                .await
+                .unwrap(),
+            b"first chapter"
+        );
+        assert_eq!(
+            tokio::fs::read(final_output.join("02-second.m4b"))
+                .await
+                .unwrap(),
+            b"second chapter"
+        );
+        assert!(!temporary.exists());
+    }
+
+    #[tokio::test]
+    async fn split_export_recovery_rejects_a_foreign_existing_directory() {
+        let (directory, state) = filesystem_test_state().await;
+        let job_id = JobId::new();
+        let output_directory = directory.path().join("exports");
+        let staging = prepare_private_export_staging(&state, job_id)
+            .await
+            .expect("private export staging");
+        let temporary = export_staging_output_path(&staging, ExportLayout::PerChapter, "m4b");
+        let final_output = output_directory.join("book");
+        tokio::fs::create_dir_all(&output_directory)
+            .await
+            .expect("public export directory");
+        tokio::fs::create_dir_all(&temporary)
+            .await
+            .expect("temporary export directory");
+        let staged = temporary.join("01-first.m4b");
+        tokio::fs::write(&staged, b"job-owned chapter")
+            .await
+            .expect("staged export file");
+        persist_export_promotion_marker(&state, job_id, &final_output, &[(staged.clone(), 1_000)])
+            .await
+            .expect("promotion marker");
+
+        tokio::fs::create_dir(&final_output)
+            .await
+            .expect("foreign final export directory");
+        let foreign = final_output.join("foreign.txt");
+        tokio::fs::write(&foreign, b"foreign data")
+            .await
+            .expect("foreign directory contents");
+
+        assert!(matches!(
+            recover_promoted_export(
+                &state,
+                job_id,
+                ExportLayout::PerChapter,
+                &temporary,
+                &final_output,
+            )
+            .await,
+            Err(ServiceError::Conflict(_))
+        ));
+        assert_eq!(
+            tokio::fs::read(&staged).await.unwrap(),
+            b"job-owned chapter"
+        );
+        assert_eq!(tokio::fs::read(&foreign).await.unwrap(), b"foreign data");
+        assert!(!final_output.join("01-first.m4b").exists());
+    }
+
+    #[tokio::test]
+    async fn promotion_never_replaces_an_existing_destination() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let source = directory.path().join("staged.m4b");
+        let destination = directory.path().join("book.m4b");
+        tokio::fs::write(&source, b"job-owned output")
+            .await
+            .unwrap();
+        tokio::fs::write(&destination, b"foreign output")
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            atomic_promote(&source, &destination).await,
+            Err(ServiceError::Conflict(_))
+        ));
+        assert_eq!(
+            tokio::fs::read(&destination).await.unwrap(),
+            b"foreign output"
+        );
+        assert_eq!(tokio::fs::read(&source).await.unwrap(), b"job-owned output");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_export_staging_ignores_a_hostile_legacy_public_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let (directory, state) = filesystem_test_state().await;
+        let output_directory = directory.path().join("public-exports");
+        tokio::fs::create_dir_all(&output_directory).await.unwrap();
+        let victim = directory.path().join("victim.txt");
+        tokio::fs::write(&victim, b"must remain untouched")
+            .await
+            .unwrap();
+        let job_id = JobId::new();
+        let legacy_public_staging = output_directory.join(format!(".book-{job_id}.partial.m4b"));
+        symlink(&victim, &legacy_public_staging).expect("hostile public staging symlink");
+
+        let private_staging = prepare_private_export_staging(&state, job_id)
+            .await
+            .expect("managed staging directory");
+        let managed_output =
+            export_staging_output_path(&private_staging, ExportLayout::SingleFile, "m4b");
+        write_job_staging_file_atomically(&private_staging, &managed_output, b"new export bytes")
+            .await
+            .expect("managed staging write");
+
+        assert_eq!(
+            tokio::fs::read(&victim).await.unwrap(),
+            b"must remain untouched"
+        );
+        assert!(
+            tokio::fs::symlink_metadata(&legacy_public_staging)
+                .await
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            tokio::fs::read(managed_output).await.unwrap(),
+            b"new export bytes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn swapped_export_root_symlink_is_rejected_before_promotion() {
+        use std::os::unix::fs::symlink;
+
+        let (directory, state) = filesystem_test_state().await;
+        let project_id = insert_recovery_project(&state, "Swapped export root").await;
+        let output_directory = directory.path().join("reserved-output");
+        let replacement = directory.path().join("foreign-output");
+        tokio::fs::create_dir_all(&output_directory).await.unwrap();
+        tokio::fs::create_dir_all(&replacement).await.unwrap();
+        let output_directory = tokio::fs::canonicalize(&output_directory).await.unwrap();
+        let profile = insert_recovery_export_profile(&state, project_id, &output_directory).await;
+        let displaced = directory.path().join("displaced-output");
+        tokio::fs::rename(&output_directory, &displaced)
+            .await
+            .unwrap();
+        symlink(&replacement, &output_directory).expect("replacement output symlink");
+
+        assert!(matches!(
+            ensure_export_root_identity(&profile).await,
+            Err(ServiceError::Conflict(_))
+        ));
+        assert!(!replacement.join("legacy-book.m4b").exists());
+    }
+
+    #[tokio::test]
+    async fn failed_exclusive_copy_retains_its_partial_destination_fail_closed() {
+        use std::{
+            pin::Pin,
+            task::{Context, Poll},
+        };
+
+        struct FailsAfterPrefix(bool);
+
+        impl tokio::io::AsyncRead for FailsAfterPrefix {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                _context: &mut Context<'_>,
+                buffer: &mut tokio::io::ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                if self.0 {
+                    Poll::Ready(Err(std::io::Error::other("injected copy failure")))
+                } else {
+                    buffer.put_slice(b"partial job output");
+                    self.0 = true;
+                    Poll::Ready(Ok(()))
+                }
+            }
+        }
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let destination = directory.path().join("book.m4b");
+        let mut source = FailsAfterPrefix(false);
+
+        assert!(matches!(
+            copy_reader_no_clobber(&mut source, &destination).await,
+            Err(ServiceError::Io(_))
+        ));
+        assert_eq!(
+            tokio::fs::read(destination).await.unwrap(),
+            b"partial job output",
+            "a failed fallback must retain the exclusively-created path instead of deleting by name"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_replaces_only_job_owned_staging_auxiliary_files() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let auxiliary = directory.path().join("..book-job.partial.m4b.ffmetadata");
+        write_job_staging_file_atomically(directory.path(), &auxiliary, b"first metadata")
+            .await
+            .unwrap();
+        write_job_staging_file_atomically(directory.path(), &auxiliary, b"retry metadata")
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::fs::read(&auxiliary).await.unwrap(),
+            b"retry metadata"
+        );
+
+        let public = directory.path().join("book.m4b.manifest.json");
+        write_file_atomically(&public, b"first public sidecar")
+            .await
+            .unwrap();
+        assert!(
+            write_file_atomically(&public, b"different public sidecar")
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            tokio::fs::read(public).await.unwrap(),
+            b"first public sidecar"
+        );
+    }
+
     #[tokio::test]
     async fn provider_stream_sink_requires_order_and_a_final_chunk() {
         let request_id = Uuid::new_v4();
@@ -4933,6 +9961,34 @@ mod tests {
             sink.finish().await.expect("collected audio"),
             b"firstsecond"[..]
         );
+    }
+
+    #[tokio::test]
+    async fn streaming_local_finalization_happens_after_billable_dispatch_success() {
+        let request_id = Uuid::new_v4();
+        let dispatch = ProviderSynthesisDispatch::Streaming {
+            metadata: StreamingSynthesisResponse {
+                content_type: "audio/wav".to_owned(),
+                usage: ProviderUsage {
+                    source: UsageSource::Reported,
+                    characters: Some(17),
+                    request_id: Some(request_id.to_string()),
+                    ..ProviderUsage::default()
+                },
+            },
+            // Deliberately omit the provider's final chunk. This is a local response-validation
+            // failure after the provider returned successful billing metadata.
+            sink: Arc::new(ProviderStreamSink::new(request_id, AudioFormat::Wav, None)),
+            decoder_task: None,
+            job_id: JobId::new(),
+            playback_ordinal: 0,
+        };
+
+        assert_eq!(dispatch.usage().characters, Some(17));
+        assert!(matches!(
+            finish_provider_audio(dispatch).await,
+            Err(ProviderError::InvalidResponse(_))
+        ));
     }
 
     #[test]
@@ -5023,6 +10079,35 @@ mod tests {
     }
 
     #[test]
+    fn export_parts_follow_manifest_order_and_retain_unlisted_fallbacks() {
+        let now = Utc::now();
+        let artifact = |id: u128, path: &str| Artifact {
+            id: ArtifactId::from_uuid(Uuid::from_u128(id)),
+            kind: ArtifactKind::Export,
+            path: path.to_owned(),
+            fingerprint: FileFingerprint {
+                algorithm: "blake3".to_owned(),
+                digest: "00".repeat(32),
+                size_bytes: 1,
+            },
+            media_type: Some("audio/mp4".to_owned()),
+            duration_ms: Some(1_000),
+            cache_key: None,
+            pinned_by_job_id: Some(JobId::from_uuid(Uuid::from_u128(99))),
+            created_at: now,
+            last_accessed_at: now,
+        };
+        let first = artifact(1, "/exports/part-1.m4b");
+        let second = artifact(2, "/exports/part-2.m4b");
+        let fallback = artifact(3, "/exports/recovered.m4b");
+        let ordered = canonical_export_ids(
+            &[first.clone(), second.clone(), fallback.clone()],
+            &[second.path.clone(), first.path.clone()],
+        );
+        assert_eq!(ordered, [second.id, first.id, fallback.id]);
+    }
+
+    #[test]
     fn pronunciation_rules_are_scoped_and_deterministic() {
         let project_id = Uuid::from_u128(1);
         let character_id = Uuid::from_u128(2);
@@ -5086,5 +10171,148 @@ mod tests {
         assert_eq!(text, "Doctor Smith ignored this.");
         assert_eq!(applied, vec![global_id, project_rule_id]);
         assert_eq!(revision.len(), 64);
+    }
+
+    #[test]
+    fn synthesis_identity_tracks_performance_but_not_local_timing() {
+        let mut segment = test_segment_plan();
+        let semantic = segment_semantic_input_hash(&segment).expect("semantic hash");
+        let cache_key = segment_cache_fingerprint(&segment, "conversion")
+            .key()
+            .expect("cache key");
+
+        segment.assignment.timing.pause_after_ms = Some(750);
+        assert_eq!(
+            segment_semantic_input_hash(&segment).expect("timing semantic hash"),
+            semantic
+        );
+        assert_eq!(
+            segment_cache_fingerprint(&segment, "conversion")
+                .key()
+                .expect("timing cache key"),
+            cache_key
+        );
+
+        segment.assignment.performance.speed = Some(1.1);
+        assert_ne!(
+            segment_semantic_input_hash(&segment).expect("performance semantic hash"),
+            semantic
+        );
+        assert_ne!(
+            segment_cache_fingerprint(&segment, "conversion")
+                .key()
+                .expect("performance cache key"),
+            cache_key
+        );
+    }
+
+    #[test]
+    fn durable_conversion_snapshot_rejects_same_key_narration_or_model_drift() {
+        let snapshot = test_segment_plan();
+        let now = Utc::now();
+        let unit = JobUnit {
+            id: JobUnitId::new(),
+            job_id: JobId::new(),
+            kind: JobUnitKind::SynthesisSegment,
+            state: JobUnitState::Failed,
+            chapter_id: Some(ChapterId::from_uuid(snapshot.chapter_id)),
+            segment_id: None,
+            provider_profile_id: Some(ProviderProfileId::from_uuid(
+                snapshot.assignment.provider_id,
+            )),
+            dependencies: Vec::new(),
+            attempt_count: 1,
+            next_attempt_at: None,
+            output_artifact_id: None,
+            payload: BTreeMap::from([
+                (
+                    "segmentKey".to_owned(),
+                    serde_json::json!(snapshot.key.clone()),
+                ),
+                ("cacheOperation".to_owned(), serde_json::json!("conversion")),
+                (
+                    "segmentPlan".to_owned(),
+                    serde_json::to_value(&snapshot).unwrap(),
+                ),
+            ]),
+            created_at: now,
+            updated_at: now,
+        };
+        validate_durable_segment_snapshot(&unit, &snapshot).expect("unchanged snapshot");
+
+        let mut changed_text = snapshot.clone();
+        changed_text.text = "Changed narration".to_owned();
+        assert!(matches!(
+            validate_durable_segment_snapshot(&unit, &changed_text),
+            Err(ServiceError::Conflict(detail)) if detail.contains("start a new conversion")
+        ));
+
+        let mut changed_model = snapshot;
+        changed_model.assignment.model = Some("changed-model".to_owned());
+        assert!(matches!(
+            validate_durable_segment_snapshot(&unit, &changed_model),
+            Err(ServiceError::Conflict(detail)) if detail.contains("start a new conversion")
+        ));
+
+        let mut changed_routing = test_segment_plan();
+        changed_routing.assignment.provider_endpoint =
+            Some("https://different-provider.example/v1".to_owned());
+        assert!(matches!(
+            validate_durable_segment_snapshot(&unit, &changed_routing),
+            Err(ServiceError::Conflict(detail)) if detail.contains("start a new conversion")
+        ));
+    }
+
+    #[test]
+    fn regeneration_reservation_multiplier_follows_uncertain_charge_policy() {
+        let base =
+            RetryPolicy::new(4, Duration::from_millis(1), Duration::from_millis(10)).unwrap();
+        assert_eq!(
+            retry_reservation_multiplier(&base.clone().with_uncertain_charge_retries(false)),
+            1
+        );
+        assert_eq!(
+            retry_reservation_multiplier(&base.with_uncertain_charge_retries(true)),
+            4
+        );
+    }
+
+    #[test]
+    fn regeneration_runtime_mode_must_match_the_durable_snapshot() {
+        assert!(provider_mode_matches_runtime(
+            ProviderModeView::CloudRemote,
+            audiobookai_providers::ProviderKind::CloudRemote,
+        ));
+        assert!(provider_mode_matches_runtime(
+            ProviderModeView::ExternalEndpoint,
+            audiobookai_providers::ProviderKind::ExternalEndpoint,
+        ));
+        assert!(provider_mode_matches_runtime(
+            ProviderModeView::ManagedChild,
+            audiobookai_providers::ProviderKind::ManagedChild,
+        ));
+        assert!(provider_mode_matches_runtime(
+            ProviderModeView::Native,
+            audiobookai_providers::ProviderKind::Native,
+        ));
+        assert!(!provider_mode_matches_runtime(
+            ProviderModeView::CloudRemote,
+            audiobookai_providers::ProviderKind::ExternalEndpoint,
+        ));
+    }
+
+    #[test]
+    fn regeneration_retry_requires_an_exact_persisted_provider_snapshot() {
+        let snapshot = Uuid::new_v4();
+        assert!(persisted_provider_snapshot_matches(
+            Some(snapshot),
+            Some(snapshot)
+        ));
+        assert!(!persisted_provider_snapshot_matches(None, Some(snapshot)));
+        assert!(!persisted_provider_snapshot_matches(Some(snapshot), None));
+        assert!(!persisted_provider_snapshot_matches(
+            Some(snapshot),
+            Some(Uuid::new_v4())
+        ));
     }
 }

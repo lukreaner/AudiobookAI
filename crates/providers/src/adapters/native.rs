@@ -280,6 +280,10 @@ impl NativeTtsProvider {
     }
 
     fn synthesis_command(&self, request: &SynthesisRequest) -> Result<NativeCommand> {
+        request.validate_performance(
+            &self.capabilities,
+            request.model.as_deref().unwrap_or("native-system"),
+        )?;
         if request.format != AudioFormat::Wav {
             return Err(ProviderError::Unsupported {
                 feature: "native TTS output other than WAV",
@@ -632,6 +636,7 @@ mod tests {
                 model: None,
                 voice: "Ava; rm -rf /".to_owned(),
                 format: AudioFormat::Wav,
+                performance: Default::default(),
                 options: Default::default(),
                 pronunciation_dictionary_ids: Vec::new(),
             })
@@ -643,5 +648,33 @@ mod tests {
         assert_eq!(command.stdin, Bytes::from_static(b"Secret book text"));
         assert!(command.arguments.contains(&literal("Ava; rm -rf /")));
         assert!(!format!("{command:?}").contains("Secret book text"));
+    }
+
+    #[tokio::test]
+    async fn native_synthesis_rejects_performance_controls_before_execution() {
+        const WAV: &[u8] = b"RIFF....WAVEfixture";
+        let runner = fixture(b"", Some(WAV));
+        let provider = NativeTtsProvider::new(
+            NativeTtsConfig::new(NativePlatform::MacOs, fixture_executable()).unwrap(),
+            runner.clone(),
+        )
+        .unwrap();
+        let result = provider
+            .synthesize(SynthesisRequest {
+                request_id: uuid::Uuid::new_v4(),
+                text: "Text".to_owned(),
+                model: None,
+                voice: "Ava".to_owned(),
+                format: AudioFormat::Wav,
+                performance: crate::PerformanceSettings {
+                    speed: Some(1.1),
+                    ..crate::PerformanceSettings::default()
+                },
+                options: Default::default(),
+                pronunciation_dictionary_ids: Vec::new(),
+            })
+            .await;
+        assert!(matches!(result, Err(ProviderError::Unsupported { .. })));
+        assert!(runner.command.lock().unwrap().is_none());
     }
 }

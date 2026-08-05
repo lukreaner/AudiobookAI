@@ -9,10 +9,11 @@ use serde_json::{Value, json};
 use super::{HttpAdapter, json_body};
 use crate::{
     AudioChunk, AudioChunkSink, AudioFormat, Authentication, CancellationFlag, EndpointConfig,
-    HttpMethod, HttpRequest, HttpTransport, Model, ParameterSupport, ProviderCapabilities,
-    ProviderDescriptor, ProviderError, ProviderHealth, ProviderId, ProviderUsage, Result,
-    StreamingSynthesisResponse, SynthesisRequest, SynthesisResponse, TtsProvider, UsageSource,
-    Voice, VoiceClone, VoiceCloneProvider, VoiceCloneRequest,
+    HttpMethod, HttpRequest, HttpTransport, Model, ModelPerformanceCapabilities, ParameterSupport,
+    PerformanceCapabilities, PerformanceRange, ProviderCapabilities, ProviderDescriptor,
+    ProviderError, ProviderHealth, ProviderId, ProviderUsage, Result, StreamingSynthesisResponse,
+    SynthesisRequest, SynthesisResponse, TtsProvider, UsageSource, Voice, VoiceClone,
+    VoiceCloneProvider, VoiceCloneRequest,
 };
 
 fn capabilities(
@@ -30,6 +31,29 @@ fn capabilities(
         reasoning: BTreeSet::new(),
         ..ProviderCapabilities::default()
     }
+}
+
+fn elevenlabs_performance_capabilities() -> Vec<ModelPerformanceCapabilities> {
+    let performance = PerformanceCapabilities {
+        speed: Some(PerformanceRange::new(0.7, 1.2)),
+        pitch: None,
+        stability: Some(PerformanceRange::new(0.0, 1.0)),
+        similarity: Some(PerformanceRange::new(0.0, 1.0)),
+        style: Some(PerformanceRange::new(0.0, 1.0)),
+        speaker_boost: true,
+        delivery_cues: Vec::new(),
+    };
+    [
+        "eleven_multilingual_v2",
+        "eleven_flash_v2_5",
+        "eleven_turbo_v2_5",
+    ]
+    .into_iter()
+    .map(|model| ModelPerformanceCapabilities {
+        model: model.to_owned(),
+        performance: performance.clone(),
+    })
+    .collect()
 }
 
 fn audio_content_type(format: AudioFormat) -> &'static str {
@@ -100,6 +124,8 @@ impl ElevenLabsProvider {
         endpoint: EndpointConfig,
         transport: Arc<dyn HttpTransport>,
     ) -> Result<Self> {
+        let mut capabilities = capabilities(true, true, true, true);
+        capabilities.set_model_performance(elevenlabs_performance_capabilities())?;
         Ok(Self {
             descriptor: ProviderDescriptor {
                 id: ProviderId::new("elevenlabs")?,
@@ -107,7 +133,7 @@ impl ElevenLabsProvider {
                 kind: endpoint.kind,
                 endpoint_family: "elevenlabs-v1".to_owned(),
             },
-            capabilities: capabilities(true, true, true, true),
+            capabilities,
             http: HttpAdapter::new(endpoint, transport),
         })
     }
@@ -127,9 +153,21 @@ impl ElevenLabsProvider {
                 });
             }
         };
+        let effective_model = request.model.as_deref().unwrap_or("eleven_multilingual_v2");
+        request.validate_performance(&self.capabilities, effective_model)?;
+        if !request.options.is_empty() {
+            return Err(ProviderError::Unsupported {
+                feature: "untyped ElevenLabs voice options",
+            });
+        }
+        if request.performance.pitch.is_some() || request.performance.delivery_cue.is_some() {
+            return Err(ProviderError::Unsupported {
+                feature: "the requested ElevenLabs performance control",
+            });
+        }
         let mut body = json!({
             "text": request.text,
-            "model_id": request.model.as_deref().unwrap_or("eleven_multilingual_v2")
+            "model_id": effective_model
         });
         if !request.pronunciation_dictionary_ids.is_empty() {
             body["pronunciation_dictionary_locators"] = Value::Array(
@@ -140,9 +178,22 @@ impl ElevenLabsProvider {
                     .collect(),
             );
         }
-        if !request.options.is_empty() {
-            body["voice_settings"] = serde_json::to_value(&request.options)
-                .map_err(|error| ProviderError::Configuration(error.to_string()))?;
+        let mut voice_settings = serde_json::Map::new();
+        for (name, value) in [
+            ("speed", request.performance.speed),
+            ("stability", request.performance.stability),
+            ("similarity_boost", request.performance.similarity),
+            ("style", request.performance.style),
+        ] {
+            if let Some(value) = value {
+                voice_settings.insert(name.to_owned(), json!(value));
+            }
+        }
+        if let Some(value) = request.performance.speaker_boost {
+            voice_settings.insert("use_speaker_boost".to_owned(), json!(value));
+        }
+        if !voice_settings.is_empty() {
+            body["voice_settings"] = Value::Object(voice_settings);
         }
         let path = format!(
             "v1/text-to-speech/{}/stream?output_format={output_format}",
@@ -430,15 +481,46 @@ impl OpenAiSpeechProvider {
             OpenAiSpeechFlavor::Mlx => "kokoro",
             OpenAiSpeechFlavor::LocalAi => "tts-1",
         };
+        let effective_model = request.model.as_deref().unwrap_or(default_model);
+        request.validate_performance(&self.capabilities, effective_model)?;
         let mut body = json!({
-            "model": request.model.as_deref().unwrap_or(default_model),
+            "model": effective_model,
             "input": request.text,
             "voice": request.voice,
             "response_format": response_format
         });
-        if !request.options.is_empty() {
-            body["options"] = serde_json::to_value(&request.options)
-                .map_err(|error| ProviderError::Configuration(error.to_string()))?;
+        match self.flavor {
+            OpenAiSpeechFlavor::Mlx => {
+                if !request.options.is_empty() {
+                    return Err(ProviderError::Unsupported {
+                        feature: "untyped MLX-audio synthesis options",
+                    });
+                }
+                if request.performance.stability.is_some()
+                    || request.performance.similarity.is_some()
+                    || request.performance.style.is_some()
+                    || request.performance.speaker_boost.is_some()
+                {
+                    return Err(ProviderError::Unsupported {
+                        feature: "the requested MLX-audio performance control",
+                    });
+                }
+                if let Some(value) = request.performance.speed {
+                    body["speed"] = json!(value);
+                }
+                if let Some(value) = request.performance.pitch {
+                    body["pitch"] = json!(value);
+                }
+                if let Some(value) = &request.performance.delivery_cue {
+                    body["instruct"] = json!(value.as_str());
+                }
+            }
+            OpenAiSpeechFlavor::LocalAi => {
+                if !request.options.is_empty() {
+                    body["options"] = serde_json::to_value(&request.options)
+                        .map_err(|error| ProviderError::Configuration(error.to_string()))?;
+                }
+            }
         }
         self.http
             .json_request(HttpMethod::Post, "v1/audio/speech", &body)
@@ -586,6 +668,32 @@ impl MlxAudioProvider {
             OpenAiSpeechFlavor::Mlx,
         )?))
     }
+
+    /// Installs exact, positively verified model capabilities used to gate MLX request fields.
+    ///
+    /// MLX-audio exposes a common request schema while individual loaded models implement only a
+    /// subset of its controls. Callers must therefore provide descriptors obtained for the exact
+    /// selected model; no provider-wide fallback is used.
+    pub fn with_model_performance(
+        mut self,
+        descriptors: Vec<ModelPerformanceCapabilities>,
+    ) -> Result<Self> {
+        for descriptor in &descriptors {
+            let performance = &descriptor.performance;
+            if performance.stability.is_some()
+                || performance.similarity.is_some()
+                || performance.style.is_some()
+                || performance.speaker_boost
+            {
+                return Err(ProviderError::Configuration(
+                    "MLX-audio capability descriptors may advertise only speed, pitch, and delivery"
+                        .to_owned(),
+                ));
+            }
+        }
+        self.0.capabilities.set_model_performance(descriptors)?;
+        Ok(self)
+    }
 }
 
 impl LocalAiProvider {
@@ -640,7 +748,10 @@ async fn stream_response(
         if cancellation.is_cancelled() {
             return Err(ProviderError::Cancelled);
         }
-        let data = chunk?;
+        // A body-stream failure occurs only after the provider accepted the request and returned
+        // a successful response. Billing is therefore unknown; classifying it as a transient
+        // connection failure could automatically dispatch and charge the same synthesis twice.
+        let data = chunk.map_err(|_| ProviderError::UncertainCharge)?;
         if data.is_empty() {
             continue;
         }
@@ -694,6 +805,10 @@ impl AllTalkProvider {
     }
 
     pub fn build_synthesis_request(&self, request: &SynthesisRequest) -> Result<HttpRequest> {
+        request.validate_performance(
+            &self.capabilities,
+            request.model.as_deref().unwrap_or("alltalk-v2"),
+        )?;
         let language = request
             .options
             .get("language")
@@ -810,13 +925,16 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
-    use crate::{HttpResponse, Temperature};
+    use crate::{HttpResponse, HttpStreamResponse, Temperature};
 
     #[derive(Debug, Default)]
     struct RecordingTransport(Mutex<Vec<HttpRequest>>);
 
     #[derive(Debug, Default)]
     struct RecordingChunkSink(Mutex<Vec<AudioChunk>>);
+
+    #[derive(Debug, Default)]
+    struct InterruptedStreamingTransport;
 
     #[async_trait]
     impl AudioChunkSink for RecordingChunkSink {
@@ -838,12 +956,44 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl HttpTransport for InterruptedStreamingTransport {
+        async fn execute(&self, _request: HttpRequest) -> Result<HttpResponse> {
+            unreachable!("streaming test uses execute_stream")
+        }
+
+        async fn execute_stream(&self, _request: HttpRequest) -> Result<HttpStreamResponse> {
+            Ok(HttpStreamResponse {
+                status: 200,
+                headers: Default::default(),
+                body: Box::pin(futures::stream::once(async {
+                    Err(ProviderError::Transport(
+                        "injected body interruption".to_owned(),
+                    ))
+                })),
+            })
+        }
+    }
+
     fn endpoint() -> EndpointConfig {
         EndpointConfig::managed_loopback(
             url::Url::parse("http://127.0.0.1:8000/").unwrap(),
             Authentication::None,
         )
         .unwrap()
+    }
+
+    fn synthesis_request(model: Option<&str>, format: AudioFormat) -> SynthesisRequest {
+        SynthesisRequest {
+            request_id: uuid::Uuid::new_v4(),
+            text: "Hello".to_owned(),
+            model: model.map(ToOwned::to_owned),
+            voice: "af_sky".to_owned(),
+            format,
+            performance: Default::default(),
+            options: Default::default(),
+            pronunciation_dictionary_ids: Vec::new(),
+        }
     }
 
     #[test]
@@ -861,21 +1011,142 @@ mod tests {
     fn localai_serializes_openai_speech_request() {
         let provider =
             LocalAiProvider::new(endpoint(), Arc::new(RecordingTransport::default())).unwrap();
-        let request = SynthesisRequest {
-            request_id: uuid::Uuid::new_v4(),
-            text: "Hello".to_owned(),
-            model: Some("kokoro".to_owned()),
-            voice: "af_sky".to_owned(),
-            format: AudioFormat::Wav,
-            options: Default::default(),
-            pronunciation_dictionary_ids: Vec::new(),
-        };
+        let request = synthesis_request(Some("kokoro"), AudioFormat::Wav);
         let http = provider.build_synthesis_request(&request).unwrap();
         let body: Value = serde_json::from_slice(&http.body).unwrap();
         assert_eq!(body["input"], "Hello");
         assert_eq!(body["response_format"], "wav");
         assert!(body.get("temperature").is_none());
         let _ = Temperature::Default;
+    }
+
+    #[test]
+    fn elevenlabs_maps_only_typed_allowlisted_voice_settings() {
+        let provider =
+            ElevenLabsProvider::with_endpoint(endpoint(), Arc::new(RecordingTransport::default()))
+                .unwrap();
+        let mut request = synthesis_request(Some("eleven_multilingual_v2"), AudioFormat::Mp3);
+        request.performance = crate::PerformanceSettings {
+            speed: Some(0.9),
+            pitch: None,
+            stability: Some(0.4),
+            similarity: Some(0.8),
+            style: Some(0.1),
+            speaker_boost: Some(true),
+            delivery_cue: None,
+        };
+
+        let http = provider.build_synthesis_request(&request).unwrap();
+        let body: Value = serde_json::from_slice(&http.body).unwrap();
+        assert_eq!(body["model_id"], "eleven_multilingual_v2");
+        assert_eq!(
+            body["voice_settings"],
+            json!({
+                "speed": 0.9,
+                "stability": 0.4,
+                "similarity_boost": 0.8,
+                "style": 0.1,
+                "use_speaker_boost": true
+            })
+        );
+        assert!(body.get("pitch").is_none());
+        assert!(body.get("delivery").is_none());
+        assert!(body.get("instruct").is_none());
+        assert!(body.get("options").is_none());
+        assert!(body.get("pause_before_ms").is_none());
+        assert!(body.get("pause_after_ms").is_none());
+
+        request.performance.delivery_cue = Some(crate::DeliveryCue::Shout);
+        assert!(provider.build_synthesis_request(&request).is_err());
+    }
+
+    #[test]
+    fn elevenlabs_rejects_untyped_or_model_unsupported_controls() {
+        let provider =
+            ElevenLabsProvider::with_endpoint(endpoint(), Arc::new(RecordingTransport::default()))
+                .unwrap();
+
+        let mut untyped = synthesis_request(None, AudioFormat::Mp3);
+        untyped.options.insert("stability".to_owned(), json!(0.5));
+        assert!(provider.build_synthesis_request(&untyped).is_err());
+
+        let mut pitch = synthesis_request(None, AudioFormat::Mp3);
+        pitch.performance.pitch = Some(1.1);
+        assert!(provider.build_synthesis_request(&pitch).is_err());
+
+        let mut unknown_model = synthesis_request(Some("eleven_v3"), AudioFormat::Mp3);
+        unknown_model.performance.speed = Some(1.0);
+        assert!(provider.build_synthesis_request(&unknown_model).is_err());
+    }
+
+    #[test]
+    fn mlx_maps_verified_controls_at_the_request_top_level() {
+        let model = "mlx-community/Kokoro-82M-bf16";
+        let provider = MlxAudioProvider::new(endpoint(), Arc::new(RecordingTransport::default()))
+            .unwrap()
+            .with_model_performance(vec![ModelPerformanceCapabilities {
+                model: model.to_owned(),
+                performance: PerformanceCapabilities {
+                    speed: Some(PerformanceRange::new(0.5, 2.0)),
+                    pitch: Some(PerformanceRange::new(0.5, 2.0)),
+                    delivery_cues: vec![crate::DeliveryCue::Whisper],
+                    ..PerformanceCapabilities::default()
+                },
+            }])
+            .unwrap();
+        let mut request = synthesis_request(Some(model), AudioFormat::Wav);
+        request.performance.speed = Some(1.1);
+        request.performance.pitch = Some(0.9);
+        request.performance.delivery_cue = Some(crate::DeliveryCue::Whisper);
+
+        let http = provider.build_synthesis_request(&request).unwrap();
+        let body: Value = serde_json::from_slice(&http.body).unwrap();
+        assert_eq!(body["speed"], 1.1);
+        assert_eq!(body["pitch"], 0.9);
+        assert_eq!(body["instruct"], "whisper");
+        assert!(body.get("options").is_none());
+        assert!(body.get("voice_settings").is_none());
+        assert!(body.get("performance").is_none());
+        assert!(body.get("pause_before_ms").is_none());
+        assert!(body.get("pause_after_ms").is_none());
+
+        request.performance.delivery_cue = Some(crate::DeliveryCue::Shout);
+        assert!(provider.build_synthesis_request(&request).is_err());
+    }
+
+    #[test]
+    fn mlx_requires_positive_exact_model_capabilities() {
+        let provider =
+            MlxAudioProvider::new(endpoint(), Arc::new(RecordingTransport::default())).unwrap();
+        let mut request = synthesis_request(Some("unverified-model"), AudioFormat::Wav);
+        request.performance.speed = Some(1.1);
+        assert!(provider.build_synthesis_request(&request).is_err());
+
+        let invalid_descriptor = ModelPerformanceCapabilities {
+            model: "model".to_owned(),
+            performance: PerformanceCapabilities {
+                stability: Some(PerformanceRange::new(0.0, 1.0)),
+                ..PerformanceCapabilities::default()
+            },
+        };
+        assert!(
+            MlxAudioProvider::new(endpoint(), Arc::new(RecordingTransport::default()))
+                .unwrap()
+                .with_model_performance(vec![invalid_descriptor])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn adapters_without_positive_capabilities_reject_performance() {
+        let local_ai =
+            LocalAiProvider::new(endpoint(), Arc::new(RecordingTransport::default())).unwrap();
+        let all_talk =
+            AllTalkProvider::new(endpoint(), Arc::new(RecordingTransport::default())).unwrap();
+        let mut request = synthesis_request(Some("model"), AudioFormat::Wav);
+        request.performance.speed = Some(1.1);
+        assert!(local_ai.build_synthesis_request(&request).is_err());
+        assert!(all_talk.build_synthesis_request(&request).is_err());
     }
 
     #[test]
@@ -900,6 +1171,7 @@ mod tests {
                     model: None,
                     voice: "af_sky".to_owned(),
                     format: AudioFormat::Wav,
+                    performance: Default::default(),
                     options: Default::default(),
                     pronunciation_dictionary_ids: Vec::new(),
                 },
@@ -921,5 +1193,20 @@ mod tests {
         assert_eq!(chunks[1].sequence, 1);
         assert!(chunks[1].data.is_empty());
         assert!(chunks[1].final_chunk);
+    }
+
+    #[tokio::test]
+    async fn successful_http_stream_interruption_is_an_uncertain_charge() {
+        let provider = LocalAiProvider::new(endpoint(), Arc::new(InterruptedStreamingTransport))
+            .expect("provider");
+        let error = provider
+            .synthesize_stream(
+                synthesis_request(None, AudioFormat::Wav),
+                CancellationFlag::default(),
+                Arc::new(RecordingChunkSink::default()),
+            )
+            .await
+            .expect_err("interrupted 2xx stream must fail");
+        assert!(matches!(error, ProviderError::UncertainCharge));
     }
 }

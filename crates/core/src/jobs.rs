@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ArtifactId, AttemptId, ChapterId, DomainError, ExportProfileId, FileFingerprint, JobId,
-    JobUnitId, Money, ProjectId, ProviderProfileId, ReservationId, SegmentId, Validate,
-    ValidationIssue,
+    JobUnitId, Money, PerformanceSettings, ProjectId, ProviderProfileId, ReservationId, SegmentId,
+    Validate, ValidationIssue,
 };
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -77,7 +77,9 @@ pub enum JobKind {
     CharacterDetection,
     Preview,
     Conversion,
+    SegmentRegeneration,
     Export,
+    QualityControl,
     CacheCleanup,
 }
 
@@ -198,6 +200,7 @@ pub enum JobUnitKind {
     MusicMix,
     Normalization,
     FinalExport,
+    QualityControl,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -317,6 +320,8 @@ pub struct CacheManifest {
     pub provider_version: Option<String>,
     pub model: Option<String>,
     pub voice_fingerprint: String,
+    #[serde(default, skip_serializing_if = "PerformanceSettings::is_empty")]
+    pub performance: PerformanceSettings,
     pub settings_hash: String,
     pub dictionary_revision_hash: String,
     pub normalization_version: String,

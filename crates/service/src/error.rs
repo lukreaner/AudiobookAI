@@ -26,6 +26,12 @@ pub enum ServiceError {
     NotFound,
     #[error("resource conflict: {0}")]
     Conflict(String),
+    #[error("resource conflict ({code}): {detail}")]
+    ConflictDetails {
+        code: &'static str,
+        detail: String,
+        meta: serde_json::Value,
+    },
     #[error("authentication required: {0}")]
     Unauthorized(String),
     #[error("request forbidden: {0}")]
@@ -45,52 +51,78 @@ pub struct ProblemDetails {
     pub title: &'static str,
     pub status: u16,
     pub detail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub meta: Option<serde_json::Value>,
 }
 
 impl IntoResponse for ServiceError {
     fn into_response(self) -> Response {
-        let (status, kind, title, detail) = match self {
+        let (status, kind, title, detail, code, meta) = match self {
             Self::InvalidRequest(detail) => (
                 StatusCode::BAD_REQUEST,
                 "urn:audiobookai:problem:invalid-request",
                 "Invalid request",
                 detail,
+                None,
+                None,
             ),
             Self::NotFound => (
                 StatusCode::NOT_FOUND,
                 "urn:audiobookai:problem:not-found",
                 "Not found",
                 self.to_string(),
+                None,
+                None,
             ),
             Self::Conflict(detail) => (
                 StatusCode::CONFLICT,
                 "urn:audiobookai:problem:conflict",
                 "Conflict",
                 detail,
+                None,
+                None,
+            ),
+            Self::ConflictDetails { code, detail, meta } => (
+                StatusCode::CONFLICT,
+                "urn:audiobookai:problem:conflict",
+                "Conflict",
+                detail,
+                Some(code),
+                Some(meta),
             ),
             Self::Unauthorized(detail) => (
                 StatusCode::UNAUTHORIZED,
                 "urn:audiobookai:problem:unauthorized",
                 "Authentication required",
                 detail,
+                None,
+                None,
             ),
             Self::Forbidden(detail) => (
                 StatusCode::FORBIDDEN,
                 "urn:audiobookai:problem:forbidden",
                 "Forbidden",
                 detail,
+                None,
+                None,
             ),
             Self::RateLimited(detail) => (
                 StatusCode::TOO_MANY_REQUESTS,
                 "urn:audiobookai:problem:rate-limited",
                 "Too many requests",
                 detail,
+                None,
+                None,
             ),
             Self::TlsRequiredForLan(address) => (
                 StatusCode::PRECONDITION_FAILED,
                 "urn:audiobookai:problem:tls-required",
                 "TLS required",
                 format!("configure TLS before binding to {address}"),
+                None,
+                None,
             ),
             other => {
                 tracing::error!(diagnostic_code = "service.request.failed", error = %other, "service request failed");
@@ -99,6 +131,8 @@ impl IntoResponse for ServiceError {
                     "urn:audiobookai:problem:internal",
                     "Internal error",
                     "the operation could not be completed".to_owned(),
+                    None,
+                    None,
                 )
             }
         };
@@ -109,6 +143,8 @@ impl IntoResponse for ServiceError {
                 title,
                 status: status.as_u16(),
                 detail,
+                code,
+                meta,
             }),
         )
             .into_response()
