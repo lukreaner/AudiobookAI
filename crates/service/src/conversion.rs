@@ -6343,12 +6343,12 @@ async fn ensure_private_staging_file_path(
 }
 
 async fn sync_file(path: &Path) -> Result<(), ServiceError> {
-    tokio::fs::OpenOptions::new()
-        .read(true)
-        .open(path)
-        .await?
-        .sync_all()
-        .await?;
+    let mut options = tokio::fs::OpenOptions::new();
+    #[cfg(windows)]
+    options.write(true);
+    #[cfg(not(windows))]
+    options.read(true);
+    options.open(path).await?.sync_all().await?;
     Ok(())
 }
 
@@ -9778,6 +9778,19 @@ mod tests {
         );
         assert_eq!(tokio::fs::read(&foreign).await.unwrap(), b"foreign data");
         assert!(!final_output.join("01-first.m4b").exists());
+    }
+
+    #[tokio::test]
+    async fn durable_file_sync_uses_platform_compatible_access() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("completed-output.m4b");
+        tokio::fs::write(&path, b"complete output")
+            .await
+            .expect("completed output");
+
+        sync_file(&path).await.expect("durable file sync");
+
+        assert_eq!(tokio::fs::read(path).await.unwrap(), b"complete output");
     }
 
     #[tokio::test]

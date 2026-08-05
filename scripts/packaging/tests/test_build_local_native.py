@@ -13,6 +13,27 @@ from unittest import mock
 from scripts.packaging import build_local_native as local
 
 
+def write_managed_snapshot(path: Path, target: str, build_id: str, payload: bytes) -> None:
+    path.mkdir(parents=True)
+    executable = path / "AudiobookAI"
+    executable.write_bytes(payload)
+    manifest = {
+        "artifacts": [{"file": executable.name}],
+        "buildId": build_id,
+        "checksumFile": "SHA256SUMS",
+        "immutableDirectory": f"builds/{target}/{build_id}",
+        "productName": "AudiobookAI",
+        "target": target,
+    }
+    manifest_path = path / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    (path / "SHA256SUMS").write_text(
+        f"{local.sha256_file(executable)}  {executable.name}\n"
+        f"{local.sha256_file(manifest_path)}  {manifest_path.name}\n",
+        encoding="utf-8",
+    )
+
+
 class LocalNativePackagingTests(unittest.TestCase):
     def test_frontend_install_is_frozen(self) -> None:
         with mock.patch.object(local, "run_visible") as run:
@@ -143,6 +164,129 @@ class LocalNativePackagingTests(unittest.TestCase):
             self.assertEqual((current / "AudiobookAI").read_bytes(), b"new executable")
             self.assertEqual((current / "keep.txt").read_bytes(), b"unmanaged")
             self.assertEqual((current / "CURRENT").read_text(encoding="utf-8"), "new-build\n")
+
+    def test_snapshot_pruning_keeps_only_the_active_target_build(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = "aarch64-apple-darwin"
+            snapshot_parent = root / "artifacts" / "local-native" / "builds" / target
+            active = snapshot_parent / "active-build"
+            stale = snapshot_parent / "stale-build"
+            write_managed_snapshot(active, target, active.name, b"current")
+            write_managed_snapshot(stale, target, stale.name, b"stale")
+            other_target = (
+                root
+                / "artifacts"
+                / "local-native"
+                / "builds"
+                / "x86_64-pc-windows-msvc"
+                / "windows-build"
+            )
+            write_managed_snapshot(
+                other_target, "x86_64-pc-windows-msvc", other_target.name, b"windows"
+            )
+
+            local.prune_superseded_snapshots(snapshot_parent, target, active.name)
+
+            self.assertTrue(active.is_dir())
+            self.assertFalse(stale.exists())
+            self.assertTrue(other_target.is_dir())
+
+    def test_snapshot_pruning_rejects_unmanaged_entries_before_deleting(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            target = "aarch64-apple-darwin"
+            snapshot_parent = Path(temporary) / "builds" / target
+            active = snapshot_parent / "active-build"
+            stale = snapshot_parent / "stale-build"
+            write_managed_snapshot(active, target, active.name, b"current")
+            write_managed_snapshot(stale, target, stale.name, b"stale")
+            unmanaged = snapshot_parent / "unmanaged-notes"
+            unmanaged.mkdir()
+            (unmanaged / "README.txt").write_text("keep me", encoding="utf-8")
+
+            with self.assertRaises(local.LocalPackageError):
+                local.prune_superseded_snapshots(snapshot_parent, target, active.name)
+
+            self.assertTrue(active.is_dir())
+            self.assertTrue(stale.is_dir())
+            self.assertTrue(unmanaged.is_dir())
+
+    def test_snapshot_pruning_requires_a_valid_active_build(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            target = "aarch64-apple-darwin"
+            snapshot_parent = Path(temporary) / "builds" / target
+            stale = snapshot_parent / "stale-build"
+            write_managed_snapshot(stale, target, stale.name, b"stale")
+
+            with self.assertRaises(local.LocalPackageError):
+                local.prune_superseded_snapshots(
+                    snapshot_parent, target, "missing-active-build"
+                )
+
+            self.assertTrue(stale.is_dir())
+
+    def test_snapshot_pruning_rejects_incomplete_checksum_coverage(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            target = "aarch64-apple-darwin"
+            snapshot_parent = Path(temporary) / "builds" / target
+            active = snapshot_parent / "active-build"
+            stale = snapshot_parent / "stale-build"
+            write_managed_snapshot(active, target, active.name, b"current")
+            write_managed_snapshot(stale, target, stale.name, b"stale")
+            manifest = stale / "manifest.json"
+            (stale / "SHA256SUMS").write_text(
+                f"{local.sha256_file(manifest)}  {manifest.name}\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(local.LocalPackageError):
+                local.prune_superseded_snapshots(snapshot_parent, target, active.name)
+
+            self.assertTrue(active.is_dir())
+            self.assertTrue(stale.is_dir())
+
+    def test_snapshot_pruning_happens_only_after_current_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output_root = root / "artifacts" / "local-native"
+            target = "aarch64-apple-darwin"
+            stale = output_root / "builds" / target / "stale-build"
+            write_managed_snapshot(stale, target, stale.name, b"stale")
+            staging = root / "staging"
+            write_managed_snapshot(staging, target, "new-build", b"current")
+
+            with (
+                mock.patch.object(local, "REPOSITORY", root),
+                mock.patch.object(local, "OUTPUT_ROOT", output_root),
+                mock.patch.object(
+                    local,
+                    "verify_checksums",
+                    side_effect=[None, local.LocalPackageError("invalid current")],
+                ),
+                self.assertRaises(local.LocalPackageError),
+            ):
+                local.publish_snapshot(staging, target, "new-build")
+
+            self.assertTrue(stale.is_dir())
+
+    def test_publication_lock_rejects_a_concurrent_target_publisher(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output_root = root / "artifacts" / "local-native"
+            target = "aarch64-apple-darwin"
+
+            with (
+                mock.patch.object(local, "REPOSITORY", root),
+                mock.patch.object(local, "OUTPUT_ROOT", output_root),
+                local.target_publication_lock(target),
+            ):
+                lock = output_root / ".publish-locks" / target
+                self.assertTrue(lock.is_dir())
+                with self.assertRaises(local.LocalPackageError):
+                    with local.target_publication_lock(target):
+                        self.fail("a concurrent publisher acquired the same target lock")
+
+            self.assertFalse(lock.exists())
 
 
 if __name__ == "__main__":

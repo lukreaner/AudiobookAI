@@ -76,9 +76,11 @@ jobs:
       - name: Install locked frontend dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Validate release scripts and unresolved sidecar schema
+      - name: Validate Python scripts and unresolved sidecar schema
         run: |
+          python -m compileall -q scripts/packaging
           python -m compileall -q scripts/release
+          python -m unittest discover -s scripts/packaging/tests
           python -m unittest discover -s scripts/release/tests
           python -m unittest scripts/security/test_check_no_secrets.py
           python scripts/security/check_no_secrets.py --current --history

@@ -67,8 +67,10 @@ make native-local
 The command uses the locked Rust and pnpm dependency graph, builds the embedded
 dashboard and an optimized debug Tauri host, and publishes a stable current view under
 `artifacts/local-native/current/<rust-host-target>/`. That directory contains
-the executable, a host package, `manifest.json`, and `SHA256SUMS`; immutable
-content-addressed snapshots remain under `artifacts/local-native/builds/`.
+the executable, a host package, `manifest.json`, and `SHA256SUMS`. Its matching
+content-addressed snapshot remains under `artifacts/local-native/builds/`; older
+snapshots for that host are pruned only after the new snapshot and current view
+both pass checksum verification.
 These local artifacts are for development and deliberately use no release
 identity, so they do not satisfy the public release procedure. On Apple Silicon,
 the linker can still apply an ad-hoc Mach-O signature; that is not project

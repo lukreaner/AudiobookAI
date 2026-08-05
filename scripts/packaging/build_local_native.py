@@ -16,8 +16,9 @@ import sys
 import tarfile
 import tempfile
 import tomllib
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import BinaryIO, Iterable
+from typing import BinaryIO, Iterable, Iterator
 import uuid
 
 
@@ -523,7 +524,92 @@ def verify_checksums(directory: Path) -> None:
             raise LocalPackageError(f"checksum verification failed: {directory / name}")
 
 
-def publish_snapshot(staging: Path, target: str, build_id: str) -> tuple[Path, Path]:
+def require_managed_snapshot(snapshot: Path, target: str) -> None:
+    try:
+        metadata = snapshot.lstat()
+    except FileNotFoundError as error:
+        raise LocalPackageError(f"local build snapshot is missing: {snapshot}") from error
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise LocalPackageError(f"local build snapshot is unsafe: {snapshot}")
+    entries = list(snapshot.iterdir())
+    if any(
+        stat.S_ISLNK(entry.lstat().st_mode) or not stat.S_ISREG(entry.lstat().st_mode)
+        for entry in entries
+    ):
+        raise LocalPackageError(f"local build snapshot contains an unsafe entry: {snapshot}")
+    manifest_path = snapshot / "manifest.json"
+    require_regular_file(manifest_path, "local build manifest")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise LocalPackageError(f"local build manifest is invalid: {manifest_path}") from error
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, list) or not all(
+        isinstance(artifact, dict) and isinstance(artifact.get("file"), str)
+        for artifact in artifacts
+    ):
+        raise LocalPackageError(f"local build manifest has invalid artifacts: {manifest_path}")
+    artifact_names = [artifact["file"] for artifact in artifacts]
+    checksum_lines = (snapshot / "SHA256SUMS").read_text(encoding="utf-8").splitlines()
+    checksum_names = []
+    for line in checksum_lines:
+        digest, separator, name = line.partition("  ")
+        if separator != "  " or len(digest) != 64 or Path(name).name != name:
+            raise LocalPackageError(f"invalid checksum entry: {line}")
+        checksum_names.append(name)
+    if (
+        manifest.get("productName") != "AudiobookAI"
+        or manifest.get("target") != target
+        or manifest.get("buildId") != snapshot.name
+        or manifest.get("immutableDirectory")
+        != (Path("builds") / target / snapshot.name).as_posix()
+        or manifest.get("checksumFile") != "SHA256SUMS"
+        or any(Path(name).name != name for name in artifact_names)
+        or len(set(artifact_names)) != len(artifact_names)
+        or {entry.name for entry in entries}
+        != {*artifact_names, "manifest.json", "SHA256SUMS"}
+        or len(checksum_names) != len(set(checksum_names))
+        or set(checksum_names) != {*artifact_names, "manifest.json"}
+    ):
+        raise LocalPackageError(f"refusing to prune unrecognized local build: {snapshot}")
+    verify_checksums(snapshot)
+
+
+def prune_superseded_snapshots(snapshot_parent: Path, target: str, active_build_id: str) -> None:
+    require_managed_snapshot(snapshot_parent / active_build_id, target)
+    superseded = sorted(
+        (snapshot for snapshot in snapshot_parent.iterdir() if snapshot.name != active_build_id),
+        key=lambda path: path.name,
+    )
+    for snapshot in superseded:
+        require_managed_snapshot(snapshot, target)
+    for snapshot in superseded:
+        shutil.rmtree(snapshot)
+
+
+@contextmanager
+def target_publication_lock(target: str) -> Iterator[None]:
+    lock_root = OUTPUT_ROOT / ".publish-locks"
+    ensure_real_directory(lock_root, base=REPOSITORY)
+    lock = lock_root / target
+    try:
+        lock.mkdir(mode=0o700)
+    except FileExistsError as error:
+        raise LocalPackageError(
+            f"another local publication is active or left a stale lock: {lock}"
+        ) from error
+    try:
+        yield
+    finally:
+        try:
+            lock.rmdir()
+        except FileNotFoundError as error:
+            raise LocalPackageError(f"local publication lock disappeared: {lock}") from error
+        except OSError as error:
+            raise LocalPackageError(f"could not release local publication lock: {lock}") from error
+
+
+def publish_snapshot_locked(staging: Path, target: str, build_id: str) -> tuple[Path, Path]:
     snapshot_parent = OUTPUT_ROOT / "builds" / target
     ensure_real_directory(snapshot_parent, base=REPOSITORY)
     snapshot = snapshot_parent / build_id
@@ -542,7 +628,13 @@ def publish_snapshot(staging: Path, target: str, build_id: str) -> tuple[Path, P
     publish_current(snapshot, current, build_id)
     verify_checksums(snapshot)
     verify_checksums(current)
+    prune_superseded_snapshots(snapshot_parent, target, build_id)
     return snapshot, current
+
+
+def publish_snapshot(staging: Path, target: str, build_id: str) -> tuple[Path, Path]:
+    with target_publication_lock(target):
+        return publish_snapshot_locked(staging, target, build_id)
 
 
 def main() -> int:

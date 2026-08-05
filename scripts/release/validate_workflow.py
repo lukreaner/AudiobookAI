@@ -265,6 +265,10 @@ def validate_snapshot(text: str) -> None:
     upload = publish.find('gh release upload "${SNAPSHOT_TAG}"')
     verify = publish.find("scripts/release/verify_release_upload.py")
     make_public = publish.find('gh release edit "${SNAPSHOT_TAG}" --draft=false')
+    prune = publish.find("Prune superseded workflow-owned snapshots after successful publication")
+    list_owned = publish.find('startswith("development-snapshot-")')
+    keep_current = publish.find('if test "${tag}" != "${SNAPSHOT_TAG}"')
+    delete_owned = publish.find('gh release delete "${tag}" --cleanup-tag --yes')
     if checkout < 0 or download < 0 or checkout > download:
         raise WorkflowPolicyError(
             "snapshot publish must check out the immutable scanner before candidate download"
@@ -280,6 +284,12 @@ def validate_snapshot(text: str) -> None:
         raise WorkflowPolicyError("snapshot release must begin as a development prerelease draft")
     if "snapshot/dist/*" in create_step:
         raise WorkflowPolicyError("snapshot assets must not be attached during release creation")
+    if min(prune, list_owned, keep_current, delete_owned) < 0 or not (
+        make_public < prune < list_owned < keep_current < delete_owned
+    ):
+        raise WorkflowPolicyError(
+            "snapshot publication must prune only superseded workflow-owned releases afterward"
+        )
     if "DEVELOPMENT-BUILD.txt" not in text or "development-snapshot-" not in text:
         raise WorkflowPolicyError("snapshot artifacts and tag must be clearly development-labelled")
 

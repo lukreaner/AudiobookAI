@@ -630,6 +630,18 @@ struct ImportFromPathInput {
     source_path: std::path::PathBuf,
 }
 
+async fn copy_file_durably(source: &FilePath, destination: &FilePath) -> Result<(), ServiceError> {
+    let mut source_file = tokio::fs::File::open(source).await?;
+    let mut destination_file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)
+        .await?;
+    tokio::io::copy(&mut source_file, &mut destination_file).await?;
+    destination_file.sync_all().await?;
+    Ok(())
+}
+
 async fn create_import_draft_from_path(
     State(state): State<Arc<AppState>>,
     Json(input): Json<ImportFromPathInput>,
@@ -669,11 +681,7 @@ async fn create_import_draft_from_path(
     let import_dir = state.config.data_dir.join("imports");
     tokio::fs::create_dir_all(&import_dir).await?;
     let destination = import_dir.join(format!("{draft_id}.epub"));
-    tokio::fs::copy(&source, &destination).await?;
-    tokio::fs::File::open(&destination)
-        .await?
-        .sync_all()
-        .await?;
+    copy_file_durably(&source, &destination).await?;
     let source_name = source
         .file_name()
         .and_then(std::ffi::OsStr::to_str)
@@ -7934,6 +7942,35 @@ fn json_f32(value: &serde_json::Value, key: &str) -> Result<f32, ServiceError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn durable_copy_does_not_inherit_read_only_source_permissions() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let source = directory.path().join("source.epub");
+        let destination = directory.path().join("import.epub");
+        tokio::fs::write(&source, b"epub bytes").await.unwrap();
+        let original_permissions = tokio::fs::metadata(&source).await.unwrap().permissions();
+        let mut read_only_permissions = original_permissions.clone();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            read_only_permissions.set_mode(read_only_permissions.mode() & !0o222);
+        }
+        #[cfg(windows)]
+        read_only_permissions.set_readonly(true);
+        tokio::fs::set_permissions(&source, read_only_permissions)
+            .await
+            .unwrap();
+
+        copy_file_durably(&source, &destination)
+            .await
+            .expect("durable copy");
+
+        assert_eq!(tokio::fs::read(destination).await.unwrap(), b"epub bytes");
+        tokio::fs::set_permissions(source, original_permissions)
+            .await
+            .unwrap();
+    }
 
     fn billable_tts_provider_fixture() -> ProviderProfileView {
         ProviderProfileView {

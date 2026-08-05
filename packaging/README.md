@@ -11,13 +11,17 @@ locking and release-identity signing disabled, then publishes only generated fil
   successful build. It contains the native executable, the host package,
   `manifest.json`, `SHA256SUMS`, and a `CURRENT` build identifier.
 - `builds/<rust-host-target>/<build-id>/` is the immutable snapshot referenced
-  by the manifest. Prior snapshots are retained rather than removed.
+  by the manifest. After the new snapshot and current view both pass checksum
+  verification, earlier recognized snapshots for that host are pruned. Unsafe
+  or unrecognized entries fail closed and are never deleted.
 
 The build ID incorporates the current tracked diff, relevant untracked build
 inputs, and the produced artifact hashes. The script rechecks that source state
 after Tauri exits, normalizes macOS app-archive metadata, writes sorted JSON and
-checksums, and verifies both the immutable and current copies before reporting
-success. On macOS, extract `AudiobookAI.app.tar.gz` to recover the development app
+checksums, and holds a per-target publication lock while it publishes, verifies,
+and prunes. A concurrent publication or stale lock fails closed. The script
+verifies both the immutable and current copies before reporting success. On
+macOS, extract `AudiobookAI.app.tar.gz` to recover the development app
 bundle, or run the standalone `AudiobookAI` executable directly. Apple Silicon's
 linker may apply an ad-hoc signature to the Mach-O executable even with Tauri
 signing disabled; the manifest records that possibility without treating it as

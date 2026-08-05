@@ -178,6 +178,24 @@ class SnapshotWorkflowPolicyTests(unittest.TestCase):
         with self.assertRaises(WorkflowPolicyError):
             validate_snapshot(unsafe)
 
+    def test_rejects_snapshot_without_post_publication_pruning(self) -> None:
+        unsafe = self.workflow.replace(
+            'gh release delete "${tag}" --cleanup-tag --yes',
+            'echo "leaving superseded snapshot ${tag}"',
+            1,
+        )
+        with self.assertRaises(WorkflowPolicyError):
+            validate_snapshot(unsafe)
+
+    def test_rejects_snapshot_pruning_without_preserving_the_current_release(self) -> None:
+        unsafe = self.workflow.replace(
+            'if test "${tag}" != "${SNAPSHOT_TAG}"; then',
+            "if true; then",
+            1,
+        )
+        with self.assertRaises(WorkflowPolicyError):
+            validate_snapshot(unsafe)
+
 
 if __name__ == "__main__":
     unittest.main()
