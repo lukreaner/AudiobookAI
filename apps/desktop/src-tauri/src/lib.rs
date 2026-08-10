@@ -132,6 +132,17 @@ fn desktop_service_authority(service: &ServiceHandle) -> String {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn configure_appimage_renderer(window: &tauri::WebviewWindow) -> tauri::Result<()> {
+    use webkit2gtk::{HardwareAccelerationPolicy, SettingsExt, WebViewExt};
+
+    window.with_webview(|webview| {
+        if let Some(settings) = webview.inner().settings() {
+            settings.set_hardware_acceleration_policy(HardwareAccelerationPolicy::Never);
+        }
+    })
+}
+
 /// Starts the native desktop host and its in-process service.
 ///
 /// # Panics
@@ -215,17 +226,40 @@ pub fn run() {
             let initialization_script = format!(
                 "window.__AUDIOBOOKAI_API__ = {origin:?}; window.__AUDIOBOOKAI_BOOTSTRAP__ = {bootstrap_javascript}; window.__AUDIOBOOKAI_OPEN_EPUB__ = {initial_epub_javascript};",
             );
-            WebviewWindowBuilder::new(
+            let origin_url: tauri::Url = origin.parse()?;
+            #[cfg(target_os = "linux")]
+            let use_software_renderer = std::env::var_os("APPIMAGE").is_some();
+            #[cfg(not(target_os = "linux"))]
+            let use_software_renderer = false;
+            let initial_url = if use_software_renderer {
+                WebviewUrl::External("about:blank".parse()?)
+            } else {
+                WebviewUrl::External(origin_url.clone())
+            };
+            let main_window = WebviewWindowBuilder::new(
                 app,
                 "main",
-                WebviewUrl::External(origin.parse()?),
+                initial_url,
             )
                 .title("AudiobookAI")
                 .inner_size(1280.0, 820.0)
                 .min_inner_size(920.0, 640.0)
                 .resizable(true)
+                .visible(!use_software_renderer)
                 .initialization_script(&initialization_script)
                 .build()?;
+            #[cfg(target_os = "linux")]
+            if use_software_renderer {
+                configure_appimage_renderer(&main_window)?;
+                main_window.navigate(origin_url)?;
+                main_window.show()?;
+                tracing::info!(
+                    diagnostic_code = "desktop.renderer.software",
+                    "using software rendering for Linux AppImage compatibility"
+                );
+            }
+            #[cfg(not(target_os = "linux"))]
+            let _ = main_window;
             create_tray(app.handle())?;
             Ok(())
         })

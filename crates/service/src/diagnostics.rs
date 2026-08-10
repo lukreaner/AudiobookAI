@@ -42,6 +42,7 @@ const SAFE_MESSAGES: &[&str] = &[
     "opened AudiobookAI database",
     "created pre-migration database backup",
     "desktop service did not shut down cleanly",
+    "using software rendering for Linux AppImage compatibility",
     "persisted LAN settings were rejected; using loopback-only recovery mode",
     "persisted LAN listener failed to start; using loopback-only recovery mode",
     "some owned provider children did not stop cleanly",
@@ -86,6 +87,10 @@ const SAFE_EVENT_CODES: &[(&str, &str)] = &[
     (
         "desktop.service.shutdown.failed",
         "desktop service did not shut down cleanly",
+    ),
+    (
+        "desktop.renderer.software",
+        "using software rendering for Linux AppImage compatibility",
     ),
     (
         "desktop.lan.settings.rejected",

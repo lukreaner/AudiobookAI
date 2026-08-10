@@ -250,6 +250,11 @@ def build_native(target: str, source_date_epoch: int) -> Path:
     environment["CARGO_PROFILE_DEV_DEBUG"] = "0"
     environment["CARGO_PROFILE_DEV_OPT_LEVEL"] = "1"
     environment["CARGO_PROFILE_DEV_STRIP"] = "symbols"
+    if target.endswith("-unknown-linux-gnu"):
+        # linuxdeploy's bundled strip is not reliable against rolling-release
+        # ELF inputs. Cargo already strips the host above, so preserve copied
+        # runtime libraries exactly as installed on the build machine.
+        environment["NO_STRIP"] = "1"
     command = [
         PNPM,
         "--dir",

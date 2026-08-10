@@ -70,6 +70,22 @@ class LocalNativePackagingTests(unittest.TestCase):
             target_root / "aarch64-apple-darwin" / "debug",
         )
 
+    def test_linux_native_build_preserves_runtime_libraries(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            tauri = root / "web" / "node_modules" / ".bin" / "tauri"
+            tauri.parent.mkdir(parents=True)
+            tauri.write_bytes(b"tauri")
+            with (
+                mock.patch.object(local, "REPOSITORY", root),
+                mock.patch.object(local, "CARGO_TARGET_ROOT", root / "target"),
+                mock.patch.object(local, "run_visible") as run,
+            ):
+                local.build_native("x86_64-unknown-linux-gnu", 1_700_000_000)
+
+        _command, environment = run.call_args.args
+        self.assertEqual(environment["NO_STRIP"], "1")
+
     def test_macos_archive_is_deterministic_and_keeps_the_executable_mode(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

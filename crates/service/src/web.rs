@@ -71,3 +71,65 @@ fn response_for(path: &str, immutable: bool) -> Response<Body> {
         .body(Body::from(asset.data))
         .expect("valid embedded asset response")
 }
+
+#[cfg(all(test, feature = "embedded-dashboard"))]
+mod tests {
+    use axum::{
+        body::to_bytes,
+        http::{Request, header},
+    };
+    use tower::ServiceExt;
+
+    use super::*;
+
+    const DASHBOARD_RESPONSE_LIMIT: usize = 16 * 1024 * 1024;
+
+    async fn request(path: &str) -> Response<Body> {
+        router()
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .body(Body::empty())
+                    .expect("valid dashboard request"),
+            )
+            .await
+            .expect("dashboard router response")
+    }
+
+    #[tokio::test]
+    async fn embedded_dashboard_serves_entrypoint_and_referenced_asset() {
+        let root = request("/").await;
+        assert_eq!(root.status(), StatusCode::OK);
+        assert_eq!(root.headers()[header::CACHE_CONTROL], "no-cache");
+        assert_eq!(root.headers()[header::CONTENT_TYPE], "text/html");
+        let root_body = to_bytes(root.into_body(), DASHBOARD_RESPONSE_LIMIT)
+            .await
+            .expect("dashboard root body");
+        assert!(!root_body.is_empty());
+
+        let explicit_index = request("/index.html").await;
+        assert_eq!(explicit_index.status(), StatusCode::OK);
+        let explicit_index_body = to_bytes(explicit_index.into_body(), DASHBOARD_RESPONSE_LIMIT)
+            .await
+            .expect("explicit dashboard index body");
+        assert_eq!(explicit_index_body, root_body);
+
+        let html = std::str::from_utf8(&root_body).expect("UTF-8 dashboard index");
+        let referenced_asset = html
+            .split('"')
+            .find(|value| {
+                value.starts_with("/assets/") && (value.ends_with(".js") || value.ends_with(".css"))
+            })
+            .expect("dashboard index must reference a compiled asset");
+        let asset = request(referenced_asset).await;
+        assert_eq!(asset.status(), StatusCode::OK);
+        assert_eq!(
+            asset.headers()[header::CACHE_CONTROL],
+            "public, max-age=31536000, immutable"
+        );
+        let asset_body = to_bytes(asset.into_body(), DASHBOARD_RESPONSE_LIMIT)
+            .await
+            .expect("referenced dashboard asset body");
+        assert!(!asset_body.is_empty());
+    }
+}
