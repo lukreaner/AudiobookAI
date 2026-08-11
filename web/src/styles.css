@@ -365,7 +365,7 @@ a { color: inherit; text-decoration: none; }
   overflow: auto;
   overscroll-behavior: contain;
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: center;
   background: rgb(var(--panel));
   border: 1px solid rgb(var(--line));
@@ -374,7 +374,7 @@ a { color: inherit; text-decoration: none; }
   padding: 1.25rem clamp(1rem, 4.5vw, 4rem);
   padding: clamp(1rem, 4dvh, 4rem) clamp(1rem, 4.5vw, 4rem);
 }
-.setup-intro { width: min(100%, 640px); text-align: center; display: flex; flex-direction: column; align-items: center; }
+.setup-intro { width: min(100%, 640px); margin-block: auto; text-align: center; display: flex; flex-direction: column; align-items: center; }
 .setup-hero-icon { width: 68px; height: 68px; display: grid; place-items: center; border-radius: 20px; color: rgb(var(--accent)); background: rgb(var(--accent-soft)); margin-bottom: 1.2rem; }
 .setup-intro h1 { margin: 0; max-width: 590px; font: 720 clamp(1.8rem, 4vw, 2.8rem)/1.08 Manrope, sans-serif; letter-spacing: -.052em; }
 .setup-intro > p { max-width: 590px; color: rgb(var(--muted)); font-size: .85rem; line-height: 1.6; margin: .8rem 0 0; }

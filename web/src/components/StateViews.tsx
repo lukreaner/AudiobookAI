@@ -53,7 +53,7 @@ export function ErrorState({ error, onRetry }: { error: unknown; onRetry?: () =>
       ? t("errors.forbiddenDetail")
       : notFound
         ? t("errors.notFoundDetail")
-        : apiError?.problem.detail || (error instanceof Error ? error.message : t("common.unknown"));
+        : apiError?.problem.detail || errorDetail(error, t("common.unknown"));
   return (
     <Card className="error-state" role="alert">
       <div className="error-icon"><AlertCircle size={22} /></div>
@@ -65,4 +65,10 @@ export function ErrorState({ error, onRetry }: { error: unknown; onRetry?: () =>
       {onRetry ? <Button variant="secondary" onClick={onRetry}><RotateCw size={16} />{t("errors.retry")}</Button> : null}
     </Card>
   );
+}
+
+function errorDetail(error: unknown, fallback: string): string {
+  if (error instanceof Error && error.message.trim()) return error.message;
+  if (typeof error === "string" && error.trim()) return error;
+  return fallback;
 }

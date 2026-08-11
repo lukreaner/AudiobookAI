@@ -124,6 +124,17 @@ async fn relocate_first_run_storage(
     let original_config = app_state.config.clone();
     drop(app_state);
 
+    let source = original_config.data_dir.clone();
+    let requested_data_root = data_root.clone();
+    let relocation_needed = tauri::async_runtime::spawn_blocking(move || {
+        storage_location::validate_relocation_target(&source, &requested_data_root)
+    })
+    .await
+    .map_err(|error| format!("the storage preflight task failed: {error}"))??;
+    if !relocation_needed {
+        return Ok(());
+    }
+
     let service = state
         .service
         .lock()

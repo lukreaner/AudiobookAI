@@ -152,4 +152,21 @@ describe("first-run setup", () => {
     expect(screen.queryByRole("button", { name: "Browse…" })).not.toBeInTheDocument();
     expect(screen.getByText("Storage can only be changed from the AudiobookAI desktop app.")).toBeInTheDocument();
   });
+
+  it("shows a storage preflight error returned as a Tauri string", async () => {
+    const user = userEvent.setup();
+    tauri.invoke.mockRejectedValueOnce("the new storage folder must be empty");
+    renderSetup();
+
+    await user.click(await screen.findByRole("button", { name: "Set up AudiobookAI" }));
+    await user.click(screen.getByRole("button", { name: "Continue" }));
+    await user.click(screen.getByRole("button", { name: "Continue" }));
+    const storageRoot = screen.getByLabelText("AudiobookAI data folder");
+    await user.clear(storageRoot);
+    await user.type(storageRoot, "/occupied");
+    await user.click(screen.getByRole("button", { name: "Continue" }));
+
+    expect(await screen.findByText("the new storage folder must be empty")).toBeInTheDocument();
+    expect(screen.queryByText("Unknown")).not.toBeInTheDocument();
+  });
 });
