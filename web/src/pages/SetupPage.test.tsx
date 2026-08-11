@@ -8,6 +8,12 @@ import type { AppSettings } from "../api/types";
 import i18n from "../i18n";
 import { SetupPage } from "./SetupPage";
 
+const tauri = vi.hoisted(() => ({
+  invoke: vi.fn(),
+  isTauri: vi.fn(() => true),
+}));
+vi.mock("@tauri-apps/api/core", () => tauri);
+
 const lockedSettings: AppSettings = {
   language: "en",
   theme: "system",
@@ -53,12 +59,15 @@ function renderSetup() {
 
 beforeEach(async () => {
   vi.restoreAllMocks();
+  tauri.invoke.mockReset();
+  tauri.invoke.mockResolvedValue(undefined);
+  tauri.isTauri.mockReturnValue(true);
   await i18n.changeLanguage("en");
   vi.spyOn(api, "settings").mockResolvedValue(structuredClone(lockedSettings));
   vi.spyOn(api, "unlockSecretStore").mockResolvedValue({ unlocked: true, backend: "passphrase" });
 });
 
-describe("first-run secret-store fallback", () => {
+describe("first-run setup", () => {
   it("clears an entered endpoint and credential when the provider choice changes", async () => {
     const user = userEvent.setup();
     renderSetup();
@@ -97,28 +106,50 @@ describe("first-run secret-store fallback", () => {
     expect(screen.getByRole("button", { name: "Continue" })).toBeEnabled();
   });
 
-  it("shows managed paths without submitting relocation edits", async () => {
+  it("chooses and applies a dedicated storage root before setup completes", async () => {
     const user = userEvent.setup();
     const readySettings = { ...structuredClone(lockedSettings), secretStore: "keychain" as const };
-    vi.mocked(api.settings).mockResolvedValue(readySettings);
+    const relocatedSettings = { ...readySettings, libraryPath: "/audiobooks/library", cachePath: "/audiobooks/cache" };
+    vi.mocked(api.settings).mockResolvedValueOnce(readySettings).mockResolvedValue(relocatedSettings);
     vi.spyOn(api, "updateSettings").mockResolvedValue(readySettings);
     vi.spyOn(api, "completeFirstRun").mockResolvedValue({ ...readySettings, firstRunComplete: true });
+    tauri.invoke.mockImplementation(async (command: string) => command === "choose_storage_directory" ? "/audiobooks" : undefined);
     renderSetup();
 
     await user.click(await screen.findByRole("button", { name: "Set up AudiobookAI" }));
     await user.click(screen.getByRole("button", { name: "Continue" }));
     await user.click(screen.getByRole("button", { name: "Continue" }));
 
-    expect(screen.getByLabelText(/^Managed library/)).toHaveValue("/data/library");
+    expect(screen.getByLabelText("AudiobookAI data folder")).toHaveValue("/data");
+    expect(screen.getByLabelText("AudiobookAI data folder")).not.toHaveAttribute("readonly");
     expect(screen.getByLabelText(/^Managed library/)).toHaveAttribute("readonly");
-    expect(screen.getByLabelText(/^Audio cache/)).toHaveValue("/data/cache");
     expect(screen.getByLabelText(/^Audio cache/)).toHaveAttribute("readonly");
 
+    await user.click(screen.getByRole("button", { name: "Browse…" }));
+    expect(screen.getByLabelText("AudiobookAI data folder")).toHaveValue("/audiobooks");
+    expect(screen.getByLabelText(/^Managed library/)).toHaveValue("/audiobooks/library");
+    expect(screen.getByLabelText(/^Audio cache/)).toHaveValue("/audiobooks/cache");
+
     await user.click(screen.getByRole("button", { name: "Continue" }));
+    await waitFor(() => expect(tauri.invoke).toHaveBeenCalledWith("relocate_first_run_storage", { dataRoot: "/audiobooks" }));
     await user.click(screen.getByRole("button", { name: "Continue" }));
     await user.click(screen.getByRole("button", { name: "Finish setup" }));
 
     await waitFor(() => expect(api.updateSettings).toHaveBeenCalledWith({ language: "en" }));
     expect(api.completeFirstRun).toHaveBeenCalled();
+  });
+
+  it("keeps storage read-only outside the desktop host", async () => {
+    const user = userEvent.setup();
+    tauri.isTauri.mockReturnValue(false);
+    renderSetup();
+
+    await user.click(await screen.findByRole("button", { name: "Set up AudiobookAI" }));
+    await user.click(screen.getByRole("button", { name: "Continue" }));
+    await user.click(screen.getByRole("button", { name: "Continue" }));
+
+    expect(screen.getByLabelText("AudiobookAI data folder")).toHaveAttribute("readonly");
+    expect(screen.queryByRole("button", { name: "Browse…" })).not.toBeInTheDocument();
+    expect(screen.getByText("Storage can only be changed from the AudiobookAI desktop app.")).toBeInTheDocument();
   });
 });

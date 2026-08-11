@@ -412,6 +412,8 @@ name = "audiobookai-desktop"
 version = "0.1.0"
 dependencies = [
  "audiobookai-service",
+ "blake3",
+ "serde",
  "serde_json",
  "tauri",
  "tauri-build",

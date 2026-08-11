@@ -54,12 +54,20 @@ its delivery files. Requirements that cannot be established mechanically stay
 visible as manual blockers; the service never treats an unverified attestation
 or an older report as current retailer readiness.
 
-The desktop installation's application-data directory is authoritative for the
-managed library and content cache. Their resolved paths are visible but
-read-only in setup and settings; copying settings from another machine cannot
-redirect existing data. A future relocation feature must checkpoint jobs, move
-and verify every managed artifact, and atomically switch the database and file
-roots before these paths can become editable.
+One desktop data root is authoritative for the database, managed library, and
+content cache. During first-run setup, before any project or job exists, the
+owner can select a dedicated empty root. The desktop host stops the local
+service, copies and hashes the complete setup tree, starts the service against
+the verified copy on the same authority, and only then atomically records the
+new root outside that tree. The original setup tree remains an owner-private
+rollback copy. Library and cache paths are derived from the active root rather
+than trusted from copied settings, so copying a database from another machine
+cannot redirect data.
+
+After setup, the root and its derived paths are read-only. A future relocation
+feature for an existing library must checkpoint jobs, move and verify every
+managed artifact, and atomically switch the database and file roots before it
+can be exposed in Settings.
 
 Application defaults are durable owner settings. Loudness and true-peak values
 are applied when a new export profile is created, while chapter concurrency and

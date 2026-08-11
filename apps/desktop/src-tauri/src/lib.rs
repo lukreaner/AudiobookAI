@@ -1,4 +1,5 @@
 use std::{
+    fmt::Write as _,
     path::{Path, PathBuf},
     sync::{
         Mutex,
@@ -6,17 +7,21 @@ use std::{
     },
 };
 
+mod storage_location;
+
 use audiobookai_service::{ServiceConfig, ServiceHandle};
 use tauri::{
     AppHandle, Emitter, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder,
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
 };
+use tauri_plugin_dialog::DialogExt as _;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Debug)]
 struct DesktopState {
     service: Mutex<Option<ServiceHandle>>,
+    storage_config_path: PathBuf,
     quitting: AtomicBool,
     close_to_tray: AtomicBool,
 }
@@ -47,6 +52,203 @@ fn installed_sidecar_directory(resource_dir: &Path) -> Option<PathBuf> {
 #[allow(clippy::needless_pass_by_value)]
 fn set_close_to_tray(state: tauri::State<'_, DesktopState>, enabled: bool) {
     state.close_to_tray.store(enabled, Ordering::SeqCst);
+}
+
+#[tauri::command]
+async fn choose_storage_directory(
+    app: AppHandle,
+    starting_directory: Option<String>,
+) -> Result<Option<String>, String> {
+    let mut dialog = app
+        .dialog()
+        .file()
+        .set_title("Choose AudiobookAI storage folder")
+        .set_can_create_directories(true);
+    if let Some(directory) = starting_directory
+        .map(PathBuf::from)
+        .filter(|directory| directory.is_dir())
+    {
+        dialog = dialog.set_directory(directory);
+    }
+    let selected = tauri::async_runtime::spawn_blocking(move || dialog.blocking_pick_folder())
+        .await
+        .map_err(|error| format!("the storage-folder dialog failed: {error}"))?;
+    let Some(selected) = selected else {
+        return Ok(None);
+    };
+    let selected = selected
+        .into_path()
+        .map_err(|error| format!("the selected storage folder is invalid: {error}"))?;
+    selected
+        .into_os_string()
+        .into_string()
+        .map(Some)
+        .map_err(|_| "the selected storage folder is not valid Unicode".to_owned())
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_lines)]
+async fn relocate_first_run_storage(
+    state: tauri::State<'_, DesktopState>,
+    data_root: String,
+) -> Result<(), String> {
+    let app_state = {
+        let service = state
+            .service
+            .lock()
+            .map_err(|_| "the desktop service state is unavailable".to_owned())?;
+        service
+            .as_ref()
+            .ok_or_else(|| "the desktop service is not running".to_owned())?
+            .state()
+            .clone()
+    };
+    {
+        let catalog = app_state.catalog.read().await;
+        if catalog.settings.first_run_complete {
+            return Err(
+                "storage can only be changed here before first-run setup is completed".to_owned(),
+            );
+        }
+        if !catalog.projects.is_empty()
+            || !catalog.import_drafts.is_empty()
+            || !catalog.jobs.is_empty()
+            || !catalog.exports.is_empty()
+            || !catalog.usage_rows.is_empty()
+        {
+            return Err(
+                "storage cannot be changed after project or job data has been created".to_owned(),
+            );
+        }
+    }
+    let original_config = app_state.config.clone();
+    drop(app_state);
+
+    let service = state
+        .service
+        .lock()
+        .map_err(|_| "the desktop service state is unavailable".to_owned())?
+        .take()
+        .ok_or_else(|| "the desktop service is not running".to_owned())?;
+    if let Err(error) = service.shutdown().await {
+        let message = format!("could not stop the desktop service for relocation: {error}");
+        return Err(recover_original_service(&state, original_config, message).await);
+    }
+
+    let source = original_config.data_dir.clone();
+    let staged = match tauri::async_runtime::spawn_blocking(move || {
+        storage_location::stage_relocation(&source, &data_root)
+    })
+    .await
+    {
+        Ok(Ok(staged)) => staged,
+        Ok(Err(error)) => {
+            return Err(recover_original_service(&state, original_config, error).await);
+        }
+        Err(error) => {
+            let message = format!("the storage relocation task failed: {error}");
+            return Err(recover_original_service(&state, original_config, message).await);
+        }
+    };
+    let storage_location::StagedRelocation::Ready { target, marker } = staged else {
+        start_and_store_service(&state, original_config).await?;
+        return Ok(());
+    };
+
+    let mut relocated_config = original_config.clone();
+    relocated_config.data_dir.clone_from(&target);
+    let relocated_service = match audiobookai_service::start(relocated_config).await {
+        Ok(service) => service,
+        Err(error) => {
+            let target_for_rollback = target.clone();
+            let marker_for_rollback = marker.clone();
+            let rollback = tauri::async_runtime::spawn_blocking(move || {
+                storage_location::rollback_relocation(&target_for_rollback, &marker_for_rollback)
+            })
+            .await;
+            let mut message = format!("could not open the relocated storage folder: {error}");
+            if let Ok(Err(rollback_error)) = rollback {
+                let _ = write!(message, "; {rollback_error}");
+            }
+            return Err(recover_original_service(&state, original_config, message).await);
+        }
+    };
+
+    let config_path = state.storage_config_path.clone();
+    let target_for_config = target.clone();
+    let config_result = tauri::async_runtime::spawn_blocking(move || {
+        storage_location::persist_data_root(&config_path, &target_for_config)
+    })
+    .await
+    .map_err(|error| format!("the storage configuration task failed: {error}"))
+    .and_then(|result| result);
+    if let Err(error) = config_result {
+        if let Err(shutdown_error) = relocated_service.shutdown().await {
+            return Err(format!(
+                "{error}; the relocated service did not stop cleanly: {shutdown_error}. Restart AudiobookAI."
+            ));
+        }
+        let target_for_rollback = target.clone();
+        let marker_for_rollback = marker.clone();
+        let rollback_error = tauri::async_runtime::spawn_blocking(move || {
+            storage_location::rollback_relocation(&target_for_rollback, &marker_for_rollback)
+        })
+        .await
+        .ok()
+        .and_then(Result::err);
+        let mut message = error;
+        if let Some(rollback_error) = rollback_error {
+            let _ = write!(message, "; {rollback_error}");
+        }
+        return Err(recover_original_service(&state, original_config, message).await);
+    }
+
+    let target_for_finish = target.clone();
+    let marker_for_finish = marker.clone();
+    if let Ok(Err(error)) = tauri::async_runtime::spawn_blocking(move || {
+        storage_location::finish_relocation(&target_for_finish, &marker_for_finish)
+    })
+    .await
+    {
+        tracing::warn!(
+            diagnostic_code = "desktop.storage.relocation_marker_cleanup.failed",
+            %error,
+            "the storage root was switched but its relocation marker could not be removed"
+        );
+    }
+    store_service(&state, relocated_service)
+}
+
+async fn recover_original_service(
+    state: &DesktopState,
+    config: ServiceConfig,
+    message: String,
+) -> String {
+    match start_and_store_service(state, config).await {
+        Ok(()) => message,
+        Err(restart_error) => format!(
+            "{message}; the original service could not be restarted: {restart_error}. Restart AudiobookAI."
+        ),
+    }
+}
+
+async fn start_and_store_service(
+    state: &DesktopState,
+    config: ServiceConfig,
+) -> Result<(), String> {
+    let service = audiobookai_service::start(config)
+        .await
+        .map_err(|error| format!("could not start the desktop service: {error}"))?;
+    store_service(state, service)
+}
+
+fn store_service(state: &DesktopState, service: ServiceHandle) -> Result<(), String> {
+    let mut stored = state
+        .service
+        .lock()
+        .map_err(|_| "the desktop service state is unavailable".to_owned())?;
+    *stored = Some(service);
+    Ok(())
 }
 
 fn begin_quit(app: &AppHandle) {
@@ -172,9 +374,23 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .invoke_handler(tauri::generate_handler![quit_application, set_close_to_tray])
+        .invoke_handler(tauri::generate_handler![
+            choose_storage_directory,
+            quit_application,
+            relocate_first_run_storage,
+            set_close_to_tray
+        ])
         .setup(|app| {
             let mut loopback_config = ServiceConfig::desktop_default()?;
+            let storage_config_path = app
+                .path()
+                .app_config_dir()?
+                .join("storage-location.json");
+            loopback_config.data_dir = storage_location::configured_data_root(
+                &storage_config_path,
+                &loopback_config.data_dir,
+            )
+            .map_err(std::io::Error::other)?;
             loopback_config.bundled_sidecar_dir =
                 installed_sidecar_directory(&app.path().resource_dir()?);
             let (service_config, persisted_lan_applied) = match tauri::async_runtime::block_on(
@@ -219,6 +435,7 @@ pub fn run() {
             let initial_epub_javascript = serde_json::to_string(&initial_epub)?;
             app.manage(DesktopState {
                 service: Mutex::new(Some(service)),
+                storage_config_path,
                 quitting: AtomicBool::new(false),
                 close_to_tray: AtomicBool::new(true),
             });

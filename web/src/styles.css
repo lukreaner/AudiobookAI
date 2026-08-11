@@ -390,6 +390,8 @@ a { color: inherit; text-decoration: none; }
 .choice-grid strong { color: rgb(var(--ink)); font-size: .8rem; }
 .choice-grid span { font-size: .68rem; line-height: 1.45; }
 .setup-form { text-align: left; width: min(100%, 540px); margin-inline: auto; }
+.setup-path-picker { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: .5rem; }
+.setup-path-picker .input { min-width: 0; }
 .setup-security { padding: .9rem; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: .7rem; align-items: center; text-align: left; }
 .setup-security > span { width: 40px; height: 40px; display: grid; place-items: center; border-radius: 12px; background: rgb(var(--positive) / .1); color: rgb(var(--positive)); }
 .setup-security strong { font-size: .76rem; }
@@ -434,7 +436,7 @@ a { color: inherit; text-decoration: none; }
 }
 @media (max-width: 760px) { .settings-layout { grid-template-columns: 1fr; }.settings-nav { position: static; flex-direction: row; overflow-x: auto; }.settings-nav button { flex: none; } }
 @media (max-width: 760px) and (min-height: 701px), (max-width: 559px) { .choice-grid { grid-template-columns: 1fr; }.choice-grid button { min-height: 115px; } }
-@media (max-width: 520px) { .settings-nav button svg { display: none; }.secret-status { grid-template-columns: auto 1fr; }.secret-status > .badge { grid-column: 1 / -1; }.setup-main { width: min(calc(100% - 1rem), 820px); }.setup-panel { padding: 1.3rem 1rem; border-radius: 1rem; }.setup-summary > div { grid-template-columns: 1fr; gap: .2rem; } }
+@media (max-width: 520px) { .settings-nav button svg { display: none; }.secret-status { grid-template-columns: auto 1fr; }.secret-status > .badge { grid-column: 1 / -1; }.setup-main { width: min(calc(100% - 1rem), 820px); }.setup-panel { padding: 1.3rem 1rem; border-radius: 1rem; }.setup-path-picker { grid-template-columns: 1fr; }.setup-path-picker .button { justify-self: start; }.setup-summary > div { grid-template-columns: 1fr; gap: .2rem; } }
 
 /* Privacy-preserving application diagnostics */
 .diagnostics-privacy { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: .75rem; align-items: start; padding: .9rem 1rem; border-color: rgb(var(--positive) / .3); margin-bottom: 1rem; }

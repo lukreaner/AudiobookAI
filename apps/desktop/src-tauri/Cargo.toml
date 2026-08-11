@@ -20,6 +20,9 @@ tauri-build = { version = "=2.6.3", features = [] }
 
 [dependencies]
 audiobookai-service = { path = "../../../crates/service", features = ["embedded-dashboard"] }
+blake3.workspace = true
+serde.workspace = true
+tempfile.workspace = true
 tauri = { version = "=2.11.5", features = ["tray-icon"] }
 tauri-plugin-dialog = "=2.7.2"
 tauri-plugin-opener = "=2.5.4"
@@ -32,9 +35,6 @@ tracing-subscriber.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 webkit2gtk = "=2.0.2"
-
-[dev-dependencies]
-tempfile.workspace = true
 
 [lints]
 workspace = true

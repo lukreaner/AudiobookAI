@@ -38,10 +38,12 @@ cookies, and known secret values.
 
 On Unix platforms, AudiobookAI tightens its entire managed data tree to mode
 `0700` on every startup and its SQLite database, writer lock, migration
-backups, and passphrase salt to mode `0600`. This also repairs permissive modes
-left by an earlier application version. Windows data remains scoped to the
-signed-in user's platform application-data directory; installer ACL behavior is
-part of the native clean-machine security acceptance gate. User-selected export
+backups, passphrase salt, and desktop storage-location record to mode `0600`.
+This also repairs permissive modes left by an earlier application version.
+The default Windows data root remains scoped to the signed-in user's platform
+application-data directory; a custom first-run root inherits the ACLs of the
+dedicated folder the owner selected. Installer ACL behavior is part of the
+native clean-machine security acceptance gate. User-selected export
 destinations retain the permissions the owner selected.
 
 ## Diagnostics privacy boundary
