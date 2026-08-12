@@ -651,6 +651,18 @@ fn parse_models(value: &Value, flavor: CharacterFlavor) -> Result<Vec<Model>> {
     .ok_or_else(|| ProviderError::InvalidResponse("missing model list".to_owned()))?;
     Ok(items
         .iter()
+        .filter(|item| {
+            if !matches!(flavor, CharacterFlavor::Gemini) {
+                return true;
+            }
+            item.get("supportedGenerationMethods")
+                .and_then(Value::as_array)
+                .is_none_or(|methods| {
+                    methods
+                        .iter()
+                        .any(|method| method.as_str() == Some("generateContent"))
+                })
+        })
         .filter_map(|item| {
             let id = item.get("id").or_else(|| item.get("name"))?.as_str()?;
             Some(Model {
@@ -732,6 +744,31 @@ mod tests {
         assert!(!omitted.as_object().unwrap().contains_key("temperature"));
         assert!(null.as_object().unwrap().contains_key("temperature"));
         assert!(null["temperature"].is_null());
+    }
+
+    #[test]
+    fn gemini_model_discovery_keeps_generation_models() {
+        let models = parse_models(
+            &json!({
+                "models": [
+                    {
+                        "name": "models/gemini-generation",
+                        "displayName": "Gemini Generation",
+                        "supportedGenerationMethods": ["generateContent"]
+                    },
+                    {
+                        "name": "models/text-embedding",
+                        "displayName": "Text Embedding",
+                        "supportedGenerationMethods": ["embedContent"]
+                    }
+                ]
+            }),
+            CharacterFlavor::Gemini,
+        )
+        .unwrap();
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "gemini-generation");
     }
 
     #[test]

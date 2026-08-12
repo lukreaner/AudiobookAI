@@ -12,7 +12,10 @@ pub use native::{
     NativeCapture, NativeCommand, NativeCommandArgument, NativeCommandOutput, NativeCommandRunner,
     NativePlatform, NativeTtsConfig, NativeTtsProvider, TokioNativeCommandRunner,
 };
-pub use tts::{AllTalkProvider, ElevenLabsProvider, LocalAiProvider, MlxAudioProvider};
+pub use tts::{
+    AllTalkProvider, ElevenLabsProvider, LocalAiProvider, MlxAudioProvider, OpenAiTtsProvider,
+    openai_tts_model_performance_capabilities,
+};
 
 use std::{collections::BTreeMap, sync::Arc};
 

@@ -65,10 +65,11 @@ beforeEach(async () => {
   await i18n.changeLanguage("en");
   vi.spyOn(api, "settings").mockResolvedValue(structuredClone(lockedSettings));
   vi.spyOn(api, "unlockSecretStore").mockResolvedValue({ unlocked: true, backend: "passphrase" });
+  vi.spyOn(api, "discoverProviderModels").mockResolvedValue({ items: [] });
 });
 
 describe("first-run setup", () => {
-  it("clears an entered endpoint and credential when the provider choice changes", async () => {
+  it("applies TTS and LLM presets while clearing transient credentials", async () => {
     const user = userEvent.setup();
     renderSetup();
 
@@ -76,13 +77,22 @@ describe("first-run setup", () => {
     await user.click(screen.getByRole("button", { name: /Use local and cloud providers/ }));
     await user.click(screen.getByRole("button", { name: "Continue" }));
     await user.selectOptions(screen.getByLabelText("Provider"), "elevenlabs");
-    await user.type(screen.getByLabelText("Endpoint URL"), "https://api.example.test");
+    const endpoint = await screen.findByLabelText(/^Endpoint URL/);
+    expect(endpoint).toHaveValue("https://api.elevenlabs.io/");
+    await user.clear(endpoint);
+    await user.type(endpoint, "https://api.example.test");
     await user.click(screen.getByRole("switch", { name: "I’ll add credentials later" }));
     await user.type(screen.getByLabelText(/^API key/), "temporary-provider-credential");
 
-    await user.selectOptions(screen.getByLabelText("Provider"), "localai");
+    await user.selectOptions(screen.getByLabelText("Provider"), "openai_tts");
+    expect(screen.getByText("Text to speech (TTS)")).toBeInTheDocument();
+    expect(screen.getByLabelText(/^Endpoint URL/)).toHaveValue("https://api.openai.com/");
+    expect(screen.getByLabelText(/^TTS model/)).toHaveValue("gpt-4o-mini-tts");
 
-    expect(screen.getByLabelText("Endpoint URL")).toHaveValue("");
+    await user.selectOptions(screen.getByLabelText("Provider"), "ollama");
+
+    expect(screen.getByText("Language model (LLM)")).toBeInTheDocument();
+    expect(screen.getByLabelText(/^Endpoint URL/)).toHaveValue("http://127.0.0.1:11434/");
     expect(screen.getByRole("switch", { name: "I’ll add credentials later" })).not.toBeChecked();
     expect(screen.queryByLabelText(/^API key/)).not.toBeInTheDocument();
   });

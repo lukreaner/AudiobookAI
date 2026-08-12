@@ -7,23 +7,9 @@ import { api } from "../api/client";
 import type { MlxManagedModel, MlxManagement, ProviderKind, ProviderModel, ProviderProfile } from "../api/types";
 import { EmptyState, ErrorState, LoadingState } from "../components/StateViews";
 import { Badge, Button, Card, Dialog, Field, Input, PageHeading, Select, Textarea } from "../components/ui";
-
-const providerKinds: { kind: ProviderKind; name: string; tts: boolean; ai: boolean }[] = [
-  { kind: "elevenlabs", name: "ElevenLabs", tts: true, ai: false },
-  { kind: "mlx_audio", name: "MLX-audio", tts: true, ai: false },
-  { kind: "localai", name: "LocalAI", tts: true, ai: false },
-  { kind: "alltalk_v2", name: "AllTalk V2", tts: true, ai: false },
-  { kind: "native_os", name: "Native system voice", tts: true, ai: false },
-  { kind: "openai", name: "OpenAI", tts: false, ai: true },
-  { kind: "openai_compatible", name: "OpenAI-compatible", tts: false, ai: true },
-  { kind: "qwen", name: "Qwen", tts: false, ai: true },
-  { kind: "kimi", name: "Kimi", tts: false, ai: true },
-  { kind: "moonshot", name: "Moonshot", tts: false, ai: true },
-  { kind: "lm_studio", name: "LM Studio", tts: false, ai: true },
-  { kind: "anthropic", name: "Claude", tts: false, ai: true },
-  { kind: "gemini", name: "Google Gemini", tts: false, ai: true },
-  { kind: "ollama", name: "Ollama", tts: false, ai: true },
-];
+import { ProviderModelField } from "../providers/ProviderModelField";
+import { providerPreset, providerPresetsFor, type ProviderRole } from "../providers/presets";
+import { useProviderModels } from "../providers/useProviderModels";
 
 const statusTone: Record<ProviderProfile["status"], "positive" | "neutral" | "accent" | "warning" | "danger"> = {
   online: "positive", offline: "neutral", starting: "accent", stopping: "warning", error: "danger", unconfigured: "warning",
@@ -48,18 +34,23 @@ type ProviderForm = {
   model: string;
 };
 
-function emptyProviderForm(): ProviderForm {
+function providerFormFor(kind: ProviderKind): ProviderForm {
+  const preset = providerPreset(kind);
   return {
-    name: "",
-    kind: "elevenlabs",
-    mode: "cloud_remote",
-    endpoint: "",
+    name: preset.name,
+    kind: preset.kind,
+    mode: preset.defaultMode,
+    endpoint: preset.defaultEndpoint,
     executablePath: "",
     workingDirectory: "",
     argumentsText: "",
     credential: "",
-    model: "",
+    model: preset.defaultModel,
   };
+}
+
+function emptyProviderForm(): ProviderForm {
+  return providerFormFor("elevenlabs");
 }
 
 function argumentLines(value: string): string[] {
@@ -105,6 +96,21 @@ export function ProvidersPage() {
   const [confirmingUninstall, setConfirmingUninstall] = useState(false);
   const [addOpen, setAddOpen] = useState(false);
   const [form, setForm] = useState<ProviderForm>(emptyProviderForm);
+  const selectedPreset = providerPreset(form.kind);
+  const availableModels = useProviderModels({
+    enabled: addOpen || Boolean(editing),
+    providerId: editing?.id,
+    credentialConfigured: editing?.credentialConfigured,
+    name: form.name,
+    kind: form.kind,
+    mode: form.mode,
+    endpoint: form.endpoint,
+    executablePath: form.executablePath,
+    workingDirectory: form.workingDirectory,
+    argumentsText: form.argumentsText,
+    credential: form.credential,
+    modelSource: selectedPreset.modelSource,
+  });
   const providerModels = useQuery({
     queryKey: ["provider-model-library", controlling?.id],
     queryFn: () => api.providerModels(controlling!.id),
@@ -131,7 +137,7 @@ export function ProvidersPage() {
       };
       return editing
         ? api.updateProvider(editing.id, shared)
-        : api.createProvider({ ...shared, name: form.name || providerKinds.find((item) => item.kind === form.kind)?.name, kind: form.kind });
+        : api.createProvider({ ...shared, name: form.name || selectedPreset.name, kind: form.kind });
     },
     onSuccess: async () => { await queryClient.invalidateQueries({ queryKey: ["providers"] }); closeDialog(); },
   });
@@ -212,10 +218,30 @@ export function ProvidersPage() {
   }, [lastProviderModelOperation?.id, lastProviderModelOperation?.state]);
 
   const closeDialog = () => { setAddOpen(false); setEditing(undefined); setForm(emptyProviderForm()); };
+  const selectProviderKind = (kind: ProviderKind) => {
+    const previous = providerPreset(form.kind);
+    const preset = providerPreset(kind);
+    const replaceName = !form.name.trim() || form.name === previous.name;
+    setForm({
+      ...providerFormFor(kind),
+      name: replaceName ? preset.name : form.name,
+    });
+  };
+  const selectProviderMode = (mode: ProviderProfile["mode"]) => {
+    setForm({
+      ...form,
+      mode,
+      endpoint: selectedPreset.defaultEndpoint,
+      executablePath: mode === "managed_child" ? form.executablePath : "",
+      workingDirectory: mode === "managed_child" ? form.workingDirectory : "",
+      argumentsText: mode === "managed_child" ? form.argumentsText : "",
+      credential: "",
+    });
+  };
   const configureDeveloperMlx = () => {
     setEditing(undefined);
     setForm({
-      ...emptyProviderForm(),
+      ...providerFormFor("mlx_audio"),
       name: "MLX-audio (developer install)",
       kind: "mlx_audio",
       mode: "managed_child",
@@ -322,41 +348,53 @@ export function ProvidersPage() {
         {selectMlxModel.isError ? <ErrorState error={selectMlxModel.error} /> : null}
       </Card> : null}
       {!providers.data?.items.length ? <EmptyState title={t("providers.emptyTitle")} detail={t("providers.emptyDetail")} action={<Button onClick={() => setAddOpen(true)}><Plus size={16} />{t("providers.add")}</Button>} /> : (
-        <div className="provider-grid">
-          {providers.data.items.map((provider) => {
-            const ModeIcon = provider.mode === "cloud_remote" ? Cloud : provider.mode === "native" ? Laptop : Cpu;
-            const caps = provider.capabilities;
-            return (
-              <Card className={clsx("provider-card", provider.status === "error" && "has-error")} key={provider.id}>
-                <div className="provider-card-head">
-                  <span className="provider-logo"><ModeIcon size={21} /></span>
-                  <div><h2>{provider.name}</h2><p>{t(modeLabel(provider.mode))}</p></div>
-                  <Badge tone={statusTone[provider.status]}><span className="service-dot" />{t(`providers.${provider.status}`)}</Badge>
-                </div>
-                <div className="provider-connection">
-                  <span>{provider.model || provider.endpoint || t(modeLabel(provider.mode))}</span>
-                  <span className={provider.credentialConfigured ? "credential-ok" : "credential-missing"}><KeyRound size={13} />{t(provider.credentialConfigured ? "providers.apiKeyConfigured" : "providers.apiKeyMissing")}</span>
-                </div>
-                <div className="capability-list">
-                  {caps ? <>
-                    {caps.tts ? <Badge tone="accent"><Waves size={12} />{t("providers.tts")}</Badge> : null}
-                    {caps.characterDetection ? <Badge tone="info"><Activity size={12} />{t("providers.ai")}</Badge> : null}
-                    {caps.streaming ? <Badge>{t("providers.streaming")}</Badge> : null}
-                    {caps.voiceCloning ? <Badge>{t("providers.cloning")}</Badge> : null}
-                    {caps.modelControl ? <Badge>{t("providers.modelControl")}</Badge> : null}
-                  </> : <span className="capability-unknown">{t("providers.capabilityUnknown")}</span>}
-                </div>
-                {provider.lastError ? <div className="provider-error"><span />{provider.lastError}</div> : null}
-                <div className="provider-actions">
-                  {provider.capabilities?.processControl ? <>
-                    {provider.status === "online" ? <Button size="sm" variant="secondary" onClick={() => control.mutate({ id: provider.id, action: "stop" })} disabled={control.isPending}><Square size={13} />{t("providers.stop")}</Button> : <Button size="sm" variant="secondary" onClick={() => control.mutate({ id: provider.id, action: "start" })} disabled={control.isPending}><Play size={13} />{t("providers.start")}</Button>}
-                    <Button size="sm" variant="ghost" onClick={() => control.mutate({ id: provider.id, action: "restart" })} disabled={control.isPending}><RotateCcw size={14} />{t("providers.restart")}</Button>
-                  </> : <Button size="sm" variant="ghost" onClick={() => control.mutate({ id: provider.id, action: "refresh" })} disabled={control.isPending}><RefreshCw size={14} />{t("providers.refresh")}</Button>}
-                  {provider.capabilities?.processControl || provider.capabilities?.modelControl ? <Button size="sm" variant="ghost" onClick={() => openControl(provider)}><ScrollText size={14} />{t("providers.control")}</Button> : null}
-                  <Button className="provider-config" size="sm" variant="ghost" onClick={() => openEdit(provider)}><MoreHorizontal size={15} />{t("common.settings")}</Button>
-                </div>
-              </Card>
-            );
+        <div className="provider-role-groups">
+          {(["tts", "llm"] as ProviderRole[]).map((role) => {
+            const roleProviders = providers.data.items.filter((provider) => providerPreset(provider.kind).role === role);
+            return <section className="provider-role-section" aria-labelledby={`provider-role-${role}`} key={role}>
+              <header>
+                <span>{role === "tts" ? <Waves size={18} /> : <Activity size={18} />}</span>
+                <div><h2 id={`provider-role-${role}`}>{t(role === "tts" ? "providers.ttsProviders" : "providers.llmProviders")}</h2><p>{t(role === "tts" ? "providers.ttsProvidersDetail" : "providers.llmProvidersDetail")}</p></div>
+                <Badge tone={role === "tts" ? "accent" : "info"}>{role === "tts" ? "TTS" : "LLM"}</Badge>
+              </header>
+              {roleProviders.length ? <div className="provider-grid">
+                {roleProviders.map((provider) => {
+                  const ModeIcon = provider.mode === "cloud_remote" ? Cloud : provider.mode === "native" ? Laptop : Cpu;
+                  const caps = provider.capabilities;
+                  return (
+                    <Card className={clsx("provider-card", provider.status === "error" && "has-error")} key={provider.id}>
+                      <div className="provider-card-head">
+                        <span className="provider-logo"><ModeIcon size={21} /></span>
+                        <div><h2>{provider.name}</h2><p>{t(modeLabel(provider.mode))}</p></div>
+                        <Badge tone={statusTone[provider.status]}><span className="service-dot" />{t(`providers.${provider.status}`)}</Badge>
+                      </div>
+                      <div className="provider-connection">
+                        <span>{provider.model || provider.endpoint || t(modeLabel(provider.mode))}</span>
+                        <span className={provider.credentialConfigured ? "credential-ok" : "credential-missing"}><KeyRound size={13} />{t(provider.credentialConfigured ? "providers.apiKeyConfigured" : "providers.apiKeyMissing")}</span>
+                      </div>
+                      <div className="capability-list">
+                        {caps ? <>
+                          {caps.tts ? <Badge tone="accent"><Waves size={12} />{t("providers.tts")}</Badge> : null}
+                          {caps.characterDetection ? <Badge tone="info"><Activity size={12} />{t("providers.ai")}</Badge> : null}
+                          {caps.streaming ? <Badge>{t("providers.streaming")}</Badge> : null}
+                          {caps.voiceCloning ? <Badge>{t("providers.cloning")}</Badge> : null}
+                          {caps.modelControl ? <Badge>{t("providers.modelControl")}</Badge> : null}
+                        </> : <span className="capability-unknown">{t("providers.capabilityUnknown")}</span>}
+                      </div>
+                      {provider.lastError ? <div className="provider-error"><span />{provider.lastError}</div> : null}
+                      <div className="provider-actions">
+                        {provider.capabilities?.processControl ? <>
+                          {provider.status === "online" ? <Button size="sm" variant="secondary" onClick={() => control.mutate({ id: provider.id, action: "stop" })} disabled={control.isPending}><Square size={13} />{t("providers.stop")}</Button> : <Button size="sm" variant="secondary" onClick={() => control.mutate({ id: provider.id, action: "start" })} disabled={control.isPending}><Play size={13} />{t("providers.start")}</Button>}
+                          <Button size="sm" variant="ghost" onClick={() => control.mutate({ id: provider.id, action: "restart" })} disabled={control.isPending}><RotateCcw size={14} />{t("providers.restart")}</Button>
+                        </> : <Button size="sm" variant="ghost" onClick={() => control.mutate({ id: provider.id, action: "refresh" })} disabled={control.isPending}><RefreshCw size={14} />{t("providers.refresh")}</Button>}
+                        {provider.capabilities?.processControl || provider.capabilities?.modelControl ? <Button size="sm" variant="ghost" onClick={() => openControl(provider)}><ScrollText size={14} />{t("providers.control")}</Button> : null}
+                        <Button className="provider-config" size="sm" variant="ghost" onClick={() => openEdit(provider)}><MoreHorizontal size={15} />{t("common.settings")}</Button>
+                      </div>
+                    </Card>
+                  );
+                })}
+              </div> : <p className="provider-role-empty">{t(role === "tts" ? "providers.noTtsProviders" : "providers.noLlmProviders")}</p>}
+            </section>;
           })}
         </div>
       )}
@@ -365,12 +403,17 @@ export function ProvidersPage() {
       <Dialog open={addOpen || Boolean(editing)} onOpenChange={(open) => !open && closeDialog()} title={editing ? t("providers.configure", { name: editing.name }) : t("providers.add")} description={t("providers.subtitle")} size="lg" footer={<>{editing && editing.mode !== "native" ? <Button variant="danger" onClick={() => requestDelete(editing)}><Trash2 size={16} />{t("providers.delete")}</Button> : null}<Button variant="secondary" onClick={closeDialog}>{t("common.cancel")}</Button><Button disabled={!form.name.trim() || (managed && !form.executablePath.trim()) || editBlockedByOwnedProcess || save.isPending} onClick={() => save.mutate()}>{save.isPending ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}{t("providers.saveAndCheck")}</Button></>}>
         <div className="provider-form stack">
           {editBlockedByOwnedProcess ? <p className="provider-form-warning">{t("providers.stopBeforeConfigure")}</p> : null}
+          <div className={`provider-role-summary provider-role-${selectedPreset.role}`}>
+            <span>{selectedPreset.role === "tts" ? <Waves size={18} /> : <Activity size={18} />}</span>
+            <div><strong>{t(selectedPreset.role === "tts" ? "providers.ttsProvider" : "providers.llmProvider")}</strong><p>{t(selectedPreset.role === "tts" ? "providers.ttsProviderDetail" : "providers.llmProviderDetail")}</p></div>
+            <Badge tone={selectedPreset.role === "tts" ? "accent" : "info"}>{selectedPreset.role.toUpperCase()}</Badge>
+          </div>
           <div className="grid-2">
-            <Field label={t("providers.chooseType")}><Select value={form.kind} onChange={(event) => { const kind = event.target.value as ProviderKind; const entry = providerKinds.find((item) => item.kind === kind); setForm({ ...form, kind, name: form.name || entry?.name || "", endpoint: "", credential: "", model: "" }); }} disabled={Boolean(editing)}>{providerKinds.map((entry) => <option value={entry.kind} key={entry.kind}>{entry.name}</option>)}</Select></Field>
-            <Field label={t("providers.mode")}><Select value={form.mode} onChange={(event) => setForm({ ...form, mode: event.target.value as ProviderProfile["mode"], endpoint: "", credential: "" })}><option value="cloud_remote">{t("providers.cloud")}</option><option value="external_endpoint">{t("providers.external")}</option><option value="managed_child">{t("providers.managed")}</option><option value="native">{t("providers.native")}</option></Select></Field>
+            <Field label={t("providers.chooseType")}><Select value={form.kind} onChange={(event) => selectProviderKind(event.target.value as ProviderKind)} disabled={Boolean(editing)}><optgroup label={t("providers.ttsProviders")}>{providerPresetsFor("tts").map((preset) => <option value={preset.kind} key={preset.kind}>{preset.name}</option>)}</optgroup><optgroup label={t("providers.llmProviders")}>{providerPresetsFor("llm").map((preset) => <option value={preset.kind} key={preset.kind}>{preset.name}</option>)}</optgroup></Select></Field>
+            <Field label={t("providers.mode")}><Select value={form.mode} onChange={(event) => selectProviderMode(event.target.value as ProviderProfile["mode"])}>{selectedPreset.modes.map((mode) => <option value={mode} key={mode}>{t(modeLabel(mode))}</option>)}</Select></Field>
           </div>
           <Field label={t("import.titleLabel")}><Input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} /></Field>
-          {hasEndpoint ? <Field label={t("providers.endpoint")} hint={managed ? t("providers.managedEndpointHint") : undefined}><Input type="url" value={form.endpoint} onChange={(event) => setForm({ ...form, endpoint: event.target.value })} placeholder="http://127.0.0.1:8080" /></Field> : null}
+          {hasEndpoint ? <Field label={t("providers.endpoint")} hint={managed ? t("providers.managedEndpointHint") : t("providers.presetEndpointHint")}><Input type="url" value={form.endpoint} onChange={(event) => setForm({ ...form, endpoint: event.target.value })} placeholder={selectedPreset.defaultEndpoint || "https://provider.example/v1"} /></Field> : null}
           {managed ? <Field label={t("providers.executable")} hint={t("providers.executableHint")}><Input value={form.executablePath} onChange={(event) => setForm({ ...form, executablePath: event.target.value })} /></Field> : null}
           {managed ? <div className="grid-2">
             <Field label={t("providers.workingDirectory")} hint={t("providers.workingDirectoryHint")}><Input value={form.workingDirectory} onChange={(event) => setForm({ ...form, workingDirectory: event.target.value })} /></Field>
@@ -378,8 +421,8 @@ export function ProvidersPage() {
           </div> : null}
           {managed ? <p className="provider-form-note">{t("providers.environmentSecurity")}</p> : null}
           <div className="grid-2">
-            <Field label={t("providers.model")}><Input value={form.model} onChange={(event) => setForm({ ...form, model: event.target.value })} /></Field>
             {form.mode !== "native" ? <Field label={t("providers.apiKey")} hint={editing?.credentialConfigured ? t("providers.apiKeyConfigured") : t("providers.apiKeyPlaceholder")}><Input type="password" autoComplete="new-password" value={form.credential} onChange={(event) => setForm({ ...form, credential: event.target.value })} placeholder="••••••••••••" /></Field> : null}
+            <ProviderModelField role={selectedPreset.role} source={selectedPreset.modelSource} value={form.model} models={availableModels.models} status={availableModels.status} onChange={(model) => setForm({ ...form, model })} />
           </div>
           {save.isError ? <ErrorState error={save.error} /> : null}
         </div>

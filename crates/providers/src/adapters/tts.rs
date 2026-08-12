@@ -8,12 +8,12 @@ use serde_json::{Value, json};
 
 use super::{HttpAdapter, json_body};
 use crate::{
-    AudioChunk, AudioChunkSink, AudioFormat, Authentication, CancellationFlag, EndpointConfig,
-    HttpMethod, HttpRequest, HttpTransport, Model, ModelPerformanceCapabilities, ParameterSupport,
-    PerformanceCapabilities, PerformanceRange, ProviderCapabilities, ProviderDescriptor,
-    ProviderError, ProviderHealth, ProviderId, ProviderUsage, Result, StreamingSynthesisResponse,
-    SynthesisRequest, SynthesisResponse, TtsProvider, UsageSource, Voice, VoiceClone,
-    VoiceCloneProvider, VoiceCloneRequest,
+    AudioChunk, AudioChunkSink, AudioFormat, Authentication, CancellationFlag, DeliveryCue,
+    EndpointConfig, HttpMethod, HttpRequest, HttpTransport, Model, ModelPerformanceCapabilities,
+    ParameterSupport, PerformanceCapabilities, PerformanceRange, ProviderCapabilities,
+    ProviderDescriptor, ProviderError, ProviderHealth, ProviderId, ProviderUsage, Result,
+    StreamingSynthesisResponse, SynthesisRequest, SynthesisResponse, TtsProvider, UsageSource,
+    Voice, VoiceClone, VoiceCloneProvider, VoiceCloneRequest,
 };
 
 fn capabilities(
@@ -307,23 +307,7 @@ impl TtsProvider for ElevenLabsProvider {
             .http
             .execute(self.http.empty_request(HttpMethod::Get, "v1/models")?)
             .await?;
-        let value = json_body(&response)?;
-        Ok(value
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|model| {
-                Some(Model {
-                    id: model.get("model_id")?.as_str()?.to_owned(),
-                    name: model
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or_else(|| model["model_id"].as_str().unwrap_or_default())
-                        .to_owned(),
-                    metadata: Default::default(),
-                })
-            })
-            .collect())
+        Ok(parse_elevenlabs_models(&json_body(&response)?))
     }
 
     async fn synthesize(&self, request: SynthesisRequest) -> Result<SynthesisResponse> {
@@ -360,6 +344,29 @@ impl TtsProvider for ElevenLabsProvider {
         )
         .await
     }
+}
+
+fn parse_elevenlabs_models(value: &Value) -> Vec<Model> {
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        // The shared catalog also contains speech-to-text, music, and other models. Keep only
+        // models that are not explicitly marked as unsuitable for this TTS adapter.
+        .filter(|model| model.get("can_do_text_to_speech").and_then(Value::as_bool) != Some(false))
+        .filter_map(|model| {
+            let id = model.get("model_id")?.as_str()?;
+            Some(Model {
+                id: id.to_owned(),
+                name: model
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(id)
+                    .to_owned(),
+                metadata: Default::default(),
+            })
+        })
+        .collect()
 }
 
 #[async_trait]
@@ -435,8 +442,45 @@ impl VoiceCloneProvider for ElevenLabsProvider {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OpenAiSpeechFlavor {
+    OpenAi,
     Mlx,
     LocalAi,
+}
+
+/// Exact model capabilities documented for `OpenAI`'s speech endpoint.
+///
+/// Unknown or newly discovered model identifiers remain selectable, but their optional
+/// performance controls fail closed until their contract is positively known.
+pub fn openai_tts_model_performance_capabilities() -> Vec<ModelPerformanceCapabilities> {
+    let expressive = PerformanceCapabilities {
+        speed: Some(PerformanceRange::new(0.25, 4.0)),
+        delivery_cues: vec![
+            DeliveryCue::Whisper,
+            DeliveryCue::Shout,
+            DeliveryCue::Sarcastic,
+            DeliveryCue::Curious,
+            DeliveryCue::Excited,
+            DeliveryCue::Crying,
+            DeliveryCue::Mischievous,
+        ],
+        ..PerformanceCapabilities::default()
+    };
+    let legacy = PerformanceCapabilities {
+        speed: Some(PerformanceRange::new(0.25, 4.0)),
+        ..PerformanceCapabilities::default()
+    };
+    [
+        ("gpt-4o-mini-tts", expressive.clone()),
+        ("gpt-4o-mini-tts-2025-12-15", expressive),
+        ("tts-1", legacy.clone()),
+        ("tts-1-hd", legacy),
+    ]
+    .into_iter()
+    .map(|(model, performance)| ModelPerformanceCapabilities {
+        model: model.to_owned(),
+        performance,
+    })
+    .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -456,6 +500,11 @@ impl OpenAiSpeechProvider {
         transport: Arc<dyn HttpTransport>,
         flavor: OpenAiSpeechFlavor,
     ) -> Result<Self> {
+        let mut provider_capabilities = capabilities(true, false, false, true);
+        if matches!(flavor, OpenAiSpeechFlavor::OpenAi) {
+            provider_capabilities
+                .set_model_performance(openai_tts_model_performance_capabilities())?;
+        }
         Ok(Self {
             descriptor: ProviderDescriptor {
                 id: ProviderId::new(id)?,
@@ -463,7 +512,7 @@ impl OpenAiSpeechProvider {
                 kind: endpoint.kind,
                 endpoint_family: endpoint_family.to_owned(),
             },
-            capabilities: capabilities(true, false, false, true),
+            capabilities: provider_capabilities,
             http: HttpAdapter::new(endpoint, transport),
             flavor,
         })
@@ -478,6 +527,7 @@ impl OpenAiSpeechProvider {
             AudioFormat::Aac => "aac",
         };
         let default_model = match self.flavor {
+            OpenAiSpeechFlavor::OpenAi => "gpt-4o-mini-tts",
             OpenAiSpeechFlavor::Mlx => "kokoro",
             OpenAiSpeechFlavor::LocalAi => "tts-1",
         };
@@ -490,6 +540,29 @@ impl OpenAiSpeechProvider {
             "response_format": response_format
         });
         match self.flavor {
+            OpenAiSpeechFlavor::OpenAi => {
+                if !request.options.is_empty() {
+                    return Err(ProviderError::Unsupported {
+                        feature: "untyped OpenAI speech options",
+                    });
+                }
+                if request.performance.pitch.is_some()
+                    || request.performance.stability.is_some()
+                    || request.performance.similarity.is_some()
+                    || request.performance.style.is_some()
+                    || request.performance.speaker_boost.is_some()
+                {
+                    return Err(ProviderError::Unsupported {
+                        feature: "the requested OpenAI speech performance control",
+                    });
+                }
+                if let Some(value) = request.performance.speed {
+                    body["speed"] = json!(value);
+                }
+                if let Some(value) = request.performance.delivery_cue {
+                    body["instructions"] = json!(value.as_str());
+                }
+            }
             OpenAiSpeechFlavor::Mlx => {
                 if !request.options.is_empty() {
                     return Err(ProviderError::Unsupported {
@@ -527,7 +600,11 @@ impl OpenAiSpeechProvider {
     }
 
     async fn voices(&self) -> Result<Vec<Voice>> {
+        if matches!(self.flavor, OpenAiSpeechFlavor::OpenAi) {
+            return Ok(openai_builtin_voices());
+        }
         let paths: &[&str] = match self.flavor {
+            OpenAiSpeechFlavor::OpenAi => unreachable!("handled above"),
             OpenAiSpeechFlavor::Mlx => &["v1/voices"],
             OpenAiSpeechFlavor::LocalAi => &["v1/models"],
         };
@@ -569,7 +646,21 @@ impl OpenAiSpeechProvider {
             .http
             .execute(self.http.empty_request(HttpMethod::Get, "v1/models")?)
             .await?;
-        parse_openai_models(&json_body(&response)?)
+        let value = json_body(&response)?;
+        if matches!(self.flavor, OpenAiSpeechFlavor::OpenAi) {
+            parse_openai_tts_models(&value)
+        } else {
+            parse_openai_models(&value)
+        }
+    }
+
+    async fn health(&self) -> Result<ProviderHealth> {
+        let path = if matches!(self.flavor, OpenAiSpeechFlavor::OpenAi) {
+            "v1/models"
+        } else {
+            "health"
+        };
+        self.http.basic_health(path).await
     }
 
     async fn synthesize(&self, request: SynthesisRequest) -> Result<SynthesisResponse> {
@@ -631,7 +722,7 @@ macro_rules! openai_speech_wrapper {
                 &self.0.capabilities
             }
             async fn health(&self) -> Result<ProviderHealth> {
-                self.0.http.basic_health("health").await
+                self.0.health().await
             }
             async fn discover_voices(&self) -> Result<Vec<Voice>> {
                 self.0.voices().await
@@ -656,6 +747,20 @@ macro_rules! openai_speech_wrapper {
 
 openai_speech_wrapper!(MlxAudioProvider);
 openai_speech_wrapper!(LocalAiProvider);
+openai_speech_wrapper!(OpenAiTtsProvider);
+
+impl OpenAiTtsProvider {
+    pub fn new(endpoint: EndpointConfig, transport: Arc<dyn HttpTransport>) -> Result<Self> {
+        Ok(Self(OpenAiSpeechProvider::new(
+            "openai-tts",
+            "OpenAI Speech",
+            "openai-speech-v1",
+            endpoint,
+            transport,
+            OpenAiSpeechFlavor::OpenAi,
+        )?))
+    }
+}
 
 impl MlxAudioProvider {
     pub fn new(endpoint: EndpointConfig, transport: Arc<dyn HttpTransport>) -> Result<Self> {
@@ -725,6 +830,33 @@ fn parse_openai_models(value: &Value) -> Result<Vec<Model>> {
             })
         })
         .collect())
+}
+
+fn parse_openai_tts_models(value: &Value) -> Result<Vec<Model>> {
+    Ok(parse_openai_models(value)?
+        .into_iter()
+        .filter(|model| is_openai_tts_model_id(&model.id))
+        .collect())
+}
+
+fn is_openai_tts_model_id(id: &str) -> bool {
+    id == "tts-1" || id.starts_with("tts-1-") || id.ends_with("-tts") || id.contains("-tts-")
+}
+
+fn openai_builtin_voices() -> Vec<Voice> {
+    [
+        "alloy", "ash", "ballad", "coral", "echo", "fable", "onyx", "nova", "sage", "shimmer",
+        "verse", "marin", "cedar",
+    ]
+    .into_iter()
+    .map(|id| Voice {
+        id: id.to_owned(),
+        name: id.to_owned(),
+        language: None,
+        owned_clone: false,
+        metadata: Default::default(),
+    })
+    .collect()
 }
 
 async fn stream_response(
@@ -983,6 +1115,25 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn elevenlabs_model_discovery_keeps_only_tts_models() {
+        let models = parse_elevenlabs_models(&json!([
+            {
+                "model_id": "eleven_multilingual_v2",
+                "name": "Eleven Multilingual v2",
+                "can_do_text_to_speech": true
+            },
+            {
+                "model_id": "scribe_v2",
+                "name": "Scribe v2",
+                "can_do_text_to_speech": false
+            }
+        ]));
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "eleven_multilingual_v2");
+    }
+
     fn synthesis_request(model: Option<&str>, format: AudioFormat) -> SynthesisRequest {
         SynthesisRequest {
             request_id: uuid::Uuid::new_v4(),
@@ -1018,6 +1169,73 @@ mod tests {
         assert_eq!(body["response_format"], "wav");
         assert!(body.get("temperature").is_none());
         let _ = Temperature::Default;
+    }
+
+    #[test]
+    fn openai_speech_uses_the_documented_default_and_typed_controls() {
+        let provider =
+            OpenAiTtsProvider::new(endpoint(), Arc::new(RecordingTransport::default())).unwrap();
+        let mut request = synthesis_request(None, AudioFormat::Mp3);
+        request.voice = "alloy".to_owned();
+        request.performance.speed = Some(1.25);
+        request.performance.delivery_cue = Some(DeliveryCue::Whisper);
+
+        let http = provider.build_synthesis_request(&request).unwrap();
+        let body: Value = serde_json::from_slice(&http.body).unwrap();
+        assert_eq!(body["model"], "gpt-4o-mini-tts");
+        assert_eq!(body["input"], "Hello");
+        assert_eq!(body["voice"], "alloy");
+        assert_eq!(body["response_format"], "mp3");
+        assert_eq!(body["speed"], 1.25);
+        assert_eq!(body["instructions"], "whisper");
+        assert!(http.url.as_str().ends_with("/v1/audio/speech"));
+    }
+
+    #[test]
+    fn openai_speech_discovery_excludes_non_tts_models() {
+        let models = parse_openai_tts_models(&json!({
+            "data": [
+                { "id": "gpt-4o-mini-tts" },
+                { "id": "gpt-4o-mini-tts-2025-12-15" },
+                { "id": "tts-1-hd" },
+                { "id": "gpt-5.6-terra" },
+                { "id": "gpt-4o-mini-transcribe" },
+                { "id": "whisper-1" }
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            ["gpt-4o-mini-tts", "gpt-4o-mini-tts-2025-12-15", "tts-1-hd"]
+        );
+    }
+
+    #[test]
+    fn legacy_openai_speech_models_reject_instructions() {
+        let provider =
+            OpenAiTtsProvider::new(endpoint(), Arc::new(RecordingTransport::default())).unwrap();
+        let mut request = synthesis_request(Some("tts-1"), AudioFormat::Mp3);
+        request.performance.delivery_cue = Some(DeliveryCue::Curious);
+
+        assert!(provider.build_synthesis_request(&request).is_err());
+    }
+
+    #[tokio::test]
+    async fn openai_speech_exposes_documented_builtin_voices_without_a_network_request() {
+        let transport = Arc::new(RecordingTransport::default());
+        let provider =
+            OpenAiTtsProvider::new(endpoint(), Arc::clone(&transport) as Arc<dyn HttpTransport>)
+                .unwrap();
+
+        let voices = provider.discover_voices().await.unwrap();
+
+        assert!(voices.iter().any(|voice| voice.id == "alloy"));
+        assert!(voices.iter().any(|voice| voice.id == "marin"));
+        assert!(transport.0.lock().unwrap().is_empty());
     }
 
     #[test]

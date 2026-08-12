@@ -263,6 +263,7 @@ pub enum ProviderKindView {
     Localai,
     AlltalkV2,
     NativeOs,
+    OpenaiTts,
     Openai,
     OpenaiCompatible,
     Anthropic,

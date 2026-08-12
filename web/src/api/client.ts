@@ -42,9 +42,11 @@ import type {
   PronunciationRule,
   ProviderLogsResponse,
   ProviderModelLibrary,
+  ProviderModelDiscoveryInput,
   ProviderModelOperation,
   ProviderProfile,
   ProviderProfileInput,
+  AvailableProviderModels,
   MlxManagement,
   MlxOperation,
   RateCard,
@@ -317,6 +319,11 @@ export const api = {
       body: json(input),
     }),
   providers: () => request<PageResponse<ProviderProfile>>("/api/v1/providers"),
+  discoverProviderModels: (profile: ProviderModelDiscoveryInput) =>
+    request<AvailableProviderModels>("/api/v1/provider-models/discover", {
+      method: "POST",
+      body: json(profile),
+    }),
   providerAction: (id: string, action: "start" | "stop" | "restart" | "refresh") =>
     request<ProviderProfile>(`/api/v1/providers/${id}/actions/${action}`, { method: "POST" }),
   providerLogs: (id: string) =>

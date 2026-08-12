@@ -71,6 +71,7 @@ beforeEach(async () => {
   vi.spyOn(api, "uninstallMlx").mockResolvedValue({ id: "operation-uninstall", kind: "uninstall", state: "queued", progressPercent: 0, phase: "queued", message: "Queued", startedAt: new Date().toISOString() });
   vi.spyOn(api, "removeMlxModel").mockResolvedValue(undefined);
   vi.spyOn(api, "providerModels").mockResolvedValue({ models: [], operations: [] });
+  vi.spyOn(api, "discoverProviderModels").mockResolvedValue({ items: [] });
   vi.spyOn(api, "createProvider").mockImplementation(async (input) => ({
     ...structuredClone(managedProvider),
     ...input,
@@ -107,18 +108,95 @@ beforeEach(async () => {
 });
 
 describe("managed provider configuration", () => {
-  it("discards transient credentials and endpoints when deployment mode changes", async () => {
+  it("fetches available models automatically and renders them as choices", async () => {
+    vi.mocked(api.discoverProviderModels).mockResolvedValue({
+      items: [
+        { id: "qwen3:8b", name: "Qwen 3 8B" },
+        { id: "gemma3:4b", name: "Gemma 3 4B" },
+      ],
+    });
     const user = userEvent.setup();
     renderProviders();
 
     await user.click(await screen.findByRole("button", { name: "Add provider" }));
-    await user.type(screen.getByLabelText("Title"), "Temporary provider");
+    await user.selectOptions(screen.getByLabelText("Choose a provider type"), "ollama");
+
+    await waitFor(() => expect(api.discoverProviderModels).toHaveBeenCalledWith(expect.objectContaining({
+      kind: "ollama",
+      mode: "external_endpoint",
+      endpoint: "http://127.0.0.1:11434/",
+    })));
+    await waitFor(() => expect(screen.getByLabelText(/^LLM model/).tagName).toBe("SELECT"));
+    expect(screen.getByRole("option", { name: "Qwen 3 8B (qwen3:8b)" })).toBeInTheDocument();
+    await user.selectOptions(screen.getByLabelText(/^LLM model/), "qwen3:8b");
+    expect(screen.getByLabelText(/^LLM model/)).toHaveValue("qwen3:8b");
+    await user.click(screen.getByRole("button", { name: "Save and check connection" }));
+    await waitFor(() => expect(api.createProvider).toHaveBeenCalledWith(expect.objectContaining({
+      kind: "ollama",
+      model: "qwen3:8b",
+    })));
+  });
+
+  it("offers OpenAI Speech as TTS with speech-only model choices", async () => {
+    vi.mocked(api.discoverProviderModels).mockResolvedValue({
+      items: [
+        { id: "gpt-4o-mini-tts", name: "gpt-4o-mini-tts" },
+        { id: "tts-1-hd", name: "tts-1-hd" },
+      ],
+    });
+    const user = userEvent.setup();
+    renderProviders();
+
+    await user.click(await screen.findByRole("button", { name: "Add provider" }));
+    await user.selectOptions(screen.getByLabelText("Choose a provider type"), "openai_tts");
+
+    expect(screen.getByText("Text to speech (TTS)")).toBeInTheDocument();
+    expect(screen.getByLabelText(/^Endpoint URL/)).toHaveValue("https://api.openai.com/");
+    expect(screen.getByLabelText(/^TTS model/)).toHaveValue("gpt-4o-mini-tts");
+    await user.type(screen.getByLabelText(/^API key/), "test-openai-key");
+
+    await waitFor(() => expect(api.discoverProviderModels).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: "openai_tts",
+        mode: "cloud_remote",
+        endpoint: "https://api.openai.com/",
+      }),
+    ));
+    await waitFor(() => expect(screen.getByLabelText(/^TTS model/).tagName).toBe("SELECT"));
+    expect(screen.getByRole("option", { name: "tts-1-hd" })).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Save and check connection" }));
+    await waitFor(() => expect(api.createProvider).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: "openai_tts",
+        model: "gpt-4o-mini-tts",
+      }),
+    ));
+  });
+
+  it("separates configured TTS providers from LLM providers", async () => {
+    renderProviders();
+
+    const ttsSection = await screen.findByRole("region", { name: "Text-to-speech providers" });
+    const llmSection = screen.getByRole("region", { name: "LLM providers" });
+    expect(within(ttsSection).getByText("LocalAI")).toBeInTheDocument();
+    expect(within(llmSection).getByText("No LLM provider is configured yet.")).toBeInTheDocument();
+  });
+
+  it("applies working presets and discards transient credentials when provider type changes", async () => {
+    const user = userEvent.setup();
+    renderProviders();
+
+    await user.click(await screen.findByRole("button", { name: "Add provider" }));
+    expect(screen.getByLabelText(/^Endpoint URL/)).toHaveValue("https://api.elevenlabs.io/");
+    await user.clear(screen.getByLabelText(/^Endpoint URL/));
     await user.type(screen.getByLabelText(/^Endpoint URL/), "https://api.example.test");
     await user.type(screen.getByLabelText(/^API key/), "temporary-provider-credential");
-    await user.selectOptions(screen.getByLabelText("Connection mode"), "native");
-    expect(screen.queryByLabelText(/^API key/)).not.toBeInTheDocument();
-    await user.selectOptions(screen.getByLabelText("Connection mode"), "cloud_remote");
-    expect(screen.getByLabelText(/^Endpoint URL/)).toHaveValue("");
+    await user.selectOptions(screen.getByLabelText("Choose a provider type"), "ollama");
+
+    expect(screen.getByText("Language model (LLM)")).toBeInTheDocument();
+    expect(screen.getByLabelText("Connection mode")).toHaveValue("external_endpoint");
+    expect(screen.getByLabelText(/^Endpoint URL/)).toHaveValue("http://127.0.0.1:11434/");
     expect(screen.getByLabelText(/^API key/)).toHaveValue("");
   });
 
@@ -131,7 +209,7 @@ describe("managed provider configuration", () => {
     expect(screen.getByLabelText(/^Launch arguments/)).toHaveValue("--address\n127.0.0.1:8080");
 
     await user.clear(screen.getByLabelText(/^Endpoint URL/));
-    await user.clear(screen.getByLabelText("Default model"));
+    await user.clear(screen.getByLabelText(/^TTS model/));
     await user.clear(screen.getByLabelText(/^Launch arguments/));
     await user.type(screen.getByLabelText(/^Launch arguments/), "--address\n127.0.0.1:9090");
     await user.click(screen.getByRole("button", { name: "Save and check connection" }));

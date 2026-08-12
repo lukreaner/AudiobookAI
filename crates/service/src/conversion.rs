@@ -4526,6 +4526,7 @@ fn provider_endpoint_family(assignment: &SpeakerAssignment) -> &'static str {
         ProviderKindView::Localai => "openai-audio-localai",
         ProviderKindView::AlltalkV2 => "alltalk-v2",
         ProviderKindView::NativeOs => "native-os",
+        ProviderKindView::OpenaiTts => "openai-speech-v1",
         ProviderKindView::Openai => "openai",
         ProviderKindView::OpenaiCompatible => "openai-compatible",
         ProviderKindView::Anthropic => "anthropic",
@@ -4540,7 +4541,7 @@ fn provider_endpoint_family(assignment: &SpeakerAssignment) -> &'static str {
 
 fn requested_audio_format(assignment: &SpeakerAssignment) -> AudioFormat {
     match assignment.provider_kind {
-        ProviderKindView::Elevenlabs => AudioFormat::Mp3,
+        ProviderKindView::Elevenlabs | ProviderKindView::OpenaiTts => AudioFormat::Mp3,
         _ => AudioFormat::Wav,
     }
 }

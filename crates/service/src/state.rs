@@ -287,7 +287,7 @@ impl AppState {
     }
 }
 
-fn runtime_profile_from_view(
+pub(crate) fn runtime_profile_from_view(
     profile: &ProviderProfileView,
     config: &ServiceConfig,
 ) -> Result<crate::runtime::RuntimeProfile, crate::ServiceError> {
@@ -305,6 +305,7 @@ fn runtime_profile_from_view(
         ProviderKindView::Localai => RuntimeAdapterKind::LocalAi,
         ProviderKindView::AlltalkV2 => RuntimeAdapterKind::AllTalkV2,
         ProviderKindView::NativeOs => RuntimeAdapterKind::NativeOs,
+        ProviderKindView::OpenaiTts => RuntimeAdapterKind::OpenAiTts,
         ProviderKindView::Openai => RuntimeAdapterKind::OpenAi,
         ProviderKindView::OpenaiCompatible => RuntimeAdapterKind::OpenAiCompatible,
         ProviderKindView::Anthropic => RuntimeAdapterKind::Anthropic,
@@ -333,7 +334,7 @@ fn runtime_profile_from_view(
         .map(url::Url::parse)
         .transpose()
         .map_err(|error| crate::ServiceError::InvalidRequest(error.to_string()))?
-        .or_else(|| local_default_endpoint(adapter));
+        .or_else(|| provider_default_endpoint(adapter));
     runtime.executable = profile
         .executable_path
         .as_ref()
@@ -409,7 +410,7 @@ fn configure_isolated_managed_environment(
     Ok(())
 }
 
-fn local_default_endpoint(adapter: crate::runtime::RuntimeAdapterKind) -> Option<url::Url> {
+fn provider_default_endpoint(adapter: crate::runtime::RuntimeAdapterKind) -> Option<url::Url> {
     use crate::runtime::RuntimeAdapterKind;
     let endpoint = match adapter {
         RuntimeAdapterKind::MlxAudio => "http://127.0.0.1:8000/",
@@ -417,6 +418,11 @@ fn local_default_endpoint(adapter: crate::runtime::RuntimeAdapterKind) -> Option
         RuntimeAdapterKind::AllTalkV2 => "http://127.0.0.1:7851/",
         RuntimeAdapterKind::LmStudio => "http://127.0.0.1:1234/",
         RuntimeAdapterKind::Ollama => "http://127.0.0.1:11434/",
+        // Versioned OpenAI-compatible bases intentionally omit a trailing slash. `Url::join`
+        // then replaces the final `v1` segment with adapter paths such as `v1/models`.
+        RuntimeAdapterKind::Qwen => "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        RuntimeAdapterKind::Kimi => "https://api.moonshot.cn/v1",
+        RuntimeAdapterKind::Moonshot => "https://api.moonshot.ai/v1",
         _ => return None,
     };
     url::Url::parse(endpoint).ok()
@@ -539,7 +545,9 @@ async fn hydrate_providers(
     use crate::models::{
         ProviderCapabilitiesView, ProviderKindView, ProviderModeView, ProviderStatusView,
     };
-    use audiobookai_core::{ProviderDeployment, ProviderFamily, TemperatureCapability};
+    use audiobookai_core::{
+        ProviderDeployment, ProviderFamily, ProviderRole, TemperatureCapability,
+    };
 
     let profiles = database
         .repositories()
@@ -557,7 +565,10 @@ async fn hydrate_providers(
             ProviderFamily::NativeWindows
             | ProviderFamily::NativeMacos
             | ProviderFamily::EspeakNg => ProviderKindView::NativeOs,
-            ProviderFamily::OpenAi => ProviderKindView::Openai,
+            ProviderFamily::OpenAi => match profile.role {
+                ProviderRole::Tts => ProviderKindView::OpenaiTts,
+                ProviderRole::CharacterDetection | ProviderRole::Both => ProviderKindView::Openai,
+            },
             ProviderFamily::OpenAiCompatible | ProviderFamily::Custom(_) => {
                 ProviderKindView::OpenaiCompatible
             }

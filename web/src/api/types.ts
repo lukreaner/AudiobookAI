@@ -197,6 +197,7 @@ export type ProviderKind =
   | "localai"
   | "alltalk_v2"
   | "native_os"
+  | "openai_tts"
   | "openai"
   | "openai_compatible"
   | "qwen"
@@ -310,6 +311,19 @@ export interface ProviderProfileInput {
   arguments?: string[];
   model?: string | null;
   credential?: string;
+}
+
+export interface AvailableProviderModel {
+  id: string;
+  name: string;
+}
+
+export interface AvailableProviderModels {
+  items: AvailableProviderModel[];
+}
+
+export interface ProviderModelDiscoveryInput extends ProviderProfileInput {
+  providerId?: Id;
 }
 
 export interface ProviderLogLine {

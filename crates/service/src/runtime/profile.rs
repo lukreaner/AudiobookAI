@@ -16,6 +16,7 @@ pub enum RuntimeAdapterKind {
     LocalAi,
     AllTalkV2,
     NativeOs,
+    OpenAiTts,
     OpenAi,
     OpenAiCompatible,
     Anthropic,
@@ -50,7 +51,12 @@ impl RuntimeAdapterKind {
     pub const fn is_tts_provider(self) -> bool {
         matches!(
             self,
-            Self::ElevenLabs | Self::MlxAudio | Self::LocalAi | Self::AllTalkV2 | Self::NativeOs
+            Self::ElevenLabs
+                | Self::MlxAudio
+                | Self::LocalAi
+                | Self::AllTalkV2
+                | Self::NativeOs
+                | Self::OpenAiTts
         )
     }
 }

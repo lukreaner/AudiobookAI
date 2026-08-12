@@ -7,7 +7,7 @@ use audiobookai_providers::{
     adapters::{
         AllTalkProvider, AnthropicProvider, ElevenLabsProvider, GeminiProvider, LocalAiProvider,
         MlxAudioProvider, NativeCommandRunner, NativeTtsConfig, NativeTtsProvider, OllamaProvider,
-        OpenAiChatPreset, OpenAiCompatibleProvider, OpenAiResponsesProvider,
+        OpenAiChatPreset, OpenAiCompatibleProvider, OpenAiResponsesProvider, OpenAiTtsProvider,
         TokioNativeCommandRunner,
     },
 };
@@ -124,6 +124,12 @@ impl ProviderAdapterFactory {
                 bundle.tts = Some(Arc::new(NativeTtsProvider::new(
                     config,
                     Arc::clone(&self.native_runner),
+                )?));
+            }
+            RuntimeAdapterKind::OpenAiTts => {
+                bundle.tts = Some(Arc::new(OpenAiTtsProvider::new(
+                    required_endpoint(control_endpoint.as_ref())?.clone(),
+                    Arc::clone(&self.transport),
                 )?));
             }
             RuntimeAdapterKind::OpenAi => {
@@ -268,7 +274,7 @@ fn authentication_for(
 fn default_endpoint(adapter: RuntimeAdapterKind) -> Option<Url> {
     let value = match adapter {
         RuntimeAdapterKind::ElevenLabs => "https://api.elevenlabs.io/",
-        RuntimeAdapterKind::OpenAi => "https://api.openai.com/",
+        RuntimeAdapterKind::OpenAi | RuntimeAdapterKind::OpenAiTts => "https://api.openai.com/",
         RuntimeAdapterKind::Anthropic => "https://api.anthropic.com/",
         RuntimeAdapterKind::Gemini => "https://generativelanguage.googleapis.com/",
         _ => return None,
@@ -292,7 +298,10 @@ fn reject_custom_cloud_endpoint(
     profile: &RuntimeProfile,
     provider_name: &str,
 ) -> Result<(), ProviderError> {
-    if profile.endpoint.is_none() && matches!(profile.mode, ProviderKind::CloudRemote) {
+    let official = default_endpoint(profile.adapter);
+    if matches!(profile.mode, ProviderKind::CloudRemote)
+        && (profile.endpoint.is_none() || profile.endpoint == official)
+    {
         Ok(())
     } else {
         Err(ProviderError::Configuration(format!(
@@ -323,6 +332,25 @@ mod tests {
     }
 
     #[test]
+    fn constructs_openai_speech_as_tts_without_an_llm_adapter() {
+        let factory = ProviderAdapterFactory::default();
+        let credential = CredentialMaterial::new(b"not-a-real-key".to_vec());
+        let profile = RuntimeProfile::new(
+            ProviderId::new("openai-speech").unwrap(),
+            "OpenAI Speech",
+            RuntimeAdapterKind::OpenAiTts,
+            ProviderKind::CloudRemote,
+        );
+
+        let bundle = factory.build(&profile, Some(&credential)).unwrap();
+
+        assert!(bundle.tts.is_some());
+        assert!(bundle.character.is_none());
+        assert!(bundle.voice_cloner.is_none());
+        assert!(!format!("{bundle:?}").contains("not-a-real-key"));
+    }
+
+    #[test]
     fn cloud_profiles_require_credentials() {
         let factory = ProviderAdapterFactory::default();
         let profile = RuntimeProfile::new(
@@ -335,6 +363,28 @@ mod tests {
             factory.build(&profile, None),
             Err(ProviderError::Configuration(_))
         ));
+    }
+
+    #[test]
+    fn fixed_cloud_adapters_accept_only_their_official_endpoint() {
+        let factory = ProviderAdapterFactory::default();
+        let credential = CredentialMaterial::new(b"test-only".to_vec());
+        for adapter in [RuntimeAdapterKind::Anthropic, RuntimeAdapterKind::Gemini] {
+            let mut profile = RuntimeProfile::new(
+                ProviderId::new(format!("{adapter:?}").to_lowercase()).unwrap(),
+                format!("{adapter:?}"),
+                adapter,
+                ProviderKind::CloudRemote,
+            );
+            profile.endpoint = default_endpoint(adapter);
+            assert!(factory.build(&profile, Some(&credential)).is_ok());
+
+            profile.endpoint = Some(Url::parse("https://example.invalid/").unwrap());
+            assert!(matches!(
+                factory.build(&profile, Some(&credential)),
+                Err(ProviderError::Configuration(_))
+            ));
+        }
     }
 
     #[test]

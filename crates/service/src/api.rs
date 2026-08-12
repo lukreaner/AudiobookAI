@@ -129,6 +129,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(list_providers).post(create_provider),
         )
         .route(
+            "/api/v1/provider-models/discover",
+            post(discover_provider_models),
+        )
+        .route(
             "/api/v1/providers/{id}",
             get(get_provider)
                 .patch(update_provider)
@@ -3738,6 +3742,187 @@ async fn list_providers(State(state): State<Arc<AppState>>) -> Json<Page<Provide
     Json(Page::all(providers))
 }
 
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderModelDiscoveryInput {
+    provider_id: Option<Uuid>,
+    #[serde(flatten)]
+    profile: ProviderProfileInput,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AvailableProviderModelView {
+    id: String,
+    name: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AvailableProviderModelsView {
+    items: Vec<AvailableProviderModelView>,
+}
+
+async fn provider_model_discovery_profile(
+    state: &AppState,
+    provider_id: Option<Uuid>,
+    input: &ProviderProfileInput,
+) -> Result<ProviderProfileView, ServiceError> {
+    let mut profile = if let Some(provider_id) = provider_id {
+        state
+            .catalog
+            .read()
+            .await
+            .providers
+            .get(&provider_id)
+            .cloned()
+            .ok_or(ServiceError::NotFound)?
+    } else {
+        let kind = input
+            .kind
+            .clone()
+            .ok_or_else(|| ServiceError::InvalidRequest("provider kind is required".to_owned()))?;
+        ProviderProfileView {
+            id: Uuid::new_v4(),
+            name: input.name.clone().unwrap_or_else(|| format!("{kind:?}")),
+            kind,
+            mode: input.mode.unwrap_or(ProviderModeView::CloudRemote),
+            endpoint: None,
+            executable_path: None,
+            working_directory: None,
+            arguments: Vec::new(),
+            status: ProviderStatusView::Unconfigured,
+            model: None,
+            credential_configured: false,
+            capabilities: None,
+            capability_source: None,
+            capability_updated_at: None,
+            last_error: None,
+        }
+    };
+
+    if let Some(name) = &input.name {
+        reject_empty("name", name)?;
+        profile.name.clone_from(name);
+    }
+    if let Some(kind) = &input.kind {
+        profile.kind.clone_from(kind);
+    }
+    if let Some(mode) = input.mode {
+        profile.mode = mode;
+    }
+    if let Some(endpoint) = &input.endpoint {
+        profile.endpoint.clone_from(endpoint);
+    }
+    if let Some(executable_path) = &input.executable_path {
+        profile.executable_path.clone_from(executable_path);
+    }
+    if let Some(working_directory) = &input.working_directory {
+        profile.working_directory.clone_from(working_directory);
+    }
+    if let Some(arguments) = &input.arguments {
+        profile.arguments.clone_from(arguments);
+    }
+    if let Some(model) = &input.model {
+        profile.model.clone_from(model);
+    }
+    Ok(profile)
+}
+
+async fn provider_model_discovery_credential(
+    state: &AppState,
+    provider_id: Option<Uuid>,
+    supplied: Option<&str>,
+) -> Result<Option<crate::runtime::CredentialMaterial>, ServiceError> {
+    if let Some(supplied) = supplied {
+        return Ok(Some(crate::runtime::CredentialMaterial::new(
+            supplied.as_bytes().to_vec(),
+        )));
+    }
+    let Some(provider_id) = provider_id else {
+        return Ok(None);
+    };
+    let secret_id = state
+        .catalog
+        .read()
+        .await
+        .provider_secret_ids
+        .get(&provider_id)
+        .copied();
+    let Some(secret_id) = secret_id else {
+        return Ok(None);
+    };
+    Ok(Some(
+        crate::runtime::CredentialMaterial::from_zeroizing_bytes(
+            &state.secrets.expose(secret_id).await?,
+        ),
+    ))
+}
+
+/// Builds the selected adapter in memory and performs only its model-list request. The supplied
+/// credential is zeroized after the request and is never persisted by this preview endpoint.
+async fn discover_provider_models(
+    State(state): State<Arc<AppState>>,
+    Json(input): Json<ProviderModelDiscoveryInput>,
+) -> Result<Json<AvailableProviderModelsView>, ServiceError> {
+    let mut profile =
+        provider_model_discovery_profile(&state, input.provider_id, &input.profile).await?;
+    let credential = provider_model_discovery_credential(
+        &state,
+        input.provider_id,
+        input
+            .profile
+            .credential
+            .as_ref()
+            .map(|value| value.as_str()),
+    )
+    .await?;
+
+    validate_provider_location(
+        profile.mode,
+        profile.endpoint.as_deref(),
+        profile.executable_path.as_deref(),
+        profile.working_directory.as_deref(),
+        &profile.arguments,
+    )?;
+    validate_provider_sensitive_fields(
+        &profile.kind,
+        profile.mode,
+        profile.model.as_deref(),
+        credential.is_some(),
+    )?;
+    profile.capabilities = Some(default_capabilities(&profile.kind, profile.mode));
+
+    let runtime_profile = crate::state::runtime_profile_from_view(&profile, &state.config)?;
+    let models = state
+        .providers
+        .preview_models(&runtime_profile, credential.as_ref())
+        .await
+        .map_err(|error| ServiceError::Conflict(error.to_string()))?;
+    let mut unique = BTreeMap::<String, String>::new();
+    for model in models {
+        let id = model.id.trim();
+        if id.is_empty() {
+            continue;
+        }
+        let name = model.name.trim();
+        unique.insert(
+            id.to_owned(),
+            if name.is_empty() {
+                id.to_owned()
+            } else {
+                name.to_owned()
+            },
+        );
+    }
+    Ok(Json(AvailableProviderModelsView {
+        items: unique
+            .into_iter()
+            .map(|(id, name)| AvailableProviderModelView { id, name })
+            .collect(),
+    }))
+}
+
 async fn get_provider(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
@@ -4976,6 +5161,7 @@ async fn refresh_provider(
                 | ProviderKindView::Localai
                 | ProviderKindView::AlltalkV2
                 | ProviderKindView::NativeOs
+                | ProviderKindView::OpenaiTts
         ) {
         state
             .providers
@@ -6335,7 +6521,7 @@ pub(crate) async fn persist_provider(
             "macos" => ProviderFamily::NativeMacos,
             _ => ProviderFamily::EspeakNg,
         },
-        ProviderKindView::Openai => ProviderFamily::OpenAi,
+        ProviderKindView::OpenaiTts | ProviderKindView::Openai => ProviderFamily::OpenAi,
         ProviderKindView::OpenaiCompatible => ProviderFamily::OpenAiCompatible,
         ProviderKindView::Anthropic => ProviderFamily::Anthropic,
         ProviderKindView::Gemini => ProviderFamily::Gemini,
@@ -6358,6 +6544,7 @@ pub(crate) async fn persist_provider(
                 | ProviderKindView::MlxAudio
                 | ProviderKindView::AlltalkV2
                 | ProviderKindView::NativeOs
+                | ProviderKindView::OpenaiTts
         )
     {
         ProviderRole::Tts
@@ -6426,7 +6613,9 @@ pub(crate) async fn persist_provider(
                         ProviderKindView::Elevenlabs => {
                             vec![ProviderAudioFormat::PcmS16Le, ProviderAudioFormat::Mp3]
                         }
-                        ProviderKindView::MlxAudio | ProviderKindView::Localai => vec![
+                        ProviderKindView::MlxAudio
+                        | ProviderKindView::Localai
+                        | ProviderKindView::OpenaiTts => vec![
                             ProviderAudioFormat::PcmS16Le,
                             ProviderAudioFormat::Wav,
                             ProviderAudioFormat::Mp3,
@@ -6441,7 +6630,8 @@ pub(crate) async fn persist_provider(
                     reports_character_usage: matches!(profile.kind, ProviderKindView::Elevenlabs),
                     reports_audio_seconds: false,
                     reports_cost: false,
-                    max_input_characters: None,
+                    max_input_characters: matches!(profile.kind, ProviderKindView::OpenaiTts)
+                        .then_some(4096),
                     model_performance: capabilities.model_performance.clone(),
                 }),
                 character_detection: capabilities.character_detection.then_some({
@@ -7722,6 +7912,7 @@ fn default_capabilities(
             | ProviderKindView::Localai
             | ProviderKindView::AlltalkV2
             | ProviderKindView::NativeOs
+            | ProviderKindView::OpenaiTts
     );
     let character_detection = matches!(
         kind,
@@ -7748,7 +7939,10 @@ fn default_capabilities(
         character_detection,
         streaming: matches!(
             kind,
-            ProviderKindView::Elevenlabs | ProviderKindView::MlxAudio | ProviderKindView::Localai
+            ProviderKindView::Elevenlabs
+                | ProviderKindView::MlxAudio
+                | ProviderKindView::Localai
+                | ProviderKindView::OpenaiTts
         ),
         voice_cloning: matches!(kind, ProviderKindView::Elevenlabs),
         pronunciation: matches!(kind, ProviderKindView::Elevenlabs),
@@ -7806,6 +8000,9 @@ fn default_model_performance(
         ModelPerformanceCapabilities, PerformanceCapabilities, PerformanceRange,
     };
 
+    if matches!(kind, ProviderKindView::OpenaiTts) {
+        return audiobookai_providers::adapters::openai_tts_model_performance_capabilities();
+    }
     if !matches!(kind, ProviderKindView::Elevenlabs) {
         return Vec::new();
     }
@@ -8310,6 +8507,28 @@ mod tests {
     }
 
     #[test]
+    fn provider_model_discovery_uses_the_flat_provider_contract() {
+        let provider_id = Uuid::new_v4();
+        let input: ProviderModelDiscoveryInput = serde_json::from_value(serde_json::json!({
+            "providerId": provider_id,
+            "name": "Local model preview",
+            "kind": "ollama",
+            "mode": "external_endpoint",
+            "endpoint": "http://127.0.0.1:11434/",
+            "model": null
+        }))
+        .expect("provider model discovery input");
+
+        assert_eq!(input.provider_id, Some(provider_id));
+        assert!(matches!(input.profile.kind, Some(ProviderKindView::Ollama)));
+        assert!(matches!(
+            input.profile.endpoint,
+            Some(Some(ref endpoint)) if endpoint == "http://127.0.0.1:11434/"
+        ));
+        assert!(matches!(input.profile.model, Some(None)));
+    }
+
+    #[test]
     fn provider_input_debug_never_contains_the_credential() {
         let credential = ["runtime", "credential", "value"].join("-");
         let input: ProviderProfileInput = serde_json::from_value(serde_json::json!({
@@ -8489,6 +8708,19 @@ mod tests {
         assert!(ollama.model_control);
         assert_eq!(ollama.temperature, "number");
         assert_eq!(ollama.reasoning, ["disabled", "effort"]);
+
+        let openai_speech =
+            default_capabilities(&ProviderKindView::OpenaiTts, ProviderModeView::CloudRemote);
+        assert!(openai_speech.tts);
+        assert!(openai_speech.streaming);
+        assert!(!openai_speech.character_detection);
+        assert_eq!(openai_speech.temperature, "unsupported");
+        assert!(
+            openai_speech
+                .model_performance
+                .iter()
+                .any(|capability| capability.model == "gpt-4o-mini-tts")
+        );
     }
 
     #[test]

@@ -1,21 +1,16 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { invoke, isTauri } from "@tauri-apps/api/core";
-import { ArrowLeft, ArrowRight, Check, Cloud, FolderOpen, KeyRound, Laptop, LoaderCircle, ShieldCheck, Sparkles, Waves } from "lucide-react";
+import { Activity, ArrowLeft, ArrowRight, Check, Cloud, FolderOpen, KeyRound, Laptop, LoaderCircle, ShieldCheck, Sparkles, Waves } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useNavigate } from "react-router-dom";
 import { api } from "../api/client";
-import type { ProviderKind, ProviderProfile } from "../api/types";
+import type { ProviderKind } from "../api/types";
 import { ErrorState, LoadingState } from "../components/StateViews";
 import { Badge, Button, Card, Field, Input, Select, SwitchField } from "../components/ui";
-
-const wizardProviders: { kind: ProviderKind; name: string; mode: ProviderProfile["mode"]; local: boolean }[] = [
-  { kind: "native_os", name: "Native system voices", mode: "native", local: true },
-  { kind: "elevenlabs", name: "ElevenLabs", mode: "cloud_remote", local: false },
-  { kind: "mlx_audio", name: "MLX-audio", mode: "external_endpoint", local: true },
-  { kind: "localai", name: "LocalAI", mode: "external_endpoint", local: true },
-  { kind: "alltalk_v2", name: "AllTalk V2", mode: "external_endpoint", local: true },
-];
+import { ProviderModelField } from "../providers/ProviderModelField";
+import { providerPreset, providerPresetsFor } from "../providers/presets";
+import { useProviderModels } from "../providers/useProviderModels";
 
 export function SetupPage() {
   const { t, i18n } = useTranslation();
@@ -29,25 +24,47 @@ export function SetupPage() {
   const [credentialNow, setCredentialNow] = useState(false);
   const [credential, setCredential] = useState("");
   const [endpoint, setEndpoint] = useState("");
+  const [model, setModel] = useState("");
   const [storageRoot, setStorageRoot] = useState<string>();
   const [secretPassphrase, setSecretPassphrase] = useState("");
   const [secretPassphraseConfirmation, setSecretPassphraseConfirmation] = useState("");
-  const clearProviderSecrets = () => {
+  const clearProvider = () => {
+    setProviderKind("");
     setCredentialNow(false);
     setCredential("");
     setEndpoint("");
+    setModel("");
   };
   const choosePrivacy = (value: "local" | "mixed") => {
     if (value !== privacy) {
-      setProviderKind("");
-      clearProviderSecrets();
+      clearProvider();
     }
     setPrivacy(value);
   };
   const chooseProvider = (kind: ProviderKind | "") => {
     setProviderKind(kind);
-    clearProviderSecrets();
+    setCredentialNow(false);
+    setCredential("");
+    if (kind) {
+      const preset = providerPreset(kind);
+      setEndpoint(preset.defaultEndpoint);
+      setModel(preset.defaultModel);
+    } else {
+      setEndpoint("");
+      setModel("");
+    }
   };
+  const selectedProvider = providerKind ? providerPreset(providerKind) : undefined;
+  const discoveryPreset = selectedProvider ?? providerPreset("native_os");
+  const availableModels = useProviderModels({
+    enabled: step === 2 && Boolean(selectedProvider),
+    name: selectedProvider?.name ?? "",
+    kind: discoveryPreset.kind,
+    mode: discoveryPreset.defaultMode,
+    endpoint,
+    credential,
+    modelSource: discoveryPreset.modelSource,
+  });
   useEffect(() => { if (settings.data?.theme && settings.data.theme !== "system") document.documentElement.dataset.theme = settings.data.theme; }, [settings.data]);
   useEffect(() => {
     if (settings.data && storageRoot === undefined) setStorageRoot(managedStorageRoot(settings.data.libraryPath));
@@ -84,8 +101,7 @@ export function SetupPage() {
   const finish = useMutation({
     mutationFn: async () => {
       await api.updateSettings({ language: i18n.language as "en" | "de" });
-      const provider = wizardProviders.find((item) => item.kind === providerKind);
-      if (provider && provider.kind !== "native_os") await api.createProvider({ name: provider.name, kind: provider.kind, mode: provider.mode, endpoint: endpoint || undefined, credential: credentialNow && credential ? credential : undefined });
+      if (selectedProvider && selectedProvider.kind !== "native_os") await api.createProvider({ name: selectedProvider.name, kind: selectedProvider.kind, mode: selectedProvider.defaultMode, endpoint: endpoint || undefined, model: model || undefined, credential: credentialNow && credential ? credential : undefined });
       return api.completeFirstRun();
     },
     onSuccess: async (value) => { queryClient.setQueryData(["settings"], value); await queryClient.invalidateQueries({ queryKey: ["providers"] }); navigate("/library", { replace: true }); },
@@ -93,7 +109,6 @@ export function SetupPage() {
   if (settings.isLoading) return <div className="setup-shell"><LoadingState label={t("state.loadingSettings")} /></div>;
   if (settings.isError) return <div className="setup-shell"><ErrorState error={settings.error} onRetry={() => void settings.refetch()} /></div>;
   const total = 6;
-  const selectedProvider = wizardProviders.find((item) => item.kind === providerKind);
   const currentStorageRoot = settings.data ? managedStorageRoot(settings.data.libraryPath) : "";
   const previewStorageRoot = storageRoot?.trim() || currentStorageRoot;
   const previewLibraryPath = managedChildPath(previewStorageRoot, "library");
@@ -115,7 +130,24 @@ export function SetupPage() {
         <section className="setup-panel">
           {step === 0 ? <SetupIntro icon={<Waves size={30} />} title={t("setup.welcomeTitle")} detail={t("setup.welcomeDetail")}><div className="setup-points"><span><Laptop size={18} />{t("shell.localPrivate")}</span><span><KeyRound size={18} />{t("settings.keychain")}</span><span><Sparkles size={18} />{t("characters.title")}</span></div></SetupIntro> : null}
           {step === 1 ? <SetupIntro icon={<ShieldCheck size={30} />} title={t("setup.privacyTitle")} detail={t("setup.privacyDetail")}><div className="choice-grid"><button className={privacy === "local" ? "selected" : ""} onClick={() => choosePrivacy("local")}><Laptop size={23} /><strong>{t("setup.localFirst")}</strong><span>{t("shell.localPrivate")}</span>{privacy === "local" ? <Check size={17} /> : null}</button><button className={privacy === "mixed" ? "selected" : ""} onClick={() => choosePrivacy("mixed")}><Cloud size={23} /><strong>{t("setup.mixed")}</strong><span>{t("import.cloudDetail")}</span>{privacy === "mixed" ? <Check size={17} /> : null}</button></div></SetupIntro> : null}
-          {step === 2 ? <SetupIntro icon={<Waves size={30} />} title={t("setup.providerTitle")} detail={t("setup.providerDetail")}><div className="stack setup-form"><Field label={t("setup.chooseProvider")}><Select value={providerKind} onChange={(event) => chooseProvider(event.target.value as ProviderKind | "")}><option value="">{t("setup.skip")}</option>{wizardProviders.filter((provider) => privacy === "mixed" || provider.local).map((provider) => <option key={provider.kind} value={provider.kind}>{provider.name}</option>)}</Select></Field>{selectedProvider && selectedProvider.mode !== "native" ? <><Field label={t("providers.endpoint")}><Input type="url" value={endpoint} onChange={(event) => setEndpoint(event.target.value)} placeholder={selectedProvider.local ? "http://127.0.0.1:8080" : "https://api.example.com"} /></Field><SwitchField checked={credentialNow} onCheckedChange={(enabled) => { setCredentialNow(enabled); if (!enabled) setCredential(""); }} label={credentialNow ? t("setup.keyNow") : t("setup.keyLater")} />{credentialNow ? <Field label={t("providers.apiKey")} hint={t("providers.apiKeyPlaceholder")}><Input type="password" autoComplete="new-password" value={credential} onChange={(event) => setCredential(event.target.value)} /></Field> : null}</> : null}</div></SetupIntro> : null}
+          {step === 2 ? <SetupIntro icon={<Waves size={30} />} title={t("setup.providerTitle")} detail={t("setup.providerDetail")}><div className="stack setup-form">
+            <Field label={t("setup.chooseProvider")}><Select value={providerKind} onChange={(event) => chooseProvider(event.target.value as ProviderKind | "")}>
+              <option value="">{t("setup.skip")}</option>
+              <optgroup label={t("providers.ttsProviders")}>{providerPresetsFor("tts").filter((provider) => privacy === "mixed" || provider.local).map((provider) => <option key={provider.kind} value={provider.kind}>{provider.name}</option>)}</optgroup>
+              <optgroup label={t("providers.llmProviders")}>{providerPresetsFor("llm").filter((provider) => privacy === "mixed" || provider.local).map((provider) => <option key={provider.kind} value={provider.kind}>{provider.name}</option>)}</optgroup>
+            </Select></Field>
+            {selectedProvider ? <div className={`provider-role-summary provider-role-${selectedProvider.role}`}>
+              <span>{selectedProvider.role === "tts" ? <Waves size={18} /> : <Activity size={18} />}</span>
+              <div><strong>{t(selectedProvider.role === "tts" ? "providers.ttsProvider" : "providers.llmProvider")}</strong><p>{t(selectedProvider.role === "tts" ? "providers.ttsProviderDetail" : "providers.llmProviderDetail")}</p></div>
+              <Badge tone={selectedProvider.role === "tts" ? "accent" : "info"}>{selectedProvider.role.toUpperCase()}</Badge>
+            </div> : null}
+            {selectedProvider && selectedProvider.defaultMode !== "native" ? <>
+              <Field label={t("providers.endpoint")} hint={t("providers.presetEndpointHint")}><Input type="url" value={endpoint} onChange={(event) => setEndpoint(event.target.value)} placeholder={selectedProvider.defaultEndpoint || "https://provider.example/v1"} /></Field>
+              <SwitchField checked={credentialNow} onCheckedChange={(enabled) => { setCredentialNow(enabled); if (!enabled) setCredential(""); }} label={credentialNow ? t("setup.keyNow") : t("setup.keyLater")} />
+              {credentialNow ? <Field label={t("providers.apiKey")} hint={t("providers.apiKeyPlaceholder")}><Input type="password" autoComplete="new-password" value={credential} onChange={(event) => setCredential(event.target.value)} /></Field> : null}
+            </> : null}
+            {selectedProvider ? <ProviderModelField role={selectedProvider.role} source={selectedProvider.modelSource} value={model} models={availableModels.models} status={availableModels.status} onChange={setModel} /> : null}
+          </div></SetupIntro> : null}
           {step === 3 ? <SetupIntro icon={<FolderOpen size={30} />} title={t("setup.storageTitle")} detail={t("setup.storageDetail")}><div className="stack setup-form">
             <div className="field"><label className="field-label" htmlFor="setup-storage-root">{t("setup.storageRoot")}</label><div className="setup-path-picker"><Input id="setup-storage-root" value={storageRoot ?? ""} readOnly={!desktop} aria-readonly={!desktop} onChange={(event) => setStorageRoot(event.target.value)} />{desktop ? <Button variant="secondary" disabled={chooseStorage.isPending || relocateStorage.isPending} onClick={() => chooseStorage.mutate()}>{chooseStorage.isPending ? <LoaderCircle className="spin" size={16} /> : <FolderOpen size={16} />}{t("setup.browse")}</Button> : null}</div><span className="field-hint">{desktop ? t("setup.storageRootHint") : t("setup.storageDesktopOnly")}</span></div>
             <Field label={t("settings.libraryPath")} hint={t("setup.derivedPathHint")}><Input value={previewLibraryPath} readOnly aria-readonly="true" /></Field>
@@ -133,7 +165,7 @@ export function SetupPage() {
               {unlockSecrets.isError ? <ErrorState error={unlockSecrets.error} onRetry={() => unlockSecrets.mutate()} /> : null}
             </div> : null}
           </SetupIntro> : null}
-          {step === 5 ? <SetupIntro icon={<Sparkles size={30} />} title={t("setup.finishTitle")} detail={t("setup.finishDetail")}><div className="setup-summary"><div><span>{t("setup.chooseProvider")}</span><strong>{selectedProvider?.name || t("setup.skip")}</strong></div><div><span>{t("settings.libraryPath")}</span><strong>{settings.data?.libraryPath}</strong></div><div><span>{t("settings.cachePath")}</span><strong>{settings.data?.cachePath}</strong></div><div><span>{t("settings.language")}</span><strong>{i18n.language.toUpperCase()}</strong></div></div>{finish.isError ? <ErrorState error={finish.error} /> : null}</SetupIntro> : null}
+          {step === 5 ? <SetupIntro icon={<Sparkles size={30} />} title={t("setup.finishTitle")} detail={t("setup.finishDetail")}><div className="setup-summary"><div><span>{t("setup.chooseProvider")}</span><strong>{selectedProvider ? `${selectedProvider.name} · ${selectedProvider.role.toUpperCase()}${model ? ` · ${model}` : ""}` : t("setup.skip")}</strong></div><div><span>{t("settings.libraryPath")}</span><strong>{settings.data?.libraryPath}</strong></div><div><span>{t("settings.cachePath")}</span><strong>{settings.data?.cachePath}</strong></div><div><span>{t("settings.language")}</span><strong>{i18n.language.toUpperCase()}</strong></div></div>{finish.isError ? <ErrorState error={finish.error} /> : null}</SetupIntro> : null}
         </section>
         <footer className="setup-footer"><Button variant="ghost" onClick={() => setStep((value) => Math.max(0, value - 1))} disabled={step === 0 || relocateStorage.isPending}><ArrowLeft size={16} />{t("common.back")}</Button>{step < total - 1 ? <Button size="lg" onClick={next} disabled={nextDisabled}>{relocateStorage.isPending && step === 3 ? <LoaderCircle className="spin" size={17} /> : null}{step === 0 ? t("setup.begin") : relocateStorage.isPending && step === 3 ? t("setup.movingStorage") : t("common.continue")}{relocateStorage.isPending && step === 3 ? null : <ArrowRight size={16} />}</Button> : <Button size="lg" onClick={() => finish.mutate()} disabled={finish.isPending}>{finish.isPending ? <LoaderCircle className="spin" size={17} /> : <Check size={17} />}{t("setup.finish")}</Button>}</footer>
       </main>

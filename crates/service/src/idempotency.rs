@@ -121,6 +121,7 @@ fn is_secret_bearing_route(method: &Method, path: &str) -> bool {
         (
             &Method::POST,
             "/api/v1/providers"
+            | "/api/v1/provider-models/discover"
             | "/api/v1/providers/mlx-audio/models"
             | "/api/v1/secrets/unlock"
             | "/api/v1/settings/lan/tokens",
@@ -185,6 +186,7 @@ mod tests {
         let provider_id = uuid::Uuid::new_v4();
         for (method, path) in [
             (Method::POST, "/api/v1/providers".to_owned()),
+            (Method::POST, "/api/v1/provider-models/discover".to_owned()),
             (Method::PATCH, format!("/api/v1/providers/{provider_id}")),
             (Method::POST, "/api/v1/secrets/unlock".to_owned()),
             (Method::PUT, "/api/v1/settings/lan/password".to_owned()),

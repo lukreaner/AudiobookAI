@@ -8,7 +8,7 @@ use std::{
 };
 
 use audiobookai_providers::{
-    CancellationFlag, CharacterProvider, ModelDownloadProgressSink, ModelDownloadRequest,
+    CancellationFlag, CharacterProvider, Model, ModelDownloadProgressSink, ModelDownloadRequest,
     ModelDownloadStatus, OwnedProcessHandle, ProcessLogLine, ProcessState, ProcessStatus,
     ProviderControl, ProviderError, ProviderId, ProviderModelInfo, TtsProvider, Voice,
     VoiceCloneProvider,
@@ -165,6 +165,23 @@ impl ProviderRuntime {
                 feature: "character detection",
             })
         })
+    }
+
+    /// Discovers selectable synthesis or character-detection models for a registered profile.
+    pub async fn discover_models(&self, id: &ProviderId) -> Result<Vec<Model>, RuntimeError> {
+        let entry = self.entry(id).await?;
+        discover_adapter_models(&entry.adapters).await
+    }
+
+    /// Builds an unregistered adapter and discovers its models without persisting credentials or
+    /// creating process ownership. This is used only by the provider setup preview.
+    pub async fn preview_models(
+        &self,
+        profile: &RuntimeProfile,
+        credential: Option<&CredentialMaterial>,
+    ) -> Result<Vec<Model>, RuntimeError> {
+        let adapters = self.factory.build(profile, credential)?;
+        discover_adapter_models(&adapters).await
     }
 
     pub async fn voice_cloner(
@@ -400,6 +417,20 @@ impl ProviderRuntime {
     }
 }
 
+async fn discover_adapter_models(
+    adapters: &ProviderAdapterBundle,
+) -> Result<Vec<Model>, RuntimeError> {
+    if let Some(provider) = &adapters.tts {
+        return Ok(provider.discover_models().await?);
+    }
+    if let Some(provider) = &adapters.character {
+        return Ok(provider.discover_models().await?);
+    }
+    Err(RuntimeError::Provider(ProviderError::Unsupported {
+        feature: "model discovery",
+    }))
+}
+
 fn process_control<'a>(
     entry: &'a RuntimeEntry,
     id: &ProviderId,
@@ -430,12 +461,62 @@ fn model_control<'a>(
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, time::Duration};
+    use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
 
-    use audiobookai_providers::ProviderKind;
+    use async_trait::async_trait;
+    use audiobookai_providers::{
+        HttpRequest, HttpResponse, HttpTransport, ManagedProcessSupervisor, ProviderKind,
+        adapters::TokioNativeCommandRunner,
+    };
+    use bytes::Bytes;
     use url::Url;
 
     use super::*;
+
+    #[derive(Debug)]
+    struct AvailableModelsTransport;
+
+    #[async_trait]
+    impl HttpTransport for AvailableModelsTransport {
+        async fn execute(
+            &self,
+            request: HttpRequest,
+        ) -> audiobookai_providers::Result<HttpResponse> {
+            assert_eq!(request.url.as_str(), "http://127.0.0.1:19090/v1/models");
+            Ok(HttpResponse {
+                status: 200,
+                headers: BTreeMap::new(),
+                body: Bytes::from_static(br#"{"data":[{"id":"model-b"},{"id":"model-a"}]}"#),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn previews_available_models_without_registering_the_profile() {
+        let runtime = ProviderRuntime::new(ProviderAdapterFactory::new(
+            Arc::new(AvailableModelsTransport),
+            ManagedProcessSupervisor::default(),
+            Arc::new(TokioNativeCommandRunner),
+        ));
+        let mut profile = RuntimeProfile::new(
+            ProviderId::new("model-preview").unwrap(),
+            "Model preview",
+            RuntimeAdapterKind::OpenAiCompatible,
+            ProviderKind::ExternalEndpoint,
+        );
+        profile.endpoint = Some(Url::parse("http://127.0.0.1:19090/").unwrap());
+
+        let models = runtime.preview_models(&profile, None).await.unwrap();
+
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            ["model-b", "model-a"]
+        );
+        assert!(runtime.profile_ids().await.is_empty());
+    }
 
     #[cfg(unix)]
     #[tokio::test]
