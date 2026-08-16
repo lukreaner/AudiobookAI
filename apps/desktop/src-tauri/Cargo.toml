@@ -35,7 +35,7 @@ tracing-subscriber.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 webkit2gtk = "=2.0.2"
 
-[dev-dependencies]
+[target.'cfg(unix)'.dev-dependencies]
 tauri = { version = "=2.11.5", features = ["test"] }
 
 [lints]

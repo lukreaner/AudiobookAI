@@ -615,6 +615,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use tauri::webview::InvokeRequest;
     use tempfile::TempDir;
 
@@ -637,12 +638,13 @@ mod tests {
         assert!(installed_sidecar_directory(&resources.path().join("missing")).is_none());
     }
 
+    #[cfg(unix)]
     #[test]
     fn embedded_dashboard_commands_are_limited_to_the_exact_service_origin() {
         let temporary = TempDir::new().expect("temporary directory");
         let app = tauri::test::mock_builder()
             .invoke_handler(tauri::generate_handler![set_close_to_tray])
-            .build(tauri::generate_context!())
+            .build(tauri::generate_context!(test = true))
             .expect("mock desktop app");
         app.manage(DesktopState {
             service: Mutex::new(None),
