@@ -17,7 +17,7 @@ use crate::{
         ProjectDetail, PronunciationRuleView, ProviderProfileView, UsageRowView, VoiceView,
     },
 };
-use audiobookai_storage::Database;
+use audiobookai_storage::{AppPaths, Database};
 
 #[derive(Clone, Debug)]
 pub struct ImportRecord {
@@ -45,7 +45,7 @@ pub struct Catalog {
 }
 
 impl Catalog {
-    fn new(data_dir: &std::path::Path) -> Self {
+    fn new(paths: &AppPaths) -> Self {
         let mut providers = HashMap::new();
         let provider = native_provider();
         providers.insert(provider.id, provider);
@@ -61,7 +61,7 @@ impl Catalog {
             exports: Vec::new(),
             usage_rows: Vec::new(),
             budgets: HashMap::new(),
-            settings: AppSettingsView::defaults(data_dir),
+            settings: AppSettingsView::defaults_for_paths(&paths.library, &paths.cache),
             project_book_ids: HashMap::new(),
             provider_secret_ids: HashMap::new(),
         }
@@ -138,7 +138,7 @@ impl AppState {
             data_dir: config.data_dir.clone(),
             ready: true,
         };
-        let mut catalog = Catalog::new(&config.data_dir);
+        let mut catalog = Catalog::new(database.paths());
         hydrate_settings(&database, &mut catalog).await?;
         hydrate_projects(&database, &mut catalog).await?;
         hydrate_providers(&database, &mut catalog).await?;
@@ -2950,7 +2950,8 @@ mod tests {
             .await
             .expect("append usage");
 
-        let mut catalog = Catalog::new(directory.path());
+        let paths = AppPaths::from_root(directory.path());
+        let mut catalog = Catalog::new(&paths);
         hydrate_projects(&database, &mut catalog)
             .await
             .expect("hydrate projects");
@@ -3076,7 +3077,8 @@ mod tests {
         .await
         .expect("insert corrupt latest run");
 
-        let mut catalog = Catalog::new(directory.path());
+        let paths = AppPaths::from_root(directory.path());
+        let mut catalog = Catalog::new(&paths);
         hydrate_projects(&database, &mut catalog)
             .await
             .expect("hydrate projects");
@@ -3113,7 +3115,8 @@ mod tests {
         .await
         .expect("insert corrupt active job");
 
-        let mut catalog = Catalog::new(directory.path());
+        let paths = AppPaths::from_root(directory.path());
+        let mut catalog = Catalog::new(&paths);
         hydrate_projects(&database, &mut catalog)
             .await
             .expect("hydrate projects");
@@ -3141,7 +3144,8 @@ mod tests {
         .await
         .expect("persist settings fixture");
 
-        let mut catalog = Catalog::new(directory.path());
+        let paths = AppPaths::from_root(directory.path());
+        let mut catalog = Catalog::new(&paths);
         hydrate_settings(&database, &mut catalog)
             .await
             .expect("hydrate settings");

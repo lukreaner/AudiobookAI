@@ -127,6 +127,7 @@ describe("managed provider configuration", () => {
       endpoint: "http://127.0.0.1:11434/",
     })));
     await waitFor(() => expect(screen.getByLabelText(/^LLM model/).tagName).toBe("SELECT"));
+    expect(screen.getByText("Available models detected automatically: 2")).toBeInTheDocument();
     expect(screen.getByRole("option", { name: "Qwen 3 8B (qwen3:8b)" })).toBeInTheDocument();
     await user.selectOptions(screen.getByLabelText(/^LLM model/), "qwen3:8b");
     expect(screen.getByLabelText(/^LLM model/)).toHaveValue("qwen3:8b");
@@ -179,8 +180,49 @@ describe("managed provider configuration", () => {
 
     const ttsSection = await screen.findByRole("region", { name: "Text-to-speech providers" });
     const llmSection = screen.getByRole("region", { name: "LLM providers" });
+    expect(screen.getByText("Automatic model detection")).toBeInTheDocument();
     expect(within(ttsSection).getByText("LocalAI")).toBeInTheDocument();
     expect(within(llmSection).getByText("No LLM provider is configured yet.")).toBeInTheDocument();
+    expect(within(llmSection).getByRole("button", { name: "Add LLM provider" })).toBeEnabled();
+  });
+
+  it("opens a model-capable LLM preset directly from the empty role section", async () => {
+    const user = userEvent.setup();
+    renderProviders();
+
+    const llmSection = await screen.findByRole("region", { name: "LLM providers" });
+    await user.click(within(llmSection).getByRole("button", { name: "Add LLM provider" }));
+
+    expect(screen.getByLabelText("Choose a provider type")).toHaveValue("openai");
+    expect(screen.getByText("Language model (LLM)")).toBeInTheDocument();
+    expect(screen.getByLabelText(/^LLM model/)).toBeInTheDocument();
+    expect(screen.getAllByText("Models load automatically after the endpoint and required credential are configured.")).not.toHaveLength(0);
+  });
+
+  it("explains that native system voices do not expose a model catalog", async () => {
+    const nativeProvider: ProviderProfile = {
+      ...structuredClone(managedProvider),
+      id: "provider-native",
+      name: "eSpeak NG",
+      kind: "native_os",
+      mode: "native",
+      endpoint: undefined,
+      executablePath: undefined,
+      workingDirectory: undefined,
+      arguments: [],
+      model: undefined,
+      status: "online",
+    };
+    vi.mocked(api.providers).mockResolvedValue({ items: [nativeProvider], total: 1 });
+    const user = userEvent.setup();
+    renderProviders();
+
+    const ttsSection = await screen.findByRole("region", { name: "Text-to-speech providers" });
+    expect(within(ttsSection).getByText("System voices · no model catalog")).toBeInTheDocument();
+    await user.click(within(ttsSection).getByRole("button", { name: "Settings" }));
+    expect(screen.getByText("This native provider uses system voices and does not expose a model catalog.")).toBeInTheDocument();
+    expect(screen.queryByLabelText(/^TTS model/)).not.toBeInTheDocument();
+    expect(api.discoverProviderModels).not.toHaveBeenCalled();
   });
 
   it("applies working presets and discards transient credentials when provider type changes", async () => {

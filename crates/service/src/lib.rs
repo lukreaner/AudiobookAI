@@ -20,7 +20,7 @@ mod state;
 mod web;
 mod workflows;
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use axum::{
     Router,
@@ -143,9 +143,26 @@ impl ServiceHandle {
 ///
 /// Returns an error when configuration, storage, TLS, provider initialization,
 /// recovery, or listener startup fails.
-pub async fn start(mut config: ServiceConfig) -> Result<ServiceHandle, ServiceError> {
+pub async fn start(config: ServiceConfig) -> Result<ServiceHandle, ServiceError> {
+    let managed_media_root = config.data_dir.clone();
+    start_with_managed_media_root(config, managed_media_root).await
+}
+
+/// Starts the service while keeping its database and control state in
+/// `config.data_dir` and placing only the managed library and cache under the
+/// separately selected media root.
+///
+/// # Errors
+///
+/// Returns an error when configuration, either storage root, TLS, provider
+/// initialization, recovery, or listener startup fails.
+pub async fn start_with_managed_media_root(
+    mut config: ServiceConfig,
+    managed_media_root: PathBuf,
+) -> Result<ServiceHandle, ServiceError> {
     config.validate()?;
-    audiobookai_storage::AppPaths::from_root(&config.data_dir)
+    let paths = audiobookai_storage::AppPaths::from_roots(&config.data_dir, managed_media_root);
+    paths
         .ensure()
         .await
         .map_err(|error| ServiceError::Storage(error.to_string()))?;
@@ -187,7 +204,7 @@ pub async fn start(mut config: ServiceConfig) -> Result<ServiceHandle, ServiceEr
         None
     };
 
-    let database = audiobookai_storage::Database::open_in(&config.data_dir)
+    let database = audiobookai_storage::Database::open(paths)
         .await
         .map_err(|error| ServiceError::Storage(error.to_string()))?;
     let state = Arc::new(AppState::new(config.clone(), database).await?);
@@ -329,6 +346,41 @@ mod tests {
         .await
         .expect("service starts");
         assert!(handle.address().ip().is_loopback());
+        handle.shutdown().await.expect("clean shutdown");
+    }
+
+    #[tokio::test]
+    async fn external_media_root_keeps_the_live_database_local() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let data_root = directory.path().join("data");
+        let media_root = directory.path().join("media");
+        std::fs::create_dir(&media_root).expect("media root");
+        let handle = start_with_managed_media_root(
+            ServiceConfig {
+                bind: "127.0.0.1:0".parse().expect("address"),
+                data_dir: data_root.clone(),
+                bundled_sidecar_dir: None,
+                tls: None,
+                lan_hostnames: Vec::new(),
+                allow_insecure_lan: false,
+                desktop_bootstrap: true,
+            },
+            media_root.clone(),
+        )
+        .await
+        .expect("service starts");
+
+        let settings = handle.state().catalog.read().await.settings.clone();
+        assert_eq!(
+            settings.library_path,
+            media_root.join("library").to_string_lossy()
+        );
+        assert_eq!(
+            settings.cache_path,
+            media_root.join("cache").to_string_lossy()
+        );
+        assert!(data_root.join("audiobookai.sqlite3").is_file());
+        assert!(!media_root.join("audiobookai.sqlite3").exists());
         handle.shutdown().await.expect("clean shutdown");
     }
 

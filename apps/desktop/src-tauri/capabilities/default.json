@@ -4,6 +4,10 @@
   "description": "Permissions for the AudiobookAI desktop dashboard",
   "windows": ["main"],
   "permissions": [
+    "allow-choose-storage-directory",
+    "allow-quit-application",
+    "allow-configure-first-run-media-root",
+    "allow-set-close-to-tray",
     "core:default",
     "dialog:default",
     "opener:default",

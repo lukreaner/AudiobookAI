@@ -31,15 +31,46 @@ export function ProviderModelField({
     setManual(Boolean(value) && !modelIds.includes(value));
   }, [models, value]);
 
-  if (source === "none") return null;
   const label = t(role === "tts" ? "providers.ttsModel" : "providers.llmModel");
+  const discoveryDetail = source === "none"
+    ? t("providers.nativeModelDiscoveryUnavailable")
+    : status === "loading"
+      ? t("providers.loadingAvailableModels")
+      : models.length > 0
+        ? t("providers.modelsDetected", { count: models.length })
+        : status === "error"
+          ? t("providers.modelDiscoveryFailed")
+          : status === "waiting"
+            ? t("providers.modelDiscoveryWaiting")
+            : source === "default_only"
+              ? t("providers.providerDefaultModelHint")
+              : t("providers.noAvailableModels");
+  const discoveryTone = source === "none" || status === "waiting"
+    ? "is-neutral"
+    : status === "error"
+      ? "is-error"
+      : status === "loading"
+        ? "is-loading"
+        : "is-success";
+  const discoveryStatus = <div className={`provider-model-discovery-status ${discoveryTone}`} role="status" aria-live="polite">
+    <span aria-hidden="true" />
+    <div><strong>{t("providers.modelDiscoveryTitle")}</strong><p>{discoveryDetail}</p></div>
+  </div>;
+
+  if (source === "none") {
+    return <div className="provider-model-picker">{discoveryStatus}</div>;
+  }
 
   if (status === "loading") {
-    return <Field label={label} hint={t("providers.loadingAvailableModels")}><Select disabled value=""><option>{t("providers.loadingAvailableModels")}</option></Select></Field>;
+    return <div className="provider-model-picker">
+      {discoveryStatus}
+      <Field label={label} hint={t("providers.loadingAvailableModels")}><Select disabled value=""><option>{t("providers.loadingAvailableModels")}</option></Select></Field>
+    </div>;
   }
 
   if (models.length > 0) {
     return <div className="provider-model-picker">
+      {discoveryStatus}
       <Field label={label} hint={t("providers.availableModelsHint")}>
         <Select
           value={manual ? "__manual__" : discoveredValue ? value : ""}
@@ -68,5 +99,8 @@ export function ProviderModelField({
       : source === "default_only"
         ? t("providers.providerDefaultModelHint")
         : t("providers.noAvailableModels");
-  return <Field label={label} hint={hint}><Input value={value} onChange={(event) => onChange(event.target.value)} /></Field>;
+  return <div className="provider-model-picker">
+    {discoveryStatus}
+    <Field label={label} hint={hint}><Input value={value} onChange={(event) => onChange(event.target.value)} /></Field>
+  </div>;
 }

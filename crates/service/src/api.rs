@@ -778,7 +778,7 @@ async fn project_cover(
     if !state.catalog.read().await.projects.contains_key(&id) {
         return Err(ServiceError::NotFound);
     }
-    let directory = state.config.data_dir.join("library").join(id.to_string());
+    let directory = state.database.paths().library.join(id.to_string());
     let bytes = tokio::fs::read(directory.join("cover.bin"))
         .await
         .map_err(|error| {
@@ -826,11 +826,7 @@ async fn commit_import(
         ));
     }
     let project_id = Uuid::new_v4();
-    let library_dir = state
-        .config
-        .data_dir
-        .join("library")
-        .join(project_id.to_string());
+    let library_dir = state.database.paths().library.join(project_id.to_string());
     tokio::fs::create_dir_all(&library_dir).await?;
     let managed_epub = library_dir.join("source.epub");
     if tokio::fs::rename(&record.managed_path, &managed_epub)

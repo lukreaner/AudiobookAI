@@ -782,11 +782,18 @@ pub struct AppSettingsView {
 
 impl AppSettingsView {
     pub fn defaults(data_dir: &std::path::Path) -> Self {
+        Self::defaults_for_paths(&data_dir.join("library"), &data_dir.join("cache"))
+    }
+
+    pub fn defaults_for_paths(
+        library_path: &std::path::Path,
+        cache_path: &std::path::Path,
+    ) -> Self {
         Self {
             language: "en".to_owned(),
             theme: "system".to_owned(),
-            library_path: data_dir.join("library").to_string_lossy().into_owned(),
-            cache_path: data_dir.join("cache").to_string_lossy().into_owned(),
+            library_path: library_path.to_string_lossy().into_owned(),
+            cache_path: cache_path.to_string_lossy().into_owned(),
             cache_limit_bytes: 20 * 1024 * 1024 * 1024,
             default_concurrency: 4,
             default_retry_count: 3,

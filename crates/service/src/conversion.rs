@@ -4350,7 +4350,7 @@ fn provider_semaphore(provider_id: Uuid, requested: u16) -> Arc<Semaphore> {
 
 fn cache(state: &AppState) -> ContentAddressedCache {
     ContentAddressedCache::new(state.catalog.try_read().map_or_else(
-        |_| state.config.data_dir.join("cache"),
+        |_| state.database.paths().cache.clone(),
         |catalog| PathBuf::from(&catalog.settings.cache_path),
     ))
 }

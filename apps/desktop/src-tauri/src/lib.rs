@@ -12,6 +12,7 @@ mod storage_location;
 use audiobookai_service::{ServiceConfig, ServiceHandle};
 use tauri::{
     AppHandle, Emitter, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder,
+    ipc::CapabilityBuilder,
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
 };
@@ -41,6 +42,32 @@ const fn close_action(quitting: bool, close_to_tray: bool) -> CloseAction {
     } else {
         CloseAction::Exit
     }
+}
+
+const DASHBOARD_PERMISSIONS: [&str; 9] = [
+    "allow-choose-storage-directory",
+    "allow-quit-application",
+    "allow-configure-first-run-media-root",
+    "allow-set-close-to-tray",
+    "core:default",
+    "dialog:default",
+    "opener:default",
+    "process:default",
+    "updater:default",
+];
+
+fn add_dashboard_capability<R: tauri::Runtime>(
+    app: &tauri::App<R>,
+    origin: &str,
+) -> tauri::Result<()> {
+    let mut capability = CapabilityBuilder::new("embedded-dashboard")
+        .local(false)
+        .remote(origin.to_owned())
+        .window("main");
+    for permission in DASHBOARD_PERMISSIONS {
+        capability = capability.permission(permission);
+    }
+    app.add_capability(capability)
 }
 
 fn installed_sidecar_directory(resource_dir: &Path) -> Option<PathBuf> {
@@ -88,9 +115,9 @@ async fn choose_storage_directory(
 
 #[tauri::command]
 #[allow(clippy::too_many_lines)]
-async fn relocate_first_run_storage(
+async fn configure_first_run_media_root(
     state: tauri::State<'_, DesktopState>,
-    data_root: String,
+    media_root: String,
 ) -> Result<(), String> {
     let app_state = {
         let service = state
@@ -122,16 +149,22 @@ async fn relocate_first_run_storage(
         }
     }
     let original_config = app_state.config.clone();
+    let current_media_root = app_state.database.paths().managed_media_root.clone();
     drop(app_state);
 
-    let source = original_config.data_dir.clone();
-    let requested_data_root = data_root.clone();
-    let relocation_needed = tauri::async_runtime::spawn_blocking(move || {
-        storage_location::validate_relocation_target(&source, &requested_data_root)
+    let local_data_root = original_config.data_dir.clone();
+    let current_media_root_for_preflight = current_media_root.clone();
+    let requested_media_root = media_root.clone();
+    let media_change_needed = tauri::async_runtime::spawn_blocking(move || {
+        storage_location::validate_media_root_target(
+            &local_data_root,
+            &current_media_root_for_preflight,
+            &requested_media_root,
+        )
     })
     .await
     .map_err(|error| format!("the storage preflight task failed: {error}"))??;
-    if !relocation_needed {
+    if !media_change_needed {
         return Ok(());
     }
 
@@ -142,67 +175,96 @@ async fn relocate_first_run_storage(
         .take()
         .ok_or_else(|| "the desktop service is not running".to_owned())?;
     if let Err(error) = service.shutdown().await {
-        let message = format!("could not stop the desktop service for relocation: {error}");
-        return Err(recover_original_service(&state, original_config, message).await);
+        let message = format!("could not stop the desktop service for media setup: {error}");
+        return Err(
+            recover_original_service(&state, original_config, current_media_root, message).await,
+        );
     }
 
-    let source = original_config.data_dir.clone();
+    let local_data_root = original_config.data_dir.clone();
+    let current_media_root_for_staging = current_media_root.clone();
     let staged = match tauri::async_runtime::spawn_blocking(move || {
-        storage_location::stage_relocation(&source, &data_root)
+        storage_location::stage_media_root(
+            &local_data_root,
+            &current_media_root_for_staging,
+            &media_root,
+        )
     })
     .await
     {
         Ok(Ok(staged)) => staged,
         Ok(Err(error)) => {
-            return Err(recover_original_service(&state, original_config, error).await);
+            return Err(recover_original_service(
+                &state,
+                original_config,
+                current_media_root,
+                error,
+            )
+            .await);
         }
         Err(error) => {
-            let message = format!("the storage relocation task failed: {error}");
-            return Err(recover_original_service(&state, original_config, message).await);
+            let message = format!("the managed-media setup task failed: {error}");
+            return Err(recover_original_service(
+                &state,
+                original_config,
+                current_media_root,
+                message,
+            )
+            .await);
         }
     };
-    let storage_location::StagedRelocation::Ready { target, marker } = staged else {
-        start_and_store_service(&state, original_config).await?;
+    let storage_location::StagedMediaRoot::Ready { target, marker } = staged else {
+        start_and_store_service(&state, original_config, current_media_root).await?;
         return Ok(());
     };
 
-    let mut relocated_config = original_config.clone();
-    relocated_config.data_dir.clone_from(&target);
-    let relocated_service = match audiobookai_service::start(relocated_config).await {
+    let configured_service = match audiobookai_service::start_with_managed_media_root(
+        original_config.clone(),
+        target.clone(),
+    )
+    .await
+    {
         Ok(service) => service,
         Err(error) => {
             let target_for_rollback = target.clone();
             let marker_for_rollback = marker.clone();
             let rollback = tauri::async_runtime::spawn_blocking(move || {
-                storage_location::rollback_relocation(&target_for_rollback, &marker_for_rollback)
+                storage_location::rollback_media_root(&target_for_rollback, &marker_for_rollback)
             })
             .await;
-            let mut message = format!("could not open the relocated storage folder: {error}");
+            let mut message = format!("could not open the managed media folder: {error}");
             if let Ok(Err(rollback_error)) = rollback {
                 let _ = write!(message, "; {rollback_error}");
             }
-            return Err(recover_original_service(&state, original_config, message).await);
+            return Err(recover_original_service(
+                &state,
+                original_config,
+                current_media_root,
+                message,
+            )
+            .await);
         }
     };
 
     let config_path = state.storage_config_path.clone();
+    let local_data_root = original_config.data_dir.clone();
     let target_for_config = target.clone();
     let config_result = tauri::async_runtime::spawn_blocking(move || {
-        storage_location::persist_data_root(&config_path, &target_for_config)
+        storage_location::persist_storage_roots(&config_path, &local_data_root, &target_for_config)
     })
     .await
     .map_err(|error| format!("the storage configuration task failed: {error}"))
     .and_then(|result| result);
     if let Err(error) = config_result {
-        if let Err(shutdown_error) = relocated_service.shutdown().await {
+        if let Err(shutdown_error) = configured_service.shutdown().await {
             return Err(format!(
-                "{error}; the relocated service did not stop cleanly: {shutdown_error}. Restart AudiobookAI."
+                "{error}; the configured service did not stop cleanly: {shutdown_error}. Restart AudiobookAI."
             ));
         }
         let target_for_rollback = target.clone();
         let marker_for_rollback = marker.clone();
         let rollback_error = tauri::async_runtime::spawn_blocking(move || {
-            storage_location::rollback_relocation(&target_for_rollback, &marker_for_rollback)
+            storage_location::rollback_media_root(&target_for_rollback, &marker_for_rollback)
         })
         .await
         .ok()
@@ -211,31 +273,34 @@ async fn relocate_first_run_storage(
         if let Some(rollback_error) = rollback_error {
             let _ = write!(message, "; {rollback_error}");
         }
-        return Err(recover_original_service(&state, original_config, message).await);
+        return Err(
+            recover_original_service(&state, original_config, current_media_root, message).await,
+        );
     }
 
     let target_for_finish = target.clone();
     let marker_for_finish = marker.clone();
     if let Ok(Err(error)) = tauri::async_runtime::spawn_blocking(move || {
-        storage_location::finish_relocation(&target_for_finish, &marker_for_finish)
+        storage_location::finish_media_root(&target_for_finish, &marker_for_finish)
     })
     .await
     {
         tracing::warn!(
-            diagnostic_code = "desktop.storage.relocation_marker_cleanup.failed",
+            diagnostic_code = "desktop.storage.media_marker_cleanup.failed",
             %error,
-            "the storage root was switched but its relocation marker could not be removed"
+            "the media root was configured but its setup marker could not be removed"
         );
     }
-    store_service(&state, relocated_service)
+    store_service(&state, configured_service)
 }
 
 async fn recover_original_service(
     state: &DesktopState,
     config: ServiceConfig,
+    managed_media_root: PathBuf,
     message: String,
 ) -> String {
-    match start_and_store_service(state, config).await {
+    match start_and_store_service(state, config, managed_media_root).await {
         Ok(()) => message,
         Err(restart_error) => format!(
             "{message}; the original service could not be restarted: {restart_error}. Restart AudiobookAI."
@@ -246,8 +311,9 @@ async fn recover_original_service(
 async fn start_and_store_service(
     state: &DesktopState,
     config: ServiceConfig,
+    managed_media_root: PathBuf,
 ) -> Result<(), String> {
-    let service = audiobookai_service::start(config)
+    let service = audiobookai_service::start_with_managed_media_root(config, managed_media_root)
         .await
         .map_err(|error| format!("could not start the desktop service: {error}"))?;
     store_service(state, service)
@@ -388,7 +454,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             choose_storage_directory,
             quit_application,
-            relocate_first_run_storage,
+            configure_first_run_media_root,
             set_close_to_tray
         ])
         .setup(|app| {
@@ -397,11 +463,13 @@ pub fn run() {
                 .path()
                 .app_config_dir()?
                 .join("storage-location.json");
-            loopback_config.data_dir = storage_location::configured_data_root(
+            let storage_roots = storage_location::configured_storage_roots(
                 &storage_config_path,
                 &loopback_config.data_dir,
             )
             .map_err(std::io::Error::other)?;
+            loopback_config.data_dir = storage_roots.data_root;
+            let managed_media_root = storage_roots.media_root;
             loopback_config.bundled_sidecar_dir =
                 installed_sidecar_directory(&app.path().resource_dir()?);
             let (service_config, persisted_lan_applied) = match tauri::async_runtime::block_on(
@@ -421,13 +489,21 @@ pub fn run() {
                     (loopback_config.clone(), false)
                 }
             };
-            let service = match tauri::async_runtime::block_on(audiobookai_service::start(
-                service_config,
-            )) {
+            let service = match tauri::async_runtime::block_on(
+                audiobookai_service::start_with_managed_media_root(
+                    service_config,
+                    managed_media_root.clone(),
+                ),
+            ) {
                 Ok(service) => service,
                 Err(error) if persisted_lan_applied => {
                     tracing::error!(diagnostic_code = "desktop.lan.listener.failed", %error, "persisted LAN listener failed to start; using loopback-only recovery mode");
-                    tauri::async_runtime::block_on(audiobookai_service::start(loopback_config))?
+                    tauri::async_runtime::block_on(
+                        audiobookai_service::start_with_managed_media_root(
+                            loopback_config,
+                            managed_media_root,
+                        ),
+                    )?
                 }
                 Err(error) => return Err(error.into()),
             };
@@ -436,6 +512,7 @@ pub fn run() {
                 service.scheme(),
                 desktop_service_authority(&service)
             );
+            add_dashboard_capability(app, &origin)?;
             let bootstrap_nonce = tauri::async_runtime::block_on(
                 service.desktop_bootstrap_nonce(),
             );
@@ -538,6 +615,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
+    use tauri::webview::InvokeRequest;
     use tempfile::TempDir;
 
     use super::*;
@@ -557,6 +635,56 @@ mod tests {
 
         assert_eq!(installed_sidecar_directory(resources.path()), Some(bin));
         assert!(installed_sidecar_directory(&resources.path().join("missing")).is_none());
+    }
+
+    #[test]
+    fn embedded_dashboard_commands_are_limited_to_the_exact_service_origin() {
+        let temporary = TempDir::new().expect("temporary directory");
+        let app = tauri::test::mock_builder()
+            .invoke_handler(tauri::generate_handler![set_close_to_tray])
+            .build(tauri::generate_context!())
+            .expect("mock desktop app");
+        app.manage(DesktopState {
+            service: Mutex::new(None),
+            storage_config_path: temporary.path().join("storage-location.json"),
+            quitting: AtomicBool::new(false),
+            close_to_tray: AtomicBool::new(true),
+        });
+        let origin = "http://127.0.0.1:38441";
+        add_dashboard_capability(&app, origin).expect("dashboard capability");
+        let webview = WebviewWindowBuilder::new(&app, "main", WebviewUrl::default())
+            .build()
+            .expect("mock main window");
+
+        let invoke = |url: &str, enabled: bool| {
+            tauri::test::get_ipc_response(
+                &webview,
+                InvokeRequest {
+                    cmd: "set_close_to_tray".into(),
+                    callback: tauri::ipc::CallbackFn(0),
+                    error: tauri::ipc::CallbackFn(1),
+                    url: url.parse().expect("request URL"),
+                    body: tauri::ipc::InvokeBody::Json(serde_json::json!({
+                        "enabled": enabled,
+                    })),
+                    headers: tauri::http::HeaderMap::default(),
+                    invoke_key: tauri::test::INVOKE_KEY.to_owned(),
+                },
+            )
+        };
+
+        assert!(invoke(&format!("{origin}/setup"), false).is_ok());
+        assert!(
+            !app.state::<DesktopState>()
+                .close_to_tray
+                .load(Ordering::SeqCst)
+        );
+        assert!(invoke("http://127.0.0.1:38442/setup", true).is_err());
+        assert!(
+            !app.state::<DesktopState>()
+                .close_to_tray
+                .load(Ordering::SeqCst)
+        );
     }
 
     #[test]

@@ -54,20 +54,25 @@ its delivery files. Requirements that cannot be established mechanically stay
 visible as manual blockers; the service never treats an unverified attestation
 or an older report as current retailer readiness.
 
-One desktop data root is authoritative for the database, managed library, and
-content cache. During first-run setup, before any project or job exists, the
-owner can select a dedicated empty root. The desktop host stops the local
-service, copies and hashes the complete setup tree, starts the service against
-the verified copy on the same authority, and only then atomically records the
-new root outside that tree. The original setup tree remains an owner-private
-rollback copy. Library and cache paths are derived from the active root rather
-than trusted from copied settings, so copying a database from another machine
-cannot redirect data.
+Desktop storage has a private control-data root and a managed-media root. The
+control-data root holds the live SQLite database, resumable job state, backups,
+logs, and provider runtimes on the local application-data filesystem. The media
+root holds only the imported library and content cache; it defaults to the
+control-data root but can be placed in a mounted local or network folder during
+first-run setup. Before any project or job exists, the desktop host validates a
+dedicated empty media root, creates and verifies its library and cache, restarts
+the service against the split paths, and only then atomically records both
+roots outside the media tree. A failed start or configuration write rolls the
+new media root back. Library and cache paths are derived from that desktop
+configuration rather than trusted from copied database settings, so copying a
+database from another machine cannot redirect data or move the live SQLite WAL
+onto a network filesystem.
 
-After setup, the root and its derived paths are read-only. A future relocation
-feature for an existing library must checkpoint jobs, move and verify every
-managed artifact, and atomically switch the database and file roots before it
-can be exposed in Settings.
+After setup, the managed-media root and its derived paths are read-only in the
+application UI. A future relocation feature for an existing library must
+checkpoint jobs, move and verify every managed artifact, and atomically switch
+the media root before it can be exposed in Settings. The private database root
+remains local.
 
 Application defaults are durable owner settings. Loudness and true-peak values
 are applied when a new export profile is created, while chapter concurrency and

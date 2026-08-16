@@ -1,6 +1,6 @@
 use std::{
-    fs::{self, File, OpenOptions},
-    io::{Read as _, Write as _},
+    fs::{self, File},
+    io::Write as _,
     path::{Path, PathBuf},
 };
 
@@ -9,45 +9,42 @@ use std::os::unix::fs::PermissionsExt as _;
 
 use serde::{Deserialize, Serialize};
 
-const CONFIG_VERSION: u8 = 1;
-const RELOCATION_MARKER: &str = ".audiobookai-first-run-relocation";
+const CONFIG_VERSION: u8 = 2;
+const LEGACY_CONFIG_VERSION: u8 = 1;
+const MEDIA_ROOT_MARKER: &str = ".audiobookai-first-run-media-root";
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct StorageLocationConfig {
     version: u8,
     data_root: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    media_root: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ConfiguredStorageRoots {
+    pub(crate) data_root: PathBuf,
+    pub(crate) media_root: PathBuf,
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) enum StagedRelocation {
+pub(crate) enum StagedMediaRoot {
     Unchanged,
     Ready { target: PathBuf, marker: String },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ManifestEntry {
-    relative_path: PathBuf,
-    kind: ManifestEntryKind,
-    size: u64,
-    permissions: u32,
-    digest: Option<blake3::Hash>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ManifestEntryKind {
-    Directory,
-    File,
-}
-
-pub(crate) fn configured_data_root(
+pub(crate) fn configured_storage_roots(
     config_path: &Path,
     default_root: &Path,
-) -> Result<PathBuf, String> {
+) -> Result<ConfiguredStorageRoots, String> {
     let metadata = match fs::symlink_metadata(config_path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(default_root.to_path_buf());
+            return Ok(ConfiguredStorageRoots {
+                data_root: default_root.to_path_buf(),
+                media_root: default_root.to_path_buf(),
+            });
         }
         Err(error) => {
             return Err(format!(
@@ -65,30 +62,34 @@ pub(crate) fn configured_data_root(
         .map_err(|error| format!("could not read the desktop storage configuration: {error}"))?;
     let config: StorageLocationConfig = serde_json::from_slice(&payload)
         .map_err(|error| format!("the desktop storage configuration is invalid: {error}"))?;
-    if config.version != CONFIG_VERSION {
-        return Err(format!(
-            "unsupported desktop storage configuration version {}",
-            config.version
-        ));
-    }
-    if !config.data_root.is_absolute() {
-        return Err("the configured desktop storage path must be absolute".to_owned());
-    }
-    let metadata = fs::symlink_metadata(&config.data_root)
-        .map_err(|error| format!("the configured desktop storage path is unavailable: {error}"))?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return Err(
-            "the configured desktop storage path must be a non-symlinked directory".to_owned(),
-        );
-    }
-    fs::canonicalize(&config.data_root)
-        .map_err(|error| format!("could not resolve the configured desktop storage path: {error}"))
+    let data_root = configured_directory(&config.data_root, "desktop data path")?;
+    let media_root = match config.version {
+        LEGACY_CONFIG_VERSION => data_root.clone(),
+        CONFIG_VERSION => configured_directory(
+            config.media_root.as_deref().ok_or_else(|| {
+                "the desktop storage configuration is missing its media root".to_owned()
+            })?,
+            "desktop media path",
+        )?,
+        version => {
+            return Err(format!(
+                "unsupported desktop storage configuration version {version}"
+            ));
+        }
+    };
+    Ok(ConfiguredStorageRoots {
+        data_root,
+        media_root,
+    })
 }
 
-pub(crate) fn persist_data_root(config_path: &Path, data_root: &Path) -> Result<(), String> {
-    if !data_root.is_absolute() {
-        return Err("the desktop storage path must be absolute".to_owned());
-    }
+pub(crate) fn persist_storage_roots(
+    config_path: &Path,
+    data_root: &Path,
+    media_root: &Path,
+) -> Result<(), String> {
+    let data_root = configured_directory(data_root, "desktop data path")?;
+    let media_root = configured_directory(media_root, "desktop media path")?;
     let parent = config_path
         .parent()
         .ok_or_else(|| "the desktop storage configuration has no parent directory".to_owned())?;
@@ -103,7 +104,8 @@ pub(crate) fn persist_data_root(config_path: &Path, data_root: &Path) -> Result<
         temporary.as_file_mut(),
         &StorageLocationConfig {
             version: CONFIG_VERSION,
-            data_root: data_root.to_path_buf(),
+            data_root,
+            media_root: Some(media_root),
         },
     )
     .map_err(|error| format!("could not encode the desktop storage configuration: {error}"))?;
@@ -126,119 +128,183 @@ pub(crate) fn persist_data_root(config_path: &Path, data_root: &Path) -> Result<
     Ok(())
 }
 
-pub(crate) fn stage_relocation(source: &Path, requested: &str) -> Result<StagedRelocation, String> {
-    let Some((source, target)) = relocation_paths(source, requested)? else {
-        return Ok(StagedRelocation::Unchanged);
+pub(crate) fn stage_media_root(
+    data_root: &Path,
+    current_media_root: &Path,
+    requested: &str,
+) -> Result<StagedMediaRoot, String> {
+    let Some(target) = media_root_target(data_root, current_media_root, requested)? else {
+        return Ok(StagedMediaRoot::Unchanged);
     };
 
     let parent = target
         .parent()
-        .ok_or_else(|| "the new storage folder has no parent directory".to_owned())?;
+        .ok_or_else(|| "the new media folder has no parent directory".to_owned())?;
     let staging = tempfile::Builder::new()
-        .prefix(".audiobookai-relocation-")
+        .prefix(".audiobookai-media-root-")
         .tempdir_in(parent)
-        .map_err(|error| format!("could not stage the new storage folder: {error}"))?;
-    copy_directory_contents(&source, staging.path())?;
-    fs::set_permissions(
-        staging.path(),
-        fs::metadata(&source).map_err(io_error)?.permissions(),
-    )
-    .map_err(|error| format!("could not preserve storage-folder permissions: {error}"))?;
-
-    let source_manifest = build_manifest(&source)?;
-    let target_manifest = build_manifest(staging.path())?;
-    if source_manifest != target_manifest {
-        return Err("the copied storage data did not pass verification".to_owned());
-    }
+        .map_err(|error| format!("could not stage the new media folder: {error}"))?;
+    let library = staging.path().join("library");
+    let cache = staging.path().join("cache");
+    fs::create_dir(&library)
+        .and_then(|()| fs::create_dir(&cache))
+        .map_err(|error| format!("could not create managed media folders: {error}"))?;
+    verify_writable_directory(&library)?;
+    verify_writable_directory(&cache)?;
 
     let marker = staging
         .path()
         .file_name()
         .and_then(|value| value.to_str())
-        .ok_or_else(|| "the relocation staging marker is invalid".to_owned())?
+        .ok_or_else(|| "the media-root staging marker is invalid".to_owned())?
         .to_owned();
-    let marker_path = staging.path().join(RELOCATION_MARKER);
+    let marker_path = staging.path().join(MEDIA_ROOT_MARKER);
     let mut marker_file = File::create(&marker_path)
-        .map_err(|error| format!("could not create the relocation marker: {error}"))?;
+        .map_err(|error| format!("could not create the media-root marker: {error}"))?;
     marker_file
         .write_all(marker.as_bytes())
         .and_then(|()| marker_file.sync_all())
-        .map_err(|error| format!("could not sync the relocation marker: {error}"))?;
-    harden_private_file(&marker_path)?;
+        .map_err(|error| format!("could not sync the media-root marker: {error}"))?;
     drop(marker_file);
+    sync_directory(staging.path())?;
 
     if target.exists() {
         fs::remove_dir(&target)
-            .map_err(|error| format!("could not replace the empty storage folder: {error}"))?;
+            .map_err(|error| format!("could not replace the empty media folder: {error}"))?;
     }
     let staging_path = staging.keep();
     if let Err(error) = fs::rename(&staging_path, &target) {
         let _ = fs::remove_dir_all(&staging_path);
         return Err(format!(
-            "could not activate the copied storage folder: {error}"
+            "could not activate the managed media folder: {error}"
         ));
     }
     sync_directory(parent)?;
-    Ok(StagedRelocation::Ready { target, marker })
+    Ok(StagedMediaRoot::Ready { target, marker })
 }
 
-/// Checks user-controlled relocation input while the service is still running.
+/// Checks user-controlled media-root input while the service is still running.
 ///
 /// Staging repeats these checks after shutdown so filesystem changes between the
-/// preflight and the copy cannot bypass the safety boundary.
-pub(crate) fn validate_relocation_target(source: &Path, requested: &str) -> Result<bool, String> {
-    Ok(relocation_paths(source, requested)?.is_some())
+/// preflight and activation cannot bypass the safety boundary.
+pub(crate) fn validate_media_root_target(
+    data_root: &Path,
+    current_media_root: &Path,
+    requested: &str,
+) -> Result<bool, String> {
+    Ok(media_root_target(data_root, current_media_root, requested)?.is_some())
 }
 
-fn relocation_paths(source: &Path, requested: &str) -> Result<Option<(PathBuf, PathBuf)>, String> {
-    let source = canonical_directory(source, "current desktop storage path")?;
+fn media_root_target(
+    data_root: &Path,
+    current_media_root: &Path,
+    requested: &str,
+) -> Result<Option<PathBuf>, String> {
+    let data_root = canonical_directory(data_root, "local desktop data path")?;
+    let current_media_root = canonical_directory(current_media_root, "current media path")?;
     let requested = requested.trim();
     if requested.is_empty() {
-        return Err("choose a storage folder before continuing".to_owned());
+        return Err("choose a media folder before continuing".to_owned());
     }
     let requested = PathBuf::from(requested);
     if !requested.is_absolute() {
-        return Err("the storage folder must be an absolute path".to_owned());
+        return Err("the media folder must be an absolute path".to_owned());
     }
 
     let target = prepare_target_path(&requested)?;
-    if target == source {
+    if target == current_media_root {
         return Ok(None);
     }
-    if target.starts_with(&source) || source.starts_with(&target) {
+    if target.starts_with(&data_root) || data_root.starts_with(&target) {
         return Err(
-            "the new storage folder must not contain, or be contained by, the current storage folder"
+            "the media folder must be separate from the private local data folder".to_owned(),
+        );
+    }
+    if target.starts_with(&current_media_root) || current_media_root.starts_with(&target) {
+        return Err(
+            "the new media folder must not contain, or be contained by, the current media folder"
                 .to_owned(),
         );
     }
+    verify_current_media_is_empty(&current_media_root)?;
     if target.exists() && directory_has_entries(&target)? {
-        return Err("the new storage folder must be empty".to_owned());
+        return Err("the new media folder must be empty".to_owned());
     }
 
     let parent = target
         .parent()
-        .ok_or_else(|| "the new storage folder has no parent directory".to_owned())?;
+        .ok_or_else(|| "the new media folder has no parent directory".to_owned())?;
     let write_check = tempfile::Builder::new()
         .prefix(".audiobookai-write-check-")
         .tempdir_in(parent)
-        .map_err(|error| format!("the new storage folder is not writable: {error}"))?;
+        .map_err(|error| format!("the new media folder is not writable: {error}"))?;
     write_check
         .close()
-        .map_err(|error| format!("could not clean up the storage write check: {error}"))?;
-    Ok(Some((source, target)))
+        .map_err(|error| format!("could not clean up the media write check: {error}"))?;
+    Ok(Some(target))
 }
 
-pub(crate) fn finish_relocation(target: &Path, marker: &str) -> Result<(), String> {
-    verify_relocation_marker(target, marker)?;
-    fs::remove_file(target.join(RELOCATION_MARKER))
-        .map_err(|error| format!("could not remove the completed relocation marker: {error}"))?;
+fn verify_current_media_is_empty(media_root: &Path) -> Result<(), String> {
+    for child in ["library", "cache"] {
+        let path = media_root.join(child);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                if directory_has_entries(&path)? {
+                    return Err(
+                        "managed media cannot be moved after an import or cache entry exists"
+                            .to_owned(),
+                    );
+                }
+            }
+            Ok(_) => {
+                return Err(format!(
+                    "the current managed {child} path is not a regular directory"
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "could not inspect the current managed {child} folder: {error}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_writable_directory(path: &Path) -> Result<(), String> {
+    let probe = path.join(".audiobookai-write-check");
+    let expected = b"AudiobookAI managed-media write check";
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .map_err(|error| format!("the managed media folder is not writable: {error}"))?;
+    file.write_all(expected)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| format!("could not sync the managed media write check: {error}"))?;
+    drop(file);
+    let actual = fs::read(&probe)
+        .map_err(|error| format!("could not verify the managed media write check: {error}"))?;
+    fs::remove_file(&probe)
+        .map_err(|error| format!("could not clean up the managed media write check: {error}"))?;
+    if actual != expected {
+        return Err("the managed media folder did not preserve written data".to_owned());
+    }
+    sync_directory(path)
+}
+
+pub(crate) fn finish_media_root(target: &Path, marker: &str) -> Result<(), String> {
+    verify_media_root_marker(target, marker)?;
+    fs::remove_file(target.join(MEDIA_ROOT_MARKER))
+        .map_err(|error| format!("could not remove the completed media-root marker: {error}"))?;
     sync_directory(target)
 }
 
-pub(crate) fn rollback_relocation(target: &Path, marker: &str) -> Result<(), String> {
-    verify_relocation_marker(target, marker)?;
+pub(crate) fn rollback_media_root(target: &Path, marker: &str) -> Result<(), String> {
+    verify_media_root_marker(target, marker)?;
     fs::remove_dir_all(target)
-        .map_err(|error| format!("could not roll back the staged storage folder: {error}"))?;
+        .map_err(|error| format!("could not roll back the staged media folder: {error}"))?;
     if let Some(parent) = target.parent() {
         sync_directory(parent)?;
     }
@@ -249,10 +315,10 @@ fn prepare_target_path(requested: &Path) -> Result<PathBuf, String> {
     match fs::symlink_metadata(requested) {
         Ok(metadata) => {
             if !metadata.is_dir() || metadata.file_type().is_symlink() {
-                return Err("the new storage path must be a non-symlinked directory".to_owned());
+                return Err("the new media path must be a non-symlinked directory".to_owned());
             }
             fs::canonicalize(requested)
-                .map_err(|error| format!("could not resolve the new storage folder: {error}"))
+                .map_err(|error| format!("could not resolve the new media folder: {error}"))
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let name = requested.file_name().ok_or_else(|| {
@@ -260,14 +326,21 @@ fn prepare_target_path(requested: &Path) -> Result<PathBuf, String> {
             })?;
             let parent = requested
                 .parent()
-                .ok_or_else(|| "the new storage folder has no parent directory".to_owned())?;
+                .ok_or_else(|| "the new media folder has no parent directory".to_owned())?;
             fs::create_dir_all(parent)
-                .map_err(|error| format!("could not create the storage-folder parent: {error}"))?;
-            let parent = canonical_directory(parent, "storage-folder parent")?;
+                .map_err(|error| format!("could not create the media-folder parent: {error}"))?;
+            let parent = canonical_directory(parent, "media-folder parent")?;
             Ok(parent.join(name))
         }
-        Err(error) => Err(format!("could not inspect the new storage folder: {error}")),
+        Err(error) => Err(format!("could not inspect the new media folder: {error}")),
     }
+}
+
+fn configured_directory(path: &Path, label: &str) -> Result<PathBuf, String> {
+    if !path.is_absolute() {
+        return Err(format!("the configured {label} must be absolute"));
+    }
+    canonical_directory(path, &format!("configured {label}"))
 }
 
 fn canonical_directory(path: &Path, label: &str) -> Result<PathBuf, String> {
@@ -281,135 +354,31 @@ fn canonical_directory(path: &Path, label: &str) -> Result<PathBuf, String> {
 
 fn directory_has_entries(path: &Path) -> Result<bool, String> {
     fs::read_dir(path)
-        .map_err(|error| format!("could not inspect the new storage folder: {error}"))?
+        .map_err(|error| format!("could not inspect the media folder: {error}"))?
         .next()
         .transpose()
         .map(|entry| entry.is_some())
-        .map_err(|error| format!("could not inspect the new storage folder: {error}"))
+        .map_err(|error| format!("could not inspect the media folder: {error}"))
 }
 
-fn copy_directory_contents(source: &Path, target: &Path) -> Result<(), String> {
-    for entry in fs::read_dir(source)
-        .map_err(|error| format!("could not read the current storage folder: {error}"))?
-    {
-        let entry = entry.map_err(io_error)?;
-        let source_path = entry.path();
-        let target_path = target.join(entry.file_name());
-        let metadata = fs::symlink_metadata(&source_path).map_err(io_error)?;
-        if metadata.file_type().is_symlink() {
-            return Err("managed storage must not contain symbolic links during setup".to_owned());
-        }
-        if metadata.is_dir() {
-            fs::create_dir(&target_path).map_err(io_error)?;
-            copy_directory_contents(&source_path, &target_path)?;
-            fs::set_permissions(&target_path, metadata.permissions()).map_err(io_error)?;
-        } else if metadata.is_file() {
-            let copied = fs::copy(&source_path, &target_path).map_err(io_error)?;
-            if copied != metadata.len() {
-                return Err("a managed storage file was not copied completely".to_owned());
-            }
-            OpenOptions::new()
-                .write(true)
-                .open(&target_path)
-                .and_then(|file| file.sync_all())
-                .map_err(io_error)?;
-            fs::set_permissions(&target_path, metadata.permissions()).map_err(io_error)?;
-        } else {
-            return Err("managed storage contains an unsupported special file".to_owned());
-        }
-    }
-    sync_directory(target)
-}
-
-fn build_manifest(root: &Path) -> Result<Vec<ManifestEntry>, String> {
-    let mut entries = Vec::new();
-    collect_manifest(root, root, &mut entries)?;
-    entries.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-    Ok(entries)
-}
-
-fn collect_manifest(
-    root: &Path,
-    directory: &Path,
-    entries: &mut Vec<ManifestEntry>,
-) -> Result<(), String> {
-    for entry in fs::read_dir(directory).map_err(io_error)? {
-        let entry = entry.map_err(io_error)?;
-        let path = entry.path();
-        let metadata = fs::symlink_metadata(&path).map_err(io_error)?;
-        let relative_path = path
-            .strip_prefix(root)
-            .map_err(|_| "could not build a relative storage manifest".to_owned())?
-            .to_path_buf();
-        if metadata.file_type().is_symlink() {
-            return Err("managed storage must not contain symbolic links during setup".to_owned());
-        }
-        if metadata.is_dir() {
-            entries.push(ManifestEntry {
-                relative_path,
-                kind: ManifestEntryKind::Directory,
-                size: 0,
-                permissions: permission_fingerprint(&metadata),
-                digest: None,
-            });
-            collect_manifest(root, &path, entries)?;
-        } else if metadata.is_file() {
-            entries.push(ManifestEntry {
-                relative_path,
-                kind: ManifestEntryKind::File,
-                size: metadata.len(),
-                permissions: permission_fingerprint(&metadata),
-                digest: Some(hash_file(&path)?),
-            });
-        } else {
-            return Err("managed storage contains an unsupported special file".to_owned());
-        }
-    }
-    Ok(())
-}
-
-fn hash_file(path: &Path) -> Result<blake3::Hash, String> {
-    let mut file = File::open(path).map_err(io_error)?;
-    let mut hasher = blake3::Hasher::new();
-    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
-    loop {
-        let read = file.read(&mut buffer).map_err(io_error)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(hasher.finalize())
-}
-
-fn verify_relocation_marker(target: &Path, expected: &str) -> Result<(), String> {
+fn verify_media_root_marker(target: &Path, expected: &str) -> Result<(), String> {
     let target_metadata = fs::symlink_metadata(target)
-        .map_err(|error| format!("could not inspect the relocated storage folder: {error}"))?;
+        .map_err(|error| format!("could not inspect the managed media folder: {error}"))?;
     if !target_metadata.is_dir() || target_metadata.file_type().is_symlink() {
-        return Err("the relocated storage folder changed unexpectedly".to_owned());
+        return Err("the managed media folder changed unexpectedly".to_owned());
     }
-    let marker_path = target.join(RELOCATION_MARKER);
+    let marker_path = target.join(MEDIA_ROOT_MARKER);
     let marker_metadata = fs::symlink_metadata(&marker_path)
-        .map_err(|error| format!("could not inspect the relocation marker: {error}"))?;
+        .map_err(|error| format!("could not inspect the media-root marker: {error}"))?;
     if !marker_metadata.is_file() || marker_metadata.file_type().is_symlink() {
-        return Err("the relocation marker changed unexpectedly".to_owned());
+        return Err("the media-root marker changed unexpectedly".to_owned());
     }
     let actual = fs::read_to_string(marker_path)
-        .map_err(|error| format!("could not read the relocation marker: {error}"))?;
+        .map_err(|error| format!("could not read the media-root marker: {error}"))?;
     if actual != expected {
-        return Err("the relocation marker no longer matches this operation".to_owned());
+        return Err("the media-root marker no longer matches this operation".to_owned());
     }
     Ok(())
-}
-
-#[cfg(unix)]
-fn permission_fingerprint(metadata: &fs::Metadata) -> u32 {
-    metadata.permissions().mode()
-}
-
-#[cfg(not(unix))]
-fn permission_fingerprint(metadata: &fs::Metadata) -> u32 {
-    u32::from(metadata.permissions().readonly())
 }
 
 #[cfg(unix)]
@@ -446,109 +415,170 @@ fn sync_directory(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-#[allow(clippy::needless_pass_by_value)] // Adapter for Result::map_err, which passes errors by value.
-fn io_error(error: std::io::Error) -> String {
-    format!("storage relocation failed: {error}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn configured_root_defaults_and_round_trips() {
+    fn configured_roots_default_migrate_and_round_trip() {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let default_root = temporary.path().join("default");
-        let selected_root = temporary.path().join("selected");
+        let legacy_root = temporary.path().join("legacy");
+        let media_root = temporary.path().join("media");
         let config_path = temporary
             .path()
             .join("config")
             .join("storage-location.json");
         fs::create_dir_all(&default_root).expect("default root");
-        fs::create_dir_all(&selected_root).expect("selected root");
+        fs::create_dir_all(&legacy_root).expect("legacy root");
+        fs::create_dir_all(&media_root).expect("media root");
 
         assert_eq!(
-            configured_data_root(&config_path, &default_root).expect("default location"),
-            default_root
+            configured_storage_roots(&config_path, &default_root).expect("default location"),
+            ConfiguredStorageRoots {
+                data_root: default_root.clone(),
+                media_root: default_root.clone(),
+            }
         );
-        persist_data_root(&config_path, &selected_root).expect("persist selected root");
+
+        fs::create_dir_all(config_path.parent().expect("config parent")).expect("config parent");
+        fs::write(
+            &config_path,
+            serde_json::json!({ "version": 1, "dataRoot": legacy_root })
+                .to_string()
+                .as_bytes(),
+        )
+        .expect("legacy config");
+        let legacy = fs::canonicalize(&legacy_root).expect("canonical legacy root");
         assert_eq!(
-            configured_data_root(&config_path, &default_root).expect("configured location"),
-            fs::canonicalize(selected_root).expect("canonical selected root")
+            configured_storage_roots(&config_path, &default_root).expect("legacy location"),
+            ConfiguredStorageRoots {
+                data_root: legacy.clone(),
+                media_root: legacy,
+            }
+        );
+
+        persist_storage_roots(&config_path, &default_root, &media_root)
+            .expect("persist selected media root");
+        assert_eq!(
+            configured_storage_roots(&config_path, &default_root).expect("configured location"),
+            ConfiguredStorageRoots {
+                data_root: fs::canonicalize(default_root).expect("canonical default root"),
+                media_root: fs::canonicalize(media_root).expect("canonical media root"),
+            }
         );
     }
 
     #[test]
-    fn relocation_copies_and_verifies_the_managed_tree() {
+    fn media_setup_creates_only_library_and_cache_outside_local_data() {
         let temporary = tempfile::tempdir().expect("temporary directory");
-        let source = temporary.path().join("source");
-        let target = temporary.path().join("selected");
-        fs::create_dir_all(source.join("library")).expect("library");
-        fs::create_dir_all(source.join("cache")).expect("cache");
+        let data_root = temporary.path().join("local-data");
+        let target = temporary.path().join("selected-media");
+        fs::create_dir_all(data_root.join("library")).expect("local library");
+        fs::create_dir_all(data_root.join("cache")).expect("local cache");
+        fs::write(data_root.join("audiobookai.sqlite3"), b"database").expect("database");
         fs::create_dir(&target).expect("empty selected folder");
-        fs::write(source.join("audiobookai.sqlite3"), b"database").expect("database");
-        fs::write(source.join("library").join("book.epub"), b"book").expect("book");
 
-        let StagedRelocation::Ready {
-            target: relocated,
+        let StagedMediaRoot::Ready {
+            target: configured,
             marker,
-        } = stage_relocation(&source, target.to_str().expect("UTF-8 target"))
-            .expect("staged relocation")
+        } = stage_media_root(
+            &data_root,
+            &data_root,
+            target.to_str().expect("UTF-8 target"),
+        )
+        .expect("staged media root")
         else {
-            panic!("relocation unexpectedly reported no change");
+            panic!("media setup unexpectedly reported no change");
         };
         assert_eq!(
-            relocated,
+            configured,
             fs::canonicalize(&target).expect("canonical target")
         );
+        assert!(configured.join("library").is_dir());
+        assert!(configured.join("cache").is_dir());
+        assert!(!configured.join("audiobookai.sqlite3").exists());
         assert_eq!(
-            fs::read(relocated.join("library").join("book.epub")).expect("copied book"),
-            b"book"
+            fs::read(data_root.join("audiobookai.sqlite3")).expect("local database"),
+            b"database"
         );
-        finish_relocation(&relocated, &marker).expect("finish relocation");
-        assert!(!relocated.join(RELOCATION_MARKER).exists());
+        finish_media_root(&configured, &marker).expect("finish media setup");
+        assert!(!configured.join(MEDIA_ROOT_MARKER).exists());
     }
 
     #[test]
-    fn relocation_rejects_nonempty_and_overlapping_targets() {
+    fn media_setup_rejects_nonempty_overlapping_and_in_use_paths() {
         let temporary = tempfile::tempdir().expect("temporary directory");
-        let source = temporary.path().join("source");
+        let data_root = temporary.path().join("local-data");
         let nonempty = temporary.path().join("nonempty");
-        fs::create_dir_all(source.join("library")).expect("source");
+        fs::create_dir_all(data_root.join("library")).expect("local library");
+        fs::create_dir_all(data_root.join("cache")).expect("local cache");
         fs::create_dir_all(&nonempty).expect("target");
         fs::write(nonempty.join("unrelated.txt"), b"occupied").expect("occupied target");
 
-        let nonempty_error = stage_relocation(&source, nonempty.to_str().expect("UTF-8 target"))
-            .expect_err("nonempty target must fail");
+        let nonempty_error = stage_media_root(
+            &data_root,
+            &data_root,
+            nonempty.to_str().expect("UTF-8 target"),
+        )
+        .expect_err("nonempty target must fail");
         assert!(nonempty_error.contains("must be empty"));
 
-        let nested = source.join("nested");
-        let overlap_error = stage_relocation(&source, nested.to_str().expect("UTF-8 target"))
-            .expect_err("nested target must fail");
-        assert!(overlap_error.contains("must not contain"));
+        let nested = data_root.join("nested");
+        let overlap_error = stage_media_root(
+            &data_root,
+            &data_root,
+            nested.to_str().expect("UTF-8 target"),
+        )
+        .expect_err("nested target must fail");
+        assert!(overlap_error.contains("separate"));
+
+        fs::write(data_root.join("library").join("book.epub"), b"book").expect("managed book");
+        let unused = temporary.path().join("unused");
+        fs::create_dir(&unused).expect("empty target");
+        let in_use_error = stage_media_root(
+            &data_root,
+            &data_root,
+            unused.to_str().expect("UTF-8 target"),
+        )
+        .expect_err("in-use media root must fail");
+        assert!(in_use_error.contains("cannot be moved"));
     }
 
     #[test]
-    fn relocation_preflight_does_not_mutate_or_stop_for_invalid_input() {
+    fn media_preflight_leaves_invalid_target_untouched() {
         let temporary = tempfile::tempdir().expect("temporary directory");
-        let source = temporary.path().join("source");
+        let data_root = temporary.path().join("local-data");
         let empty = temporary.path().join("empty");
         let occupied = temporary.path().join("occupied");
-        fs::create_dir_all(&source).expect("source");
+        fs::create_dir_all(data_root.join("library")).expect("local library");
+        fs::create_dir_all(data_root.join("cache")).expect("local cache");
         fs::create_dir_all(&empty).expect("empty target");
         fs::create_dir_all(&occupied).expect("occupied target");
         fs::write(occupied.join("existing.txt"), b"existing").expect("occupied file");
 
         assert!(
-            !validate_relocation_target(&source, source.to_str().expect("UTF-8 source"))
-                .expect("unchanged preflight")
+            !validate_media_root_target(
+                &data_root,
+                &data_root,
+                data_root.to_str().expect("UTF-8 data root")
+            )
+            .expect("unchanged preflight")
         );
         assert!(
-            validate_relocation_target(&source, empty.to_str().expect("UTF-8 target"))
-                .expect("valid preflight")
+            validate_media_root_target(
+                &data_root,
+                &data_root,
+                empty.to_str().expect("UTF-8 target")
+            )
+            .expect("valid preflight")
         );
-        let error = validate_relocation_target(&source, occupied.to_str().expect("UTF-8 target"))
-            .expect_err("occupied target must fail preflight");
+        let error = validate_media_root_target(
+            &data_root,
+            &data_root,
+            occupied.to_str().expect("UTF-8 target"),
+        )
+        .expect_err("occupied target must fail preflight");
         assert!(error.contains("must be empty"));
         assert_eq!(
             fs::read(occupied.join("existing.txt")).expect("existing file remains"),
@@ -557,25 +587,29 @@ mod tests {
     }
 
     #[test]
-    fn relocation_rollback_only_removes_its_marked_copy() {
+    fn media_rollback_only_removes_its_marked_root() {
         let temporary = tempfile::tempdir().expect("temporary directory");
-        let source = temporary.path().join("source");
-        let target = temporary.path().join("selected");
-        fs::create_dir_all(&source).expect("source");
-        fs::write(source.join("audiobookai.sqlite3"), b"database").expect("database");
+        let data_root = temporary.path().join("local-data");
+        let target = temporary.path().join("selected-media");
+        fs::create_dir_all(data_root.join("library")).expect("local library");
+        fs::create_dir_all(data_root.join("cache")).expect("local cache");
 
-        let StagedRelocation::Ready {
-            target: relocated,
+        let StagedMediaRoot::Ready {
+            target: configured,
             marker,
-        } = stage_relocation(&source, target.to_str().expect("UTF-8 target"))
-            .expect("staged relocation")
+        } = stage_media_root(
+            &data_root,
+            &data_root,
+            target.to_str().expect("UTF-8 target"),
+        )
+        .expect("staged media root")
         else {
-            panic!("relocation unexpectedly reported no change");
+            panic!("media setup unexpectedly reported no change");
         };
-        assert!(rollback_relocation(&relocated, "wrong marker").is_err());
-        assert!(relocated.exists());
-        rollback_relocation(&relocated, &marker).expect("rollback relocation");
-        assert!(!relocated.exists());
-        assert!(source.exists());
+        assert!(rollback_media_root(&configured, "wrong marker").is_err());
+        assert!(configured.exists());
+        rollback_media_root(&configured, &marker).expect("rollback media setup");
+        assert!(!configured.exists());
+        assert!(data_root.exists());
     }
 }

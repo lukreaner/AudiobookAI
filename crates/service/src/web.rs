@@ -118,7 +118,13 @@ mod tests {
         let referenced_asset = html
             .split('"')
             .find(|value| {
-                value.starts_with("/assets/") && (value.ends_with(".js") || value.ends_with(".css"))
+                value.starts_with("/assets/")
+                    && std::path::Path::new(value)
+                        .extension()
+                        .is_some_and(|extension| {
+                            extension.eq_ignore_ascii_case("js")
+                                || extension.eq_ignore_ascii_case("css")
+                        })
             })
             .expect("dashboard index must reference a compiled asset");
         let asset = request(referenced_asset).await;

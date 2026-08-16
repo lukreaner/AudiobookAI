@@ -36,13 +36,17 @@ requires an explicit Argon2id passphrase; plaintext fallback is not supported.
 Logs and error payloads redact authorization headers, query credentials,
 cookies, and known secret values.
 
-On Unix platforms, AudiobookAI tightens its entire managed data tree to mode
-`0700` on every startup and its SQLite database, writer lock, migration
+On Unix platforms, AudiobookAI tightens its private local control-data tree to
+mode `0700` on every startup and its SQLite database, writer lock, migration
 backups, passphrase salt, and desktop storage-location record to mode `0600`.
-This also repairs permissive modes left by an earlier application version.
-The default Windows data root remains scoped to the signed-in user's platform
-application-data directory; a custom first-run root inherits the ACLs of the
-dedicated folder the owner selected. Installer ACL behavior is part of the
+This also repairs permissive modes left by an earlier application version. The
+default local library and cache receive the same owner-only directory mode. If
+the owner explicitly chooses a separate first-run media root, AudiobookAI keeps
+the database and control state local, verifies the selected non-symlinked media
+directories for durable read/write access, and leaves media access control to
+that filesystem or network share. The setup UI makes this boundary visible.
+The default Windows control-data root remains scoped to the signed-in user's
+platform application-data directory. Installer ACL behavior is part of the
 native clean-machine security acceptance gate. User-selected export
 destinations retain the permissions the owner selected.
 

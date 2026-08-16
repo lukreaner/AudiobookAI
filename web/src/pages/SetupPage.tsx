@@ -73,11 +73,11 @@ export function SetupPage() {
     mutationFn: () => invoke<string | null>("choose_storage_directory", { startingDirectory: storageRoot }),
     onSuccess: (selected) => { if (selected) setStorageRoot(selected); },
   });
-  const relocateStorage = useMutation({
+  const configureStorage = useMutation({
     mutationFn: async () => {
-      const dataRoot = storageRoot?.trim();
-      if (!dataRoot) throw new Error(t("setup.storageRootRequired"));
-      await invoke("relocate_first_run_storage", { dataRoot });
+      const mediaRoot = storageRoot?.trim();
+      if (!mediaRoot) throw new Error(t("setup.storageRootRequired"));
+      await invoke("configure_first_run_media_root", { mediaRoot });
       return api.settings();
     },
     onSuccess: (value) => {
@@ -114,10 +114,10 @@ export function SetupPage() {
   const previewLibraryPath = managedChildPath(previewStorageRoot, "library");
   const previewCachePath = managedChildPath(previewStorageRoot, "cache");
   const storageChanged = normalizedPath(previewStorageRoot) !== normalizedPath(currentStorageRoot);
-  const nextDisabled = (step === 3 && (!previewStorageRoot || relocateStorage.isPending)) || (step === 4 && settings.data?.secretStore === "locked");
+  const nextDisabled = (step === 3 && (!previewStorageRoot || configureStorage.isPending)) || (step === 4 && settings.data?.secretStore === "locked");
   const next = () => {
     if (step === 3 && desktop && storageChanged) {
-      relocateStorage.mutate();
+      configureStorage.mutate();
       return;
     }
     setStep((value) => value + 1);
@@ -149,11 +149,11 @@ export function SetupPage() {
             {selectedProvider ? <ProviderModelField role={selectedProvider.role} source={selectedProvider.modelSource} value={model} models={availableModels.models} status={availableModels.status} onChange={setModel} /> : null}
           </div></SetupIntro> : null}
           {step === 3 ? <SetupIntro icon={<FolderOpen size={30} />} title={t("setup.storageTitle")} detail={t("setup.storageDetail")}><div className="stack setup-form">
-            <div className="field"><label className="field-label" htmlFor="setup-storage-root">{t("setup.storageRoot")}</label><div className="setup-path-picker"><Input id="setup-storage-root" value={storageRoot ?? ""} readOnly={!desktop} aria-readonly={!desktop} onChange={(event) => setStorageRoot(event.target.value)} />{desktop ? <Button variant="secondary" disabled={chooseStorage.isPending || relocateStorage.isPending} onClick={() => chooseStorage.mutate()}>{chooseStorage.isPending ? <LoaderCircle className="spin" size={16} /> : <FolderOpen size={16} />}{t("setup.browse")}</Button> : null}</div><span className="field-hint">{desktop ? t("setup.storageRootHint") : t("setup.storageDesktopOnly")}</span></div>
+            <div className="field"><label className="field-label" htmlFor="setup-storage-root">{t("setup.storageRoot")}</label><div className="setup-path-picker"><Input id="setup-storage-root" value={storageRoot ?? ""} readOnly={!desktop} aria-readonly={!desktop} onChange={(event) => setStorageRoot(event.target.value)} />{desktop ? <Button variant="secondary" disabled={chooseStorage.isPending || configureStorage.isPending} onClick={() => chooseStorage.mutate()}>{chooseStorage.isPending ? <LoaderCircle className="spin" size={16} /> : <FolderOpen size={16} />}{t("setup.browse")}</Button> : null}</div><span className="field-hint">{desktop ? t("setup.storageRootHint") : t("setup.storageDesktopOnly")}</span></div>
             <Field label={t("settings.libraryPath")} hint={t("setup.derivedPathHint")}><Input value={previewLibraryPath} readOnly aria-readonly="true" /></Field>
             <Field label={t("settings.cachePath")} hint={t("setup.derivedPathHint")}><Input value={previewCachePath} readOnly aria-readonly="true" /></Field>
             {chooseStorage.isError ? <ErrorState error={chooseStorage.error} onRetry={() => chooseStorage.mutate()} /> : null}
-            {relocateStorage.isError ? <ErrorState error={relocateStorage.error} onRetry={() => relocateStorage.mutate()} /> : null}
+            {configureStorage.isError ? <ErrorState error={configureStorage.error} onRetry={() => configureStorage.mutate()} /> : null}
           </div></SetupIntro> : null}
           {step === 4 ? <SetupIntro icon={<KeyRound size={30} />} title={t("setup.securityTitle")} detail={t("setup.securityDetail")}>
             <Card className={`setup-security ${settings.data?.secretStore === "locked" ? "is-locked" : ""}`}><span><KeyRound size={20} /></span><div><strong>{t(`settings.${settings.data?.secretStore ?? "locked"}`)}</strong><p>{settings.data?.secretStore === "locked" ? t("settings.secretStoreLockedDetail") : t("settings.secretStoreReadyDetail")}</p></div><Badge tone={settings.data?.secretStore === "locked" ? "warning" : "positive"}>{settings.data?.secretStore === "locked" ? t("settings.secretStoreLocked") : <><Check size={12} />{t("settings.secretStoreReady")}</>}</Badge></Card>
@@ -167,7 +167,7 @@ export function SetupPage() {
           </SetupIntro> : null}
           {step === 5 ? <SetupIntro icon={<Sparkles size={30} />} title={t("setup.finishTitle")} detail={t("setup.finishDetail")}><div className="setup-summary"><div><span>{t("setup.chooseProvider")}</span><strong>{selectedProvider ? `${selectedProvider.name} · ${selectedProvider.role.toUpperCase()}${model ? ` · ${model}` : ""}` : t("setup.skip")}</strong></div><div><span>{t("settings.libraryPath")}</span><strong>{settings.data?.libraryPath}</strong></div><div><span>{t("settings.cachePath")}</span><strong>{settings.data?.cachePath}</strong></div><div><span>{t("settings.language")}</span><strong>{i18n.language.toUpperCase()}</strong></div></div>{finish.isError ? <ErrorState error={finish.error} /> : null}</SetupIntro> : null}
         </section>
-        <footer className="setup-footer"><Button variant="ghost" onClick={() => setStep((value) => Math.max(0, value - 1))} disabled={step === 0 || relocateStorage.isPending}><ArrowLeft size={16} />{t("common.back")}</Button>{step < total - 1 ? <Button size="lg" onClick={next} disabled={nextDisabled}>{relocateStorage.isPending && step === 3 ? <LoaderCircle className="spin" size={17} /> : null}{step === 0 ? t("setup.begin") : relocateStorage.isPending && step === 3 ? t("setup.movingStorage") : t("common.continue")}{relocateStorage.isPending && step === 3 ? null : <ArrowRight size={16} />}</Button> : <Button size="lg" onClick={() => finish.mutate()} disabled={finish.isPending}>{finish.isPending ? <LoaderCircle className="spin" size={17} /> : <Check size={17} />}{t("setup.finish")}</Button>}</footer>
+        <footer className="setup-footer"><Button variant="ghost" onClick={() => setStep((value) => Math.max(0, value - 1))} disabled={step === 0 || configureStorage.isPending}><ArrowLeft size={16} />{t("common.back")}</Button>{step < total - 1 ? <Button size="lg" onClick={next} disabled={nextDisabled}>{configureStorage.isPending && step === 3 ? <LoaderCircle className="spin" size={17} /> : null}{step === 0 ? t("setup.begin") : configureStorage.isPending && step === 3 ? t("setup.movingStorage") : t("common.continue")}{configureStorage.isPending && step === 3 ? null : <ArrowRight size={16} />}</Button> : <Button size="lg" onClick={() => finish.mutate()} disabled={finish.isPending}>{finish.isPending ? <LoaderCircle className="spin" size={17} /> : <Check size={17} />}{t("setup.finish")}</Button>}</footer>
       </main>
     </div>
   );

@@ -218,6 +218,11 @@ export function ProvidersPage() {
   }, [lastProviderModelOperation?.id, lastProviderModelOperation?.state]);
 
   const closeDialog = () => { setAddOpen(false); setEditing(undefined); setForm(emptyProviderForm()); };
+  const openAddForRole = (role: ProviderRole) => {
+    setEditing(undefined);
+    setForm(providerFormFor(role === "tts" ? "elevenlabs" : "openai"));
+    setAddOpen(true);
+  };
   const selectProviderKind = (kind: ProviderKind) => {
     const previous = providerPreset(form.kind);
     const preset = providerPreset(kind);
@@ -294,6 +299,11 @@ export function ProvidersPage() {
   return (
     <div className="page providers-page">
       <PageHeading eyebrow={t("providers.eyebrow")} title={t("providers.title")} subtitle={t("providers.subtitle")} actions={<Button onClick={() => setAddOpen(true)}><Plus size={17} />{t("providers.add")}</Button>} />
+      <Card className="provider-model-discovery-card">
+        <span className="provider-logo"><RefreshCw size={20} /></span>
+        <div><strong>{t("providers.modelDiscoveryTitle")}</strong><p>{t("providers.modelDiscoveryOverview")}</p></div>
+        <Badge tone="info">{t("providers.automatic")}</Badge>
+      </Card>
       {mlx.isError ? <ErrorState error={mlx.error} onRetry={() => void mlx.refetch()} /> : null}
       {mlx.data ? <Card className="mlx-management-card">
         <div className="mlx-management-head">
@@ -361,6 +371,7 @@ export function ProvidersPage() {
                 {roleProviders.map((provider) => {
                   const ModeIcon = provider.mode === "cloud_remote" ? Cloud : provider.mode === "native" ? Laptop : Cpu;
                   const caps = provider.capabilities;
+                  const preset = providerPreset(provider.kind);
                   return (
                     <Card className={clsx("provider-card", provider.status === "error" && "has-error")} key={provider.id}>
                       <div className="provider-card-head">
@@ -369,7 +380,7 @@ export function ProvidersPage() {
                         <Badge tone={statusTone[provider.status]}><span className="service-dot" />{t(`providers.${provider.status}`)}</Badge>
                       </div>
                       <div className="provider-connection">
-                        <span>{provider.model || provider.endpoint || t(modeLabel(provider.mode))}</span>
+                        <span>{provider.model || (preset.modelSource === "none" ? t("providers.systemVoicesNoModelCatalog") : provider.endpoint || t(modeLabel(provider.mode)))}</span>
                         <span className={provider.credentialConfigured ? "credential-ok" : "credential-missing"}><KeyRound size={13} />{t(provider.credentialConfigured ? "providers.apiKeyConfigured" : "providers.apiKeyMissing")}</span>
                       </div>
                       <div className="capability-list">
@@ -393,7 +404,10 @@ export function ProvidersPage() {
                     </Card>
                   );
                 })}
-              </div> : <p className="provider-role-empty">{t(role === "tts" ? "providers.noTtsProviders" : "providers.noLlmProviders")}</p>}
+              </div> : <div className="provider-role-empty">
+                <p>{t(role === "tts" ? "providers.noTtsProviders" : "providers.noLlmProviders")}</p>
+                <Button size="sm" variant="secondary" onClick={() => openAddForRole(role)}><Plus size={14} />{t(role === "tts" ? "providers.addTtsProvider" : "providers.addLlmProvider")}</Button>
+              </div>}
             </section>;
           })}
         </div>

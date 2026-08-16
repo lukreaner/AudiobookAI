@@ -116,11 +116,11 @@ describe("first-run setup", () => {
     expect(screen.getByRole("button", { name: "Continue" })).toBeEnabled();
   });
 
-  it("chooses and applies a dedicated storage root before setup completes", async () => {
+  it("chooses and applies a dedicated media root before setup completes", async () => {
     const user = userEvent.setup();
     const readySettings = { ...structuredClone(lockedSettings), secretStore: "keychain" as const };
-    const relocatedSettings = { ...readySettings, libraryPath: "/audiobooks/library", cachePath: "/audiobooks/cache" };
-    vi.mocked(api.settings).mockResolvedValueOnce(readySettings).mockResolvedValue(relocatedSettings);
+    const configuredSettings = { ...readySettings, libraryPath: "/audiobooks/library", cachePath: "/audiobooks/cache" };
+    vi.mocked(api.settings).mockResolvedValueOnce(readySettings).mockResolvedValue(configuredSettings);
     vi.spyOn(api, "updateSettings").mockResolvedValue(readySettings);
     vi.spyOn(api, "completeFirstRun").mockResolvedValue({ ...readySettings, firstRunComplete: true });
     tauri.invoke.mockImplementation(async (command: string) => command === "choose_storage_directory" ? "/audiobooks" : undefined);
@@ -130,18 +130,18 @@ describe("first-run setup", () => {
     await user.click(screen.getByRole("button", { name: "Continue" }));
     await user.click(screen.getByRole("button", { name: "Continue" }));
 
-    expect(screen.getByLabelText("AudiobookAI data folder")).toHaveValue("/data");
-    expect(screen.getByLabelText("AudiobookAI data folder")).not.toHaveAttribute("readonly");
+    expect(screen.getByLabelText("AudiobookAI media folder")).toHaveValue("/data");
+    expect(screen.getByLabelText("AudiobookAI media folder")).not.toHaveAttribute("readonly");
     expect(screen.getByLabelText(/^Managed library/)).toHaveAttribute("readonly");
     expect(screen.getByLabelText(/^Audio cache/)).toHaveAttribute("readonly");
 
     await user.click(screen.getByRole("button", { name: "Browse…" }));
-    expect(screen.getByLabelText("AudiobookAI data folder")).toHaveValue("/audiobooks");
+    expect(screen.getByLabelText("AudiobookAI media folder")).toHaveValue("/audiobooks");
     expect(screen.getByLabelText(/^Managed library/)).toHaveValue("/audiobooks/library");
     expect(screen.getByLabelText(/^Audio cache/)).toHaveValue("/audiobooks/cache");
 
     await user.click(screen.getByRole("button", { name: "Continue" }));
-    await waitFor(() => expect(tauri.invoke).toHaveBeenCalledWith("relocate_first_run_storage", { dataRoot: "/audiobooks" }));
+    await waitFor(() => expect(tauri.invoke).toHaveBeenCalledWith("configure_first_run_media_root", { mediaRoot: "/audiobooks" }));
     await user.click(screen.getByRole("button", { name: "Continue" }));
     await user.click(screen.getByRole("button", { name: "Finish setup" }));
 
@@ -158,25 +158,25 @@ describe("first-run setup", () => {
     await user.click(screen.getByRole("button", { name: "Continue" }));
     await user.click(screen.getByRole("button", { name: "Continue" }));
 
-    expect(screen.getByLabelText("AudiobookAI data folder")).toHaveAttribute("readonly");
+    expect(screen.getByLabelText("AudiobookAI media folder")).toHaveAttribute("readonly");
     expect(screen.queryByRole("button", { name: "Browse…" })).not.toBeInTheDocument();
-    expect(screen.getByText("Storage can only be changed from the AudiobookAI desktop app.")).toBeInTheDocument();
+    expect(screen.getByText("Media storage can only be changed from the AudiobookAI desktop app.")).toBeInTheDocument();
   });
 
   it("shows a storage preflight error returned as a Tauri string", async () => {
     const user = userEvent.setup();
-    tauri.invoke.mockRejectedValueOnce("the new storage folder must be empty");
+    tauri.invoke.mockRejectedValueOnce("the new media folder must be empty");
     renderSetup();
 
     await user.click(await screen.findByRole("button", { name: "Set up AudiobookAI" }));
     await user.click(screen.getByRole("button", { name: "Continue" }));
     await user.click(screen.getByRole("button", { name: "Continue" }));
-    const storageRoot = screen.getByLabelText("AudiobookAI data folder");
+    const storageRoot = screen.getByLabelText("AudiobookAI media folder");
     await user.clear(storageRoot);
     await user.type(storageRoot, "/occupied");
     await user.click(screen.getByRole("button", { name: "Continue" }));
 
-    expect(await screen.findByText("the new storage folder must be empty")).toBeInTheDocument();
+    expect(await screen.findByText("the new media folder must be empty")).toBeInTheDocument();
     expect(screen.queryByText("Unknown")).not.toBeInTheDocument();
   });
 });
