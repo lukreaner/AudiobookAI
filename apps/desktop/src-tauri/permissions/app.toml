@@ -1,0 +1,19 @@
+[[permission]]
+identifier = "allow-choose-storage-directory"
+description = "Allows the AudiobookAI dashboard to open the dedicated storage-folder picker."
+commands.allow = ["choose_storage_directory"]
+
+[[permission]]
+identifier = "allow-quit-application"
+description = "Allows the AudiobookAI dashboard to request a clean application shutdown."
+commands.allow = ["quit_application"]
+
+[[permission]]
+identifier = "allow-configure-first-run-media-root"
+description = "Allows the AudiobookAI setup wizard to configure an empty managed-media root."
+commands.allow = ["configure_first_run_media_root"]
+
+[[permission]]
+identifier = "allow-set-close-to-tray"
+description = "Allows the AudiobookAI dashboard to apply the saved close-to-tray preference."
+commands.allow = ["set_close_to_tray"]
