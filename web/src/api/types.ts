@@ -196,6 +196,7 @@ export type ProviderKind =
   | "mlx_audio"
   | "localai"
   | "alltalk_v2"
+  | "piper"
   | "native_os"
   | "openai_tts"
   | "openai"
@@ -207,6 +208,9 @@ export type ProviderKind =
   | "anthropic"
   | "gemini"
   | "ollama";
+
+/** The single workload a provider connection is allowed to serve. */
+export type ProviderRole = "tts" | "llm";
 
 export interface ProviderCapabilities {
   tts: boolean;
@@ -254,6 +258,7 @@ export interface ProviderProfile {
   id: Id;
   name: string;
   kind: ProviderKind;
+  role: ProviderRole;
   mode: "cloud_remote" | "external_endpoint" | "managed_child" | "native";
   endpoint?: string;
   executablePath?: string;
@@ -266,6 +271,13 @@ export interface ProviderProfile {
   capabilitySource?: string;
   capabilityUpdatedAt?: string;
   lastError?: string;
+}
+
+export interface NativeProviderAvailability {
+  platform: "linux" | "macos" | "windows" | "unsupported";
+  providerName: string;
+  available: boolean;
+  detail: string | null;
 }
 
 export interface ProviderModel {
@@ -301,9 +313,10 @@ export interface ProviderModelLibrary {
   operations: ProviderModelOperation[];
 }
 
-export interface ProviderProfileInput {
+export interface ProviderProfilePatchInput {
   name?: string;
   kind?: ProviderKind;
+  role?: ProviderRole;
   mode?: ProviderProfile["mode"];
   endpoint?: string | null;
   executablePath?: string | null;
@@ -313,6 +326,11 @@ export interface ProviderProfileInput {
   credential?: string;
 }
 
+export interface ProviderProfileCreateInput extends ProviderProfilePatchInput {
+  kind: ProviderKind;
+  role: ProviderRole;
+}
+
 export interface AvailableProviderModel {
   id: string;
   name: string;
@@ -320,9 +338,11 @@ export interface AvailableProviderModel {
 
 export interface AvailableProviderModels {
   items: AvailableProviderModel[];
+  /** When true, every returned item is positively verified for the requested provider role. */
+  strict: boolean;
 }
 
-export interface ProviderModelDiscoveryInput extends ProviderProfileInput {
+export interface ProviderModelDiscoveryInput extends ProviderProfileCreateInput {
   providerId?: Id;
 }
 
@@ -377,6 +397,72 @@ export interface MlxManagement {
   models: MlxManagedModel[];
   activeOperation?: MlxOperation;
   lastOperation?: MlxOperation;
+  profileActionRequired: boolean;
+}
+
+export type PiperOperationState = MlxOperationState;
+
+export interface PiperOperation {
+  id: Id;
+  kind: "install" | "uninstall" | "download_voice" | "remove_voice";
+  state: PiperOperationState;
+  progressPercent: number;
+  phase: string;
+  message: string;
+  voiceId?: Id;
+  bytesDownloaded?: number;
+  bytesTotal?: number;
+  startedAt: string;
+  finishedAt?: string;
+}
+
+export interface PiperCatalogVoice {
+  id: Id;
+  name: string;
+  language: string;
+  quality: string;
+  speakers: number;
+  sampleRate: number;
+  sizeBytes: number;
+  license: string;
+  licenseUrl: string;
+  licenseSummary: string;
+  modelCardUrl: string;
+  sourceUrl: string;
+}
+
+export interface PiperInstalledVoice {
+  id: Id;
+  name: string;
+  language: string;
+  quality: string;
+  modelPath: string;
+  configPath: string;
+  sizeBytes: number;
+  license: string;
+  installedAt: string;
+}
+
+export interface PiperVoiceIssue {
+  id: Id;
+  status: "incomplete" | "unsafe_filesystem";
+  removable: boolean;
+  detail: string;
+}
+
+export interface PiperManagement {
+  supported: boolean;
+  supportDetail: string;
+  installerStatus: MlxManagement["installerStatus"];
+  installed: boolean;
+  installedVersion?: string;
+  executablePath?: string;
+  voicesDir?: string;
+  catalog: PiperCatalogVoice[];
+  installedVoices: PiperInstalledVoice[];
+  voiceIssues: PiperVoiceIssue[];
+  activeOperation?: PiperOperation;
+  lastOperation?: PiperOperation;
   profileActionRequired: boolean;
 }
 

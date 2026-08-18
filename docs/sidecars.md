@@ -6,6 +6,10 @@ and voice data. The macOS bundle additionally carries uv 0.12.1 and the complete
 MLX-audio installer payload solely for the explicit, user-initiated installation flow. macOS and
 Windows use their native speech systems instead of eSpeak NG.
 
+The optional Piper TTS runtime is deliberately outside these release bundles. On Linux x86_64 it
+is an explicit, online, app-managed install into the application data directory; it is never copied
+into `packaging/runtime/` or advertised as available offline.
+
 ## Pinned sources and build contract
 
 The authoritative machine-readable record is
@@ -46,6 +50,30 @@ marking installation complete. It never resolves or downloads Python or packages
 feature remains release-blocked until the exact CPython distribution and complete transitive wheel
 set have independently reviewed hashes; `releaseReady` must remain false until that work is done.
 
+## App-managed online Piper input
+
+The `piperInstaller` section of the lockfile records the separate runtime-download contract. It
+pins the official Piper 1.2.0 `piper_amd64.tar.gz` release archive to 25,916,047 bytes and SHA-256
+`467c17935d2a22dcce9dc9e08ba07485e29be813097e7cf08c5627aa09d32e42`. The app offers this only on
+Linux x86_64 and downloads it only after an explicit install action. The runtime installer verifies
+the byte count and checksum before safe extraction into its marker-owned app-data root. The release
+sidecar fetch/extract command validates this metadata but does not fetch Piper or add it to a desktop
+package.
+
+Voice files are a separate explicit download. The curated catalog is pinned to the full
+`rhasspy/piper-voices` commit `f5a6e9094787fd865d65cb024472f977f9c542b5`; each model, config,
+and model card has its own exact path, byte count, and SHA-256. The initial catalog exposes only the
+single-speaker `de_DE-thorsten-medium` voice. The pinned card declares its source dataset license as
+CC0, which is recorded with that narrow scope; it is not an unqualified license assertion for every
+artifact in the voice repository. The UI must show the pinned card, declared license, and provenance
+and obtain per-voice confirmation before downloading. Voice provenance and licensing remain
+independent from the MIT-licensed Piper engine.
+
+Engine uninstall retains voices. Removing a voice requires a separate confirmation and must fail
+closed if any profile, assignment, or active job still uses it. Adding a curated voice requires the
+same per-file locking and license/provenance review; a branch name or mutable `main` URL is not an
+acceptable catalog pin.
+
 ## Bundle approval
 
 1. Build independently on the matching native host and run the media acceptance suite.
@@ -63,6 +91,10 @@ set have independently reviewed hashes; `releaseReady` must remain false until t
 The fetcher verifies the archive before extraction, rejects unsafe archive entries, then verifies
 each critical file. It never sends an authorization header and never treats TLS alone as sufficient
 provenance.
+
+This bundle approval procedure covers shipped FFmpeg, eSpeak NG, uv, and MLX installer inputs. The
+separate Piper runtime and voice downloads follow the app-managed contract above and are never
+introduced into the bundle by this procedure.
 
 The Tauri bundle preserves that verified tree below its resource directory as `sidecars/bin/` and
 `sidecars/share/`. The desktop host passes the installed `sidecars/bin/` directory to the service;

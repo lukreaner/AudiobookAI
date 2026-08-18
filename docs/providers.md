@@ -3,6 +3,13 @@
 Provider configuration and capability discovery are separate from credentials.
 A profile stores an opaque `SecretRef`, never the secret value.
 
+Every provider connection has exactly one workload role, `tts` or `llm`, independently of its
+deployment mode. The same vendor, endpoint, and credential may therefore be used by multiple
+connections with different roles and models without sharing runtime state. Model discovery is
+performed through the role-specific adapter and fails closed: mixed catalogs expose only entries
+with positive compatibility evidence, while providers that publish no such evidence require an
+explicit model value instead of presenting unverified entries as compatible choices.
+
 Capabilities cover modality, model and voice discovery, native streaming,
 concurrency, cancellation, structured output, usage reporting, pronunciation,
 voice cloning, reasoning controls, and lifecycle/model controls. A cached
@@ -27,7 +34,10 @@ contain secrets. Plaintext environment values are not part of the
 provider-profile API; provider credentials use the encrypted secret store.
 Deleting a profile never terminates an external process or deletes provider-side
 models and voices, and a profile with a running app-owned child must be stopped
-before it can be deleted. Model loading, unloading, downloading, and deletion
+before it can be deleted. The active connection and encrypted secrets are removed
+from selection; a disabled credential-free identity remains in storage so completed
+job, detection, and usage records keep their audit provenance. Model loading,
+unloading, downloading, and deletion
 are separate capability-gated operations. Destructive model actions require an
 explicit confirmation and are rejected while the model is selected, assigned,
 used by an active job, or still loaded when the provider exposes that state.
@@ -47,6 +57,31 @@ output, paths, argv, environment values, and credential-shaped text are never
 retained. Public Hugging Face `owner/repository` model downloads remain separate,
 explicit user actions. Runtime uninstall retains models; model removal checks an
 ownership marker and never deletes an arbitrary path.
+
+Piper is the app-managed local TTS option for Linux x86_64. It is not bundled
+with AudiobookAI and is not an offline installer: an explicit user action
+downloads the official Piper 1.2.0 amd64 archive from its fixed GitHub release
+URL. The manager verifies the exact 25,916,047-byte archive and SHA-256
+`467c17935d2a22dcce9dc9e08ba07485e29be813097e7cf08c5627aa09d32e42`
+before extracting it below `<data_dir>/managed-providers/piper/engine/`. The
+runtime invokes the canonical `engine/piper/piper` executable directly, without
+a shell, and health requires that executable, its sibling eSpeak NG data, and
+at least one complete installed voice model/config pair.
+
+The initial curated voice catalog contains only `de_DE-thorsten-medium`. Its
+model, JSON config, and model card are independently size- and SHA-256-locked to
+the `rhasspy/piper-voices` commit
+`f5a6e9094787fd865d65cb024472f977f9c542b5`. Before download, the UI presents
+the pinned model-card provenance, its source-dataset license declaration, and
+the attribution record and requires per-voice confirmation. This scoped
+model-card declaration does not turn the Piper engine's MIT license into a
+license for voice artifacts. Multi-speaker voices are not offered until the
+adapter has an explicit speaker selector.
+
+Piper engine uninstall removes only the marker-owned engine and retains
+downloaded voices. Voice removal is a separate confirmed action and fails while
+the voice is selected by a profile or assignment, or referenced by active work.
+Neither action deletes an arbitrary user-selected path.
 
 Provider-native model controls follow each provider's documented API instead of
 assuming a shared OpenAI-compatible contract. Ollama supports installed-model

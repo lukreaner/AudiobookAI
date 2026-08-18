@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import io
 import json
 import os
@@ -55,6 +56,69 @@ class PublicSidecarTests(unittest.TestCase):
                 "archive",
                 [],
             )
+
+    def test_piper_manifest_is_pinned_online_and_not_bundled(self) -> None:
+        source = Path("packaging/sidecars.lock.json")
+        manifest = json.loads(source.read_text(encoding="utf-8"))
+
+        sidecars.validate_piper_installer(manifest)
+        installer = manifest["piperInstaller"]
+        self.assertFalse(manifest["releaseReady"])
+        self.assertEqual(installer["delivery"], "explicit-online-install")
+        self.assertFalse(installer["bundled"])
+        self.assertEqual(installer["target"], "x86_64-unknown-linux-gnu")
+        self.assertEqual(
+            [voice["id"] for voice in installer["voiceCatalog"]["voices"]],
+            ["de_DE-thorsten-medium"],
+        )
+        for bundle in manifest["bundles"].values():
+            for item in bundle["requiredFiles"]:
+                self.assertNotIn("piper", item["path"].casefold())
+
+        bundled = copy.deepcopy(manifest)
+        bundled["bundles"]["x86_64-unknown-linux-gnu"]["requiredFiles"].append(
+            {"path": "bin/piper", "sha256": "0" * 64, "executable": True}
+        )
+        with self.assertRaisesRegex(sidecars.SidecarError, "bundles Piper"):
+            sidecars.validate_piper_installer(bundled)
+
+    def test_piper_manifest_rejects_runtime_contract_drift(self) -> None:
+        source = Path("packaging/sidecars.lock.json")
+        manifest = json.loads(source.read_text(encoding="utf-8"))
+        mutations = [
+            (("piperInstaller", "version"), "1.2.1"),
+            (("piperInstaller", "target"), "aarch64-unknown-linux-gnu"),
+            (("piperInstaller", "delivery"), "bundled"),
+            (("piperInstaller", "bundled"), True),
+            (("piperInstaller", "archive", "url"), "https://example.test/piper.tar.gz"),
+            (("piperInstaller", "archive", "sha256"), "0" * 64),
+            (
+                ("piperInstaller", "voiceCatalog", "licenseConfirmationRequired"),
+                False,
+            ),
+            (("piperInstaller", "voiceCatalog", "downloadQuery"), "token=secret"),
+            (
+                (
+                    "piperInstaller",
+                    "voiceCatalog",
+                    "voices",
+                    0,
+                    "files",
+                    "model",
+                    "sha256",
+                ),
+                "0" * 64,
+            ),
+        ]
+        for path, value in mutations:
+            with self.subTest(path=path):
+                candidate = copy.deepcopy(manifest)
+                selected = candidate
+                for component in path[:-1]:
+                    selected = selected[component]
+                selected[path[-1]] = value
+                with self.assertRaises(sidecars.SidecarError):
+                    sidecars.validate_piper_installer(candidate)
 
     @unittest.skipIf(os.name == "nt", "creating symlinks is not generally available on Windows CI")
     def test_tree_verification_rejects_required_file_symlink(self) -> None:

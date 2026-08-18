@@ -8,7 +8,7 @@ use audiobookai_providers::{
         AllTalkProvider, AnthropicProvider, ElevenLabsProvider, GeminiProvider, LocalAiProvider,
         MlxAudioProvider, NativeCommandRunner, NativeTtsConfig, NativeTtsProvider, OllamaProvider,
         OpenAiChatPreset, OpenAiCompatibleProvider, OpenAiResponsesProvider, OpenAiTtsProvider,
-        TokioNativeCommandRunner,
+        PiperTtsConfig, PiperTtsProvider, TokioNativeCommandRunner,
     },
 };
 use url::Url;
@@ -80,7 +80,7 @@ impl ProviderAdapterFactory {
         };
 
         let control_endpoint = match profile.adapter {
-            RuntimeAdapterKind::NativeOs => None,
+            RuntimeAdapterKind::NativeOs | RuntimeAdapterKind::Piper => None,
             _ => Some(Self::endpoint_for(profile, credential)?),
         };
 
@@ -123,6 +123,27 @@ impl ProviderAdapterFactory {
                 let config = NativeTtsConfig::for_current_os(executable)?;
                 bundle.tts = Some(Arc::new(NativeTtsProvider::new(
                     config,
+                    Arc::clone(&self.native_runner),
+                )?));
+            }
+            RuntimeAdapterKind::Piper => {
+                let executable = profile.executable.clone().ok_or_else(|| {
+                    ProviderError::Configuration(
+                        "Piper requires its app-managed executable".to_owned(),
+                    )
+                })?;
+                let voices_dir = profile.piper_voices_dir.clone().ok_or_else(|| {
+                    ProviderError::Configuration(
+                        "Piper requires its app-managed voice directory".to_owned(),
+                    )
+                })?;
+                let selected_voice = profile.model.clone().ok_or_else(|| {
+                    ProviderError::Configuration(
+                        "Piper requires one exact selected installed voice".to_owned(),
+                    )
+                })?;
+                bundle.tts = Some(Arc::new(PiperTtsProvider::new(
+                    PiperTtsConfig::new(executable, voices_dir, selected_voice)?,
                     Arc::clone(&self.native_runner),
                 )?));
             }

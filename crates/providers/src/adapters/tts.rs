@@ -351,9 +351,10 @@ fn parse_elevenlabs_models(value: &Value) -> Vec<Model> {
         .as_array()
         .into_iter()
         .flatten()
-        // The shared catalog also contains speech-to-text, music, and other models. Keep only
-        // models that are not explicitly marked as unsuitable for this TTS adapter.
-        .filter(|model| model.get("can_do_text_to_speech").and_then(Value::as_bool) != Some(false))
+        // The shared catalog also contains speech-to-text, music, and other models. Discovery is
+        // fail-closed: an item is compatible with this adapter only when ElevenLabs positively
+        // marks it as text-to-speech capable.
+        .filter(|model| model.get("can_do_text_to_speech").and_then(Value::as_bool) == Some(true))
         .filter_map(|model| {
             let id = model.get("model_id")?.as_str()?;
             Some(Model {
@@ -647,11 +648,7 @@ impl OpenAiSpeechProvider {
             .execute(self.http.empty_request(HttpMethod::Get, "v1/models")?)
             .await?;
         let value = json_body(&response)?;
-        if matches!(self.flavor, OpenAiSpeechFlavor::OpenAi) {
-            parse_openai_tts_models(&value)
-        } else {
-            parse_openai_models(&value)
-        }
+        parse_openai_speech_models(&value, self.flavor)
     }
 
     async fn health(&self) -> Result<ProviderHealth> {
@@ -832,6 +829,21 @@ fn parse_openai_models(value: &Value) -> Result<Vec<Model>> {
         .collect())
 }
 
+fn parse_openai_speech_models(value: &Value, flavor: OpenAiSpeechFlavor) -> Result<Vec<Model>> {
+    match flavor {
+        OpenAiSpeechFlavor::OpenAi => parse_openai_tts_models(value),
+        // MLX-audio's catalog is dedicated to audio models, so every well-formed catalog entry is
+        // positively scoped to this adapter.
+        OpenAiSpeechFlavor::Mlx => parse_openai_models(value),
+        // LocalAI exposes one mixed OpenAI-compatible catalog without endpoint capability
+        // metadata. Validate the response shape, but do not claim any entry is TTS-compatible.
+        OpenAiSpeechFlavor::LocalAi => {
+            parse_openai_models(value)?;
+            Ok(Vec::new())
+        }
+    }
+}
+
 fn parse_openai_tts_models(value: &Value) -> Result<Vec<Model>> {
     Ok(parse_openai_models(value)?
         .into_iter()
@@ -839,8 +851,29 @@ fn parse_openai_tts_models(value: &Value) -> Result<Vec<Model>> {
         .collect())
 }
 
-fn is_openai_tts_model_id(id: &str) -> bool {
-    id == "tts-1" || id.starts_with("tts-1-") || id.ends_with("-tts") || id.contains("-tts-")
+/// Returns true only for model families positively documented for `OpenAI`'s speech endpoint.
+///
+/// `GET /v1/models` does not expose endpoint compatibility. Keep this list fail-closed instead of
+/// treating every model containing "audio" or "tts" as synthesizable. Dated snapshots retain the
+/// documented family prefix.
+pub fn is_openai_tts_model_id(id: &str) -> bool {
+    if matches!(id, "tts-1" | "tts-1-hd" | "gpt-4o-mini-tts") {
+        return true;
+    }
+    if let Some(snapshot) = id.strip_prefix("gpt-4o-mini-tts-") {
+        return snapshot.len() == 10
+            && snapshot.as_bytes()[4] == b'-'
+            && snapshot.as_bytes()[7] == b'-'
+            && snapshot
+                .bytes()
+                .enumerate()
+                .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit());
+    }
+    ["tts-1-", "tts-1-hd-"].into_iter().any(|family| {
+        id.strip_prefix(family).is_some_and(|snapshot| {
+            snapshot.len() == 4 && snapshot.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    })
 }
 
 fn openai_builtin_voices() -> Vec<Voice> {
@@ -1127,6 +1160,15 @@ mod tests {
                 "model_id": "scribe_v2",
                 "name": "Scribe v2",
                 "can_do_text_to_speech": false
+            },
+            {
+                "model_id": "unknown_without_capabilities",
+                "name": "Unknown"
+            },
+            {
+                "model_id": "malformed_capabilities",
+                "name": "Malformed",
+                "can_do_text_to_speech": "true"
             }
         ]));
 
@@ -1212,6 +1254,35 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["gpt-4o-mini-tts", "gpt-4o-mini-tts-2025-12-15", "tts-1-hd"]
         );
+    }
+
+    #[test]
+    fn localai_mixed_catalog_discovers_no_unverified_tts_models() {
+        let models = parse_openai_speech_models(
+            &json!({
+                "data": [
+                    { "id": "kokoro" },
+                    { "id": "llama-chat" },
+                    { "id": "whisper-1" }
+                ]
+            }),
+            OpenAiSpeechFlavor::LocalAi,
+        )
+        .unwrap();
+
+        assert!(models.is_empty());
+    }
+
+    #[test]
+    fn mlx_dedicated_catalog_remains_discoverable() {
+        let models = parse_openai_speech_models(
+            &json!({ "data": [{ "id": "kokoro" }] }),
+            OpenAiSpeechFlavor::Mlx,
+        )
+        .unwrap();
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "kokoro");
     }
 
     #[test]

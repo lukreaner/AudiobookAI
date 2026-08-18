@@ -262,6 +262,7 @@ pub enum ProviderKindView {
     MlxAudio,
     Localai,
     AlltalkV2,
+    Piper,
     NativeOs,
     OpenaiTts,
     Openai,
@@ -282,6 +283,18 @@ pub enum ProviderModeView {
     ExternalEndpoint,
     ManagedChild,
     Native,
+}
+
+/// The single workload a provider connection is allowed to serve.
+///
+/// This is deliberately separate from [`ProviderModeView`], which describes where the provider
+/// runs. A vendor such as `OpenAI` can therefore have independent TTS and LLM connections that use
+/// the same endpoint and credential without sharing a model selection or runtime adapter.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderRoleView {
+    Tts,
+    Llm,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -334,6 +347,7 @@ pub struct ProviderProfileView {
     pub id: Id,
     pub name: String,
     pub kind: ProviderKindView,
+    pub role: ProviderRoleView,
     pub mode: ProviderModeView,
     pub endpoint: Option<String>,
     pub executable_path: Option<String>,
@@ -353,6 +367,7 @@ pub struct ProviderProfileView {
 pub struct ProviderProfileInput {
     pub name: Option<String>,
     pub kind: Option<ProviderKindView>,
+    pub role: Option<ProviderRoleView>,
     pub mode: Option<ProviderModeView>,
     #[serde(default, deserialize_with = "deserialize_nullable_patch")]
     pub endpoint: Option<Option<String>>,
@@ -372,6 +387,7 @@ impl fmt::Debug for ProviderProfileInput {
             .debug_struct("ProviderProfileInput")
             .field("has_name", &self.name.is_some())
             .field("kind", &self.kind)
+            .field("role", &self.role)
             .field("mode", &self.mode)
             .field(
                 "endpoint_patch",

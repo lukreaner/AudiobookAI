@@ -1606,6 +1606,7 @@ fn validate_detection_profile(
     config: &DetectionJobConfig,
 ) -> Result<(), ServiceError> {
     if profile.id != config.provider_profile_id
+        || !matches!(profile.role, crate::models::ProviderRoleView::Llm)
         || profile.model.as_deref() != Some(config.model.as_str())
         || profile.endpoint != config.provider_endpoint
         || Some(profile.mode) != config.provider_mode
@@ -1998,6 +1999,7 @@ async fn detection_dispatch_guard(
         .get(&config.provider_profile_id)
         .ok_or_else(|| ProviderError::Configuration("detection provider was removed".to_owned()))?;
     if profile.model.as_deref() != Some(config.model.as_str())
+        || !matches!(profile.role, crate::models::ProviderRoleView::Llm)
         || profile.endpoint != config.provider_endpoint
         || Some(profile.mode) != config.provider_mode
         || !matches!(profile.status, ProviderStatusView::Online)
@@ -3250,6 +3252,7 @@ mod tests {
             id: config.provider_profile_id,
             name: "Detection provider".to_owned(),
             kind: crate::models::ProviderKindView::OpenaiCompatible,
+            role: crate::models::ProviderRoleView::Llm,
             mode: ProviderModeView::ExternalEndpoint,
             endpoint: config.provider_endpoint.clone(),
             executable_path: None,

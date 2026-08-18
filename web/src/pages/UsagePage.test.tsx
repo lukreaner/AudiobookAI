@@ -11,6 +11,7 @@ const provider: ProviderProfile = {
   id: "00000000-0000-4000-8000-000000000001",
   name: "Local speech",
   kind: "localai",
+  role: "tts",
   mode: "external_endpoint",
   status: "online",
   arguments: [],

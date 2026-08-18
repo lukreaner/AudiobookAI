@@ -1,13 +1,23 @@
-import type { ProviderKind, ProviderProfile } from "../api/types";
+import type { ProviderKind, ProviderProfile, ProviderRole } from "../api/types";
 
-export type ProviderRole = "tts" | "llm";
+export type { ProviderRole } from "../api/types";
 export type ProviderMode = ProviderProfile["mode"];
 export type ProviderModelSource = "discover" | "default_only" | "none";
+
+export interface ProviderRoleDefaults {
+  defaultModel: string;
+  modelSource: ProviderModelSource;
+}
 
 export interface ProviderPreset {
   kind: ProviderKind;
   name: string;
+  /** Default role plus any additional roles supported by the same visible vendor. */
   role: ProviderRole;
+  roles?: ProviderRole[];
+  roleDefaults?: Partial<Record<ProviderRole, ProviderRoleDefaults>>;
+  hidden?: boolean;
+  setupVisible?: boolean;
   local: boolean;
   defaultMode: ProviderMode;
   modes: ProviderMode[];
@@ -67,6 +77,18 @@ export const providerPresets: ProviderPreset[] = [
     modelSource: "default_only",
   },
   {
+    kind: "piper",
+    name: "Piper",
+    role: "tts",
+    local: true,
+    setupVisible: false,
+    defaultMode: "native",
+    modes: ["native"],
+    defaultEndpoint: "",
+    defaultModel: "",
+    modelSource: "discover",
+  },
+  {
     kind: "native_os",
     name: "Native system voices",
     role: "tts",
@@ -79,8 +101,9 @@ export const providerPresets: ProviderPreset[] = [
   },
   {
     kind: "openai_tts",
-    name: "OpenAI Speech",
+    name: "OpenAI Speech (legacy)",
     role: "tts",
+    hidden: true,
     local: false,
     defaultMode: "cloud_remote",
     modes: ["cloud_remote"],
@@ -92,6 +115,11 @@ export const providerPresets: ProviderPreset[] = [
     kind: "openai",
     name: "OpenAI",
     role: "llm",
+    roles: ["tts", "llm"],
+    roleDefaults: {
+      tts: { defaultModel: "gpt-4o-mini-tts", modelSource: "discover" },
+      llm: { defaultModel: "", modelSource: "discover" },
+    },
     local: false,
     defaultMode: "cloud_remote",
     modes: ["cloud_remote"],
@@ -196,5 +224,20 @@ export function providerPreset(kind: ProviderKind): ProviderPreset {
 }
 
 export function providerPresetsFor(role: ProviderRole): ProviderPreset[] {
-  return providerPresets.filter((preset) => preset.role === role);
+  return providerPresets.filter((preset) => !preset.hidden && providerSupportsRole(preset, role));
+}
+
+export function providerRoles(preset: ProviderPreset): ProviderRole[] {
+  return preset.roles ?? [preset.role];
+}
+
+export function providerSupportsRole(preset: ProviderPreset, role: ProviderRole): boolean {
+  return providerRoles(preset).includes(role);
+}
+
+export function providerDefaultsForRole(preset: ProviderPreset, role: ProviderRole): ProviderRoleDefaults {
+  const defaults = preset.roleDefaults?.[role];
+  if (defaults) return defaults;
+  if (preset.role === role) return { defaultModel: preset.defaultModel, modelSource: preset.modelSource };
+  throw new Error(`${preset.kind} does not support provider role ${role}`);
 }

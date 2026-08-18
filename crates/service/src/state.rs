@@ -1,10 +1,13 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    ffi::OsStr,
+    path::Path,
     path::PathBuf,
     sync::Arc,
 };
 
 use chrono::{DateTime, Utc};
+use futures::StreamExt;
 use serde::{Serialize, de::DeserializeOwned};
 use sqlx::Row;
 use tokio::sync::{Mutex, RwLock};
@@ -68,6 +71,22 @@ impl Catalog {
     }
 }
 
+fn prepare_provider_runtime_probes(
+    catalog: &mut Catalog,
+) -> Vec<(Uuid, crate::models::ProviderModeView)> {
+    catalog
+        .providers
+        .values_mut()
+        .map(|profile| {
+            // Persisted status is only the last observation. Fail closed before any await so a
+            // global startup timeout or task cancellation cannot expose stale Online state.
+            profile.status = crate::models::ProviderStatusView::Offline;
+            profile.last_error = None;
+            (profile.id, profile.mode)
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct RuntimeStatus {
     pub instance_id: Uuid,
@@ -89,7 +108,8 @@ pub struct AppState {
     pub providers: crate::runtime::ProviderRuntime,
     pub provider_models: crate::provider_models::ProviderModelManager,
     pub mlx: crate::mlx_management::MlxManager,
-    /// Serializes model deletion with every operation that can create a new model reference.
+    pub piper: crate::piper_management::PiperManager,
+    /// Serializes model/runtime removal with every operation that can create a new reference.
     pub model_lifecycle: Arc<Mutex<()>>,
     /// Serializes character-review and detection lifecycle changes per project. The database is
     /// process-exclusive; this closes the remaining in-process check-then-write race.
@@ -157,6 +177,7 @@ impl AppState {
         let providers = crate::runtime::ProviderRuntime::production()
             .map_err(|error| crate::ServiceError::Internal(error.to_string()))?;
         let mlx = crate::mlx_management::MlxManager::initialize(&config).await?;
+        let piper = crate::piper_management::PiperManager::initialize(&config).await?;
         let events = EventHub::new(512);
         let provider_models =
             crate::provider_models::ProviderModelManager::new(providers.clone(), events.clone());
@@ -177,6 +198,7 @@ impl AppState {
             providers,
             provider_models,
             mlx,
+            piper,
             model_lifecycle: Arc::new(Mutex::new(())),
             character_lifecycle: Arc::new(Mutex::new(HashMap::new())),
             dispatch_consent_lifecycle: Arc::new(Mutex::new(HashMap::new())),
@@ -195,15 +217,27 @@ impl AppState {
             .cloned()
             .collect::<Vec<_>>();
         for profile in native_profiles {
-            if state
+            let persisted = state
                 .database
                 .repositories()
                 .providers
                 .get(audiobookai_core::ProviderProfileId::from_uuid(profile.id))
                 .await
-                .map_err(|error| crate::ServiceError::Storage(error.to_string()))?
-                .is_none()
+                .map_err(|error| crate::ServiceError::Storage(error.to_string()))?;
+            if persisted.is_none()
+                && matches!(profile.kind, crate::models::ProviderKindView::NativeOs)
+                && native_tts_availability_for_profile(&profile, &state.config)
+                    .executable
+                    .is_none()
             {
+                // `Catalog::new` contributes a convenient platform-native default, but a fresh
+                // installation must not turn a missing Linux dependency into a broken saved
+                // connection. Existing enabled rows remain visible below, while hydration has
+                // already removed any canonical default suppressed by a disabled tombstone.
+                state.catalog.write().await.providers.remove(&profile.id);
+                continue;
+            }
+            if persisted.is_none() {
                 crate::api::persist_provider(&state, &profile, None).await?;
             }
         }
@@ -229,22 +263,52 @@ impl AppState {
     }
 
     async fn bootstrap_provider_runtime(&self) {
-        let ids = self
-            .catalog
-            .read()
-            .await
-            .providers
-            .keys()
-            .copied()
-            .collect::<Vec<_>>();
-        for id in ids {
-            if let Err(error) = self.sync_provider_runtime(id).await
-                && let Some(profile) = self.catalog.write().await.providers.get_mut(&id)
-            {
-                profile.status = crate::models::ProviderStatusView::Unconfigured;
-                profile.last_error = Some(error.to_string());
-            }
-        }
+        let profiles = {
+            let mut catalog = self.catalog.write().await;
+            prepare_provider_runtime_probes(&mut catalog)
+        };
+        let probes =
+            futures::stream::iter(profiles).for_each_concurrent(16, |(id, mode)| async move {
+                if let Err(error) = self.sync_provider_runtime(id).await {
+                    if let Some(profile) = self.catalog.write().await.providers.get_mut(&id) {
+                        profile.status = crate::models::ProviderStatusView::Unconfigured;
+                        profile.last_error =
+                            Some(provider_setup_error_detail(profile, &self.config, &error));
+                    }
+                    return;
+                }
+                if matches!(mode, crate::models::ProviderModeView::ManagedChild) {
+                    if let Some(profile) = self.catalog.write().await.providers.get_mut(&id) {
+                        profile.status = crate::models::ProviderStatusView::Offline;
+                        profile.last_error = None;
+                    }
+                    return;
+                }
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(12),
+                    crate::api::refresh_provider(self, id),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => {
+                        if let Some(profile) = self.catalog.write().await.providers.get_mut(&id) {
+                            profile.status = crate::models::ProviderStatusView::Error;
+                            profile.last_error = Some(error.to_string());
+                        }
+                    }
+                    Err(_) => {
+                        if let Some(profile) = self.catalog.write().await.providers.get_mut(&id) {
+                            profile.status = crate::models::ProviderStatusView::Error;
+                            profile.last_error = Some("provider health check timed out".to_owned());
+                        }
+                    }
+                }
+            });
+        // A large set of unreachable connections must not delay the desktop listener by one
+        // timeout window per small batch. Probe with bounded parallelism under one global startup
+        // budget; any connection not reached within it remains available for manual refresh.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(12), probes).await;
     }
 
     /// Replaces the runtime registration for a persisted provider profile.
@@ -292,29 +356,39 @@ pub(crate) fn runtime_profile_from_view(
     config: &ServiceConfig,
 ) -> Result<crate::runtime::RuntimeProfile, crate::ServiceError> {
     use crate::{
-        models::{ProviderKindView, ProviderModeView},
+        models::{ProviderKindView, ProviderModeView, ProviderRoleView},
         runtime::{RuntimeAdapterKind, RuntimeProfile},
     };
     use audiobookai_providers::{ProviderId, ProviderKind};
 
     let runtime_id = ProviderId::new(profile.id.to_string())
         .map_err(|error| crate::ServiceError::InvalidRequest(error.to_string()))?;
-    let adapter = match profile.kind {
-        ProviderKindView::Elevenlabs => RuntimeAdapterKind::ElevenLabs,
-        ProviderKindView::MlxAudio => RuntimeAdapterKind::MlxAudio,
-        ProviderKindView::Localai => RuntimeAdapterKind::LocalAi,
-        ProviderKindView::AlltalkV2 => RuntimeAdapterKind::AllTalkV2,
-        ProviderKindView::NativeOs => RuntimeAdapterKind::NativeOs,
-        ProviderKindView::OpenaiTts => RuntimeAdapterKind::OpenAiTts,
-        ProviderKindView::Openai => RuntimeAdapterKind::OpenAi,
-        ProviderKindView::OpenaiCompatible => RuntimeAdapterKind::OpenAiCompatible,
-        ProviderKindView::Anthropic => RuntimeAdapterKind::Anthropic,
-        ProviderKindView::Gemini => RuntimeAdapterKind::Gemini,
-        ProviderKindView::Qwen => RuntimeAdapterKind::Qwen,
-        ProviderKindView::Kimi => RuntimeAdapterKind::Kimi,
-        ProviderKindView::Moonshot => RuntimeAdapterKind::Moonshot,
-        ProviderKindView::LmStudio => RuntimeAdapterKind::LmStudio,
-        ProviderKindView::Ollama => RuntimeAdapterKind::Ollama,
+    let adapter = match (&profile.kind, profile.role) {
+        (ProviderKindView::Elevenlabs, ProviderRoleView::Tts) => RuntimeAdapterKind::ElevenLabs,
+        (ProviderKindView::MlxAudio, ProviderRoleView::Tts) => RuntimeAdapterKind::MlxAudio,
+        (ProviderKindView::Localai, ProviderRoleView::Tts) => RuntimeAdapterKind::LocalAi,
+        (ProviderKindView::AlltalkV2, ProviderRoleView::Tts) => RuntimeAdapterKind::AllTalkV2,
+        (ProviderKindView::Piper, ProviderRoleView::Tts) => RuntimeAdapterKind::Piper,
+        (ProviderKindView::NativeOs, ProviderRoleView::Tts) => RuntimeAdapterKind::NativeOs,
+        (ProviderKindView::OpenaiTts | ProviderKindView::Openai, ProviderRoleView::Tts) => {
+            RuntimeAdapterKind::OpenAiTts
+        }
+        (ProviderKindView::Openai, ProviderRoleView::Llm) => RuntimeAdapterKind::OpenAi,
+        (ProviderKindView::OpenaiCompatible, ProviderRoleView::Llm) => {
+            RuntimeAdapterKind::OpenAiCompatible
+        }
+        (ProviderKindView::Anthropic, ProviderRoleView::Llm) => RuntimeAdapterKind::Anthropic,
+        (ProviderKindView::Gemini, ProviderRoleView::Llm) => RuntimeAdapterKind::Gemini,
+        (ProviderKindView::Qwen, ProviderRoleView::Llm) => RuntimeAdapterKind::Qwen,
+        (ProviderKindView::Kimi, ProviderRoleView::Llm) => RuntimeAdapterKind::Kimi,
+        (ProviderKindView::Moonshot, ProviderRoleView::Llm) => RuntimeAdapterKind::Moonshot,
+        (ProviderKindView::LmStudio, ProviderRoleView::Llm) => RuntimeAdapterKind::LmStudio,
+        (ProviderKindView::Ollama, ProviderRoleView::Llm) => RuntimeAdapterKind::Ollama,
+        _ => {
+            return Err(crate::ServiceError::InvalidRequest(
+                "the selected provider does not support this TTS/LLM role".to_owned(),
+            ));
+        }
     };
     let mode = match profile.mode {
         ProviderModeView::CloudRemote => ProviderKind::CloudRemote,
@@ -323,6 +397,7 @@ pub(crate) fn runtime_profile_from_view(
         ProviderModeView::Native => ProviderKind::Native,
     };
     let mut runtime = RuntimeProfile::new(runtime_id, profile.name.clone(), adapter, mode);
+    runtime.model.clone_from(&profile.model);
     runtime.model_performance = profile
         .capabilities
         .as_ref()
@@ -335,11 +410,31 @@ pub(crate) fn runtime_profile_from_view(
         .transpose()
         .map_err(|error| crate::ServiceError::InvalidRequest(error.to_string()))?
         .or_else(|| provider_default_endpoint(adapter));
-    runtime.executable = profile
-        .executable_path
-        .as_ref()
-        .map(std::path::PathBuf::from)
-        .or_else(|| native_executable(adapter, config));
+    runtime.executable = match adapter {
+        RuntimeAdapterKind::NativeOs => Some(
+            native_tts_availability_for_profile(profile, config)
+                .executable
+                .ok_or_else(|| {
+                    crate::ServiceError::InvalidRequest(native_tts_setup_detail(
+                        std::env::consts::OS,
+                    ))
+                })?,
+        ),
+        RuntimeAdapterKind::Piper => native_executable(adapter, config),
+        _ => profile
+            .executable_path
+            .as_ref()
+            .map(std::path::PathBuf::from),
+    };
+    if matches!(adapter, RuntimeAdapterKind::Piper) {
+        runtime.piper_voices_dir = Some(
+            config
+                .data_dir
+                .join("managed-providers")
+                .join("piper")
+                .join("voices"),
+        );
+    }
     runtime.arguments.clone_from(&profile.arguments);
     runtime.working_directory = profile
         .working_directory
@@ -432,28 +527,176 @@ fn native_executable(
     adapter: crate::runtime::RuntimeAdapterKind,
     config: &ServiceConfig,
 ) -> Option<PathBuf> {
-    if !matches!(adapter, crate::runtime::RuntimeAdapterKind::NativeOs) {
-        return None;
+    if matches!(adapter, crate::runtime::RuntimeAdapterKind::Piper) {
+        return Some(
+            config
+                .data_dir
+                .join("managed-providers")
+                .join("piper")
+                .join("engine")
+                .join("piper")
+                .join("piper"),
+        );
     }
-    if std::env::consts::OS == "linux"
-        && let Some(directory) = &config.bundled_sidecar_dir
-    {
-        return Some(directory.join("espeak-ng"));
-    }
-    if let Some(path) = std::env::var_os("AUDIOBOOKAI_NATIVE_TTS_EXECUTABLE") {
-        return Some(PathBuf::from(path));
-    }
-    Some(native_executable_for_os(std::env::consts::OS, config))
+    None
 }
 
-fn native_executable_for_os(os: &str, config: &ServiceConfig) -> PathBuf {
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct NativeProviderAvailabilityView {
+    pub platform: &'static str,
+    pub provider_name: &'static str,
+    pub available: bool,
+    pub detail: Option<String>,
+    #[serde(skip)]
+    executable: Option<PathBuf>,
+}
+
+pub(crate) fn native_tts_availability(config: &ServiceConfig) -> NativeProviderAvailabilityView {
+    native_tts_availability_with_override(config, None)
+}
+
+pub(crate) fn native_tts_availability_for_profile(
+    profile: &ProviderProfileView,
+    config: &ServiceConfig,
+) -> NativeProviderAvailabilityView {
+    native_tts_availability_with_override(config, profile.executable_path.as_deref().map(Path::new))
+}
+
+fn native_tts_availability_with_override(
+    config: &ServiceConfig,
+    profile_override: Option<&Path>,
+) -> NativeProviderAvailabilityView {
+    let os = std::env::consts::OS;
+    let environment_override = std::env::var_os("AUDIOBOOKAI_NATIVE_TTS_EXECUTABLE");
+    let search_path = std::env::var_os("PATH");
+    let executable = resolve_native_tts_executable(
+        os,
+        config,
+        profile_override,
+        environment_override.as_deref(),
+        search_path.as_deref(),
+    );
+    let (platform, provider_name) = native_tts_identity(os);
+    NativeProviderAvailabilityView {
+        platform,
+        provider_name,
+        available: executable.is_some(),
+        detail: executable.is_none().then(|| native_tts_setup_detail(os)),
+        executable,
+    }
+}
+
+fn resolve_native_tts_executable(
+    os: &str,
+    config: &ServiceConfig,
+    profile_override: Option<&Path>,
+    environment_override: Option<&OsStr>,
+    search_path: Option<&OsStr>,
+) -> Option<PathBuf> {
+    let environment_override = environment_override.map(Path::new);
     match os {
-        "macos" => PathBuf::from("/usr/bin/say"),
-        "windows" => PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"),
-        _ => config.bundled_sidecar_dir.as_ref().map_or_else(
-            || PathBuf::from("/usr/bin/espeak-ng"),
-            |directory| directory.join("espeak-ng"),
-        ),
+        "linux" => {
+            if let Some(directory) = config.bundled_sidecar_dir.as_deref() {
+                // A packaged installation is a closed dependency set. Never replace a missing
+                // or damaged signed sidecar with a same-named executable from the user's PATH.
+                return usable_bundled_espeak(directory);
+            }
+            if let Some(profile_override) = profile_override {
+                return usable_native_executable(profile_override);
+            }
+            if let Some(environment_override) = environment_override {
+                return usable_native_executable(environment_override);
+            }
+            search_path.and_then(|search_path| {
+                std::env::split_paths(search_path)
+                    // Empty and relative PATH entries mean the current directory. Native TTS
+                    // never resolves executable content through that ambient trust boundary.
+                    .filter(|directory| directory.is_absolute())
+                    .find_map(|directory| usable_native_executable(&directory.join("espeak-ng")))
+            })
+        }
+        "macos" => profile_override
+            .map(usable_native_executable)
+            .or_else(|| environment_override.map(usable_native_executable))
+            .unwrap_or_else(|| usable_native_executable(Path::new("/usr/bin/say"))),
+        "windows" => profile_override
+            .map(usable_native_executable)
+            .or_else(|| environment_override.map(usable_native_executable))
+            .unwrap_or_else(|| {
+                usable_native_executable(Path::new(
+                    r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+                ))
+            }),
+        _ => None,
+    }
+}
+
+fn usable_bundled_espeak(directory: &Path) -> Option<PathBuf> {
+    if !directory.is_absolute() {
+        return None;
+    }
+    let canonical_directory = std::fs::canonicalize(directory).ok()?;
+    let executable = usable_native_executable(&directory.join("espeak-ng"))?;
+    if !executable.starts_with(&canonical_directory) {
+        return None;
+    }
+    let packaged_root = canonical_directory.parent()?;
+    let voice_data = std::fs::canonicalize(packaged_root.join("share/espeak-ng-data")).ok()?;
+    let metadata = std::fs::metadata(&voice_data).ok()?;
+    (metadata.is_dir() && voice_data.starts_with(packaged_root)).then_some(executable)
+}
+
+fn usable_native_executable(candidate: &Path) -> Option<PathBuf> {
+    if !candidate.is_absolute() {
+        return None;
+    }
+    let canonical = std::fs::canonicalize(candidate).ok()?;
+    let metadata = std::fs::metadata(&canonical).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return None;
+        }
+    }
+    Some(canonical)
+}
+
+fn native_tts_identity(os: &str) -> (&'static str, &'static str) {
+    match os {
+        "linux" => ("linux", "eSpeak NG"),
+        "macos" => ("macos", "macOS Speech"),
+        "windows" => ("windows", "Windows Speech"),
+        _ => ("unsupported", "Native system voices"),
+    }
+}
+
+fn native_tts_setup_detail(os: &str) -> String {
+    match os {
+        "linux" => "eSpeak NG is not installed or is unavailable. Install eSpeak NG with your Linux package manager, or use AudiobookAI's managed Piper provider.".to_owned(),
+        "macos" => "macOS Speech is unavailable. AudiobookAI requires the built-in /usr/bin/say service.".to_owned(),
+        "windows" => "Windows Speech is unavailable. AudiobookAI requires the built-in Windows PowerShell and SAPI services.".to_owned(),
+        _ => "Native system voices are not supported on this operating system; use a supported TTS provider instead.".to_owned(),
+    }
+}
+
+pub(crate) fn provider_setup_error_detail(
+    profile: &ProviderProfileView,
+    config: &ServiceConfig,
+    error: &crate::ServiceError,
+) -> String {
+    if matches!(profile.kind, crate::models::ProviderKindView::NativeOs)
+        && native_tts_availability_for_profile(profile, config)
+            .executable
+            .is_none()
+    {
+        native_tts_setup_detail(std::env::consts::OS)
+    } else {
+        error.to_string()
     }
 }
 
@@ -543,7 +786,8 @@ async fn hydrate_providers(
     catalog: &mut Catalog,
 ) -> Result<(), crate::ServiceError> {
     use crate::models::{
-        ProviderCapabilitiesView, ProviderKindView, ProviderModeView, ProviderStatusView,
+        ProviderCapabilitiesView, ProviderKindView, ProviderModeView, ProviderRoleView,
+        ProviderStatusView,
     };
     use audiobookai_core::{
         ProviderDeployment, ProviderFamily, ProviderRole, TemperatureCapability,
@@ -552,23 +796,30 @@ async fn hydrate_providers(
     let profiles = database
         .repositories()
         .providers
+        // Read disabled rows as well as live profiles. Most tombstones merely stay absent from the
+        // empty portions of the catalog, but the platform-native profile is installed as an
+        // in-memory default before hydration. Observing its tombstone is therefore what prevents
+        // a deliberately removed eSpeak connection from reappearing after restart.
         .list(false)
         .await
         .map_err(|error| crate::ServiceError::Storage(error.to_string()))?;
     for profile in profiles {
         let id = profile.id.as_uuid();
-        let kind = match profile.family {
+        if !profile.enabled {
+            catalog.providers.remove(&id);
+            catalog.provider_secret_ids.remove(&id);
+            continue;
+        }
+        let kind = match &profile.family {
             ProviderFamily::ElevenLabs => ProviderKindView::Elevenlabs,
             ProviderFamily::MlxAudio => ProviderKindView::MlxAudio,
             ProviderFamily::LocalAi => ProviderKindView::Localai,
             ProviderFamily::AllTalkV2 => ProviderKindView::AlltalkV2,
+            ProviderFamily::Piper => ProviderKindView::Piper,
             ProviderFamily::NativeWindows
             | ProviderFamily::NativeMacos
             | ProviderFamily::EspeakNg => ProviderKindView::NativeOs,
-            ProviderFamily::OpenAi => match profile.role {
-                ProviderRole::Tts => ProviderKindView::OpenaiTts,
-                ProviderRole::CharacterDetection | ProviderRole::Both => ProviderKindView::Openai,
-            },
+            ProviderFamily::OpenAi => ProviderKindView::Openai,
             ProviderFamily::OpenAiCompatible | ProviderFamily::Custom(_) => {
                 ProviderKindView::OpenaiCompatible
             }
@@ -586,6 +837,23 @@ async fn hydrate_providers(
             ProviderDeployment::ManagedChild => ProviderModeView::ManagedChild,
             ProviderDeployment::NativeInProcess => ProviderModeView::Native,
         };
+        let role = match profile.role {
+            ProviderRole::Tts => ProviderRoleView::Tts,
+            ProviderRole::CharacterDetection => ProviderRoleView::Llm,
+            // `Both` predates per-connection workload isolation. Preserve the adapter behavior
+            // users had before the migration while every subsequent save persists one role.
+            ProviderRole::Both => match &profile.family {
+                ProviderFamily::ElevenLabs
+                | ProviderFamily::MlxAudio
+                | ProviderFamily::LocalAi
+                | ProviderFamily::AllTalkV2
+                | ProviderFamily::Piper
+                | ProviderFamily::NativeWindows
+                | ProviderFamily::NativeMacos
+                | ProviderFamily::EspeakNg => ProviderRoleView::Tts,
+                _ => ProviderRoleView::Llm,
+            },
+        };
         let model = profile
             .settings
             .0
@@ -595,6 +863,10 @@ async fn hydrate_providers(
         let mut fingerprint = blake3::Hasher::new();
         fingerprint.update(profile.endpoint.as_deref().unwrap_or("native").as_bytes());
         fingerprint.update(model.as_deref().unwrap_or("default").as_bytes());
+        fingerprint.update(match role {
+            ProviderRoleView::Tts => b"tts",
+            ProviderRoleView::Llm => b"llm",
+        });
         let endpoint_fingerprint = fingerprint.finalize().to_hex().to_string();
         let snapshot = profile.capability_snapshot.as_ref().filter(|snapshot| {
             snapshot.model.as_deref() == model.as_deref()
@@ -661,6 +933,7 @@ async fn hydrate_providers(
                 id,
                 name: profile.name,
                 kind,
+                role,
                 mode,
                 endpoint: profile.endpoint,
                 executable_path: profile.executable_path,
@@ -1258,9 +1531,15 @@ async fn hydrate_voices(
             warn_skipped("voice_profile", &row_id, "invalid relational UUID");
             continue;
         };
-        if !catalog.providers.contains_key(&provider_id) {
+        let Some(provider) = catalog
+            .providers
+            .get(&provider_id)
+            .filter(|provider| matches!(provider.role, crate::models::ProviderRoleView::Tts))
+        else {
             continue;
-        }
+        };
+        let piper_selected_model = matches!(provider.kind, crate::models::ProviderKindView::Piper)
+            .then(|| provider.model.clone());
         let payload = row.get::<String, _>("payload");
         let Some(profile) = decode_optional::<VoiceProfile>(&payload, "voice_profile", &row_id)
         else {
@@ -1295,6 +1574,16 @@ async fn hydrate_voices(
             .or_else(|| setting_string(&profile.settings, "sourceId"))
             .or_else(|| setting_string(&profile.settings, "referenceAudioPath"))
             .unwrap_or_else(|| profile.id.to_string());
+        if let Some(selected_model) = piper_selected_model.as_ref()
+            && selected_model.as_deref() != Some(source_id.as_str())
+        {
+            warn_skipped(
+                "voice_profile",
+                &row_id,
+                "Piper voice source does not match the provider's selected model",
+            );
+            continue;
+        }
         let preview_url = setting_string(&profile.settings, "previewUrl");
         let gender = setting_string(&profile.settings, "gender");
         catalog.voice_sources.insert(id, source_id);
@@ -1386,6 +1675,25 @@ async fn hydrate_voices(
             );
             continue;
         }
+        let Some(provider) = catalog.providers.get(&provider_id) else {
+            continue;
+        };
+        let piper_selected_model = matches!(provider.kind, crate::models::ProviderKindView::Piper)
+            .then_some(provider.model.as_deref());
+        if let Some(selected_model) = piper_selected_model
+            && (catalog.voice_sources.get(&voice_id).map(String::as_str) != selected_model
+                || assignment
+                    .model
+                    .as_deref()
+                    .is_some_and(|model| Some(model) != selected_model))
+        {
+            warn_skipped(
+                "voice_assignment",
+                &row_id,
+                "Piper assignment does not match the provider's selected model",
+            );
+            continue;
+        }
         let target_id = match &assignment.speaker {
             Speaker::Narrator => catalog.characters.get(&project_id).and_then(|characters| {
                 characters
@@ -1419,10 +1727,12 @@ async fn hydrate_voices(
             );
             continue;
         };
-        let provider_name = catalog.providers.get(&provider_id).map_or_else(
-            || "Unknown provider".to_owned(),
-            |provider| provider.name.clone(),
-        );
+        let provider_name = provider.name.clone();
+        let model = if piper_selected_model.is_some() {
+            provider.model.clone()
+        } else {
+            assignment.model.clone().or_else(|| profile.model.clone())
+        };
         if let Some(character) = catalog
             .characters
             .get_mut(&project_id)
@@ -1433,7 +1743,7 @@ async fn hydrate_voices(
                 provider_name,
                 voice_id,
                 voice_name: voice.name.clone(),
-                model: assignment.model.clone().or_else(|| profile.model.clone()),
+                model,
                 performance: assignment.performance.clone(),
                 timing: assignment.timing.clone(),
             });
@@ -2256,7 +2566,8 @@ fn storage_error(error: sqlx::Error) -> crate::ServiceError {
 
 fn native_provider() -> ProviderProfileView {
     use crate::models::{
-        ProviderCapabilitiesView, ProviderKindView, ProviderModeView, ProviderStatusView,
+        ProviderCapabilitiesView, ProviderKindView, ProviderModeView, ProviderRoleView,
+        ProviderStatusView,
     };
     ProviderProfileView {
         id: Uuid::parse_str(match std::env::consts::OS {
@@ -2272,6 +2583,7 @@ fn native_provider() -> ProviderProfileView {
         }
         .to_owned(),
         kind: ProviderKindView::NativeOs,
+        role: ProviderRoleView::Tts,
         mode: ProviderModeView::Native,
         endpoint: None,
         executable_path: None,
@@ -2334,11 +2646,56 @@ mod tests {
     }
 
     #[test]
-    fn packaged_linux_native_tts_resolves_from_the_installed_bin_directory() {
-        let sidecars = PathBuf::from("/opt/AudiobookAI/resources/sidecars/bin");
+    fn startup_probe_candidates_are_fail_closed_before_async_health_checks() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let paths = AppPaths::from_root(directory.path());
+        let mut catalog = Catalog::new(&paths);
+        for profile in catalog.providers.values_mut() {
+            profile.status = crate::models::ProviderStatusView::Online;
+            profile.last_error = Some("stale result".to_owned());
+        }
+
+        let candidates = prepare_provider_runtime_probes(&mut catalog);
+
+        assert_eq!(candidates.len(), catalog.providers.len());
+        assert!(
+            catalog.providers.values().all(|profile| matches!(
+                profile.status,
+                crate::models::ProviderStatusView::Offline
+            )),
+            "no unprobed provider may inherit a persisted Online status"
+        );
+        assert!(
+            catalog
+                .providers
+                .values()
+                .all(|profile| profile.last_error.is_none())
+        );
+    }
+
+    #[cfg(unix)]
+    fn write_test_executable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::create_dir_all(path.parent().expect("executable parent")).expect("create parent");
+        std::fs::write(path, "#!/bin/sh\nexit 0\n").expect("write executable");
+        let mut permissions = std::fs::metadata(path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).expect("mark executable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn packaged_linux_native_tts_requires_the_complete_bundled_payload() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let sidecars = directory.path().join("sidecars/bin");
+        let executable = sidecars.join("espeak-ng");
+        write_test_executable(&executable);
+        std::fs::create_dir_all(directory.path().join("sidecars/share/espeak-ng-data"))
+            .expect("voice data");
         let config = ServiceConfig {
             bind: "127.0.0.1:0".parse().unwrap(),
-            data_dir: PathBuf::from("/tmp/audiobookai-test-data"),
+            data_dir: directory.path().join("data"),
             bundled_sidecar_dir: Some(sidecars.clone()),
             tls: None,
             lan_hostnames: Vec::new(),
@@ -2347,14 +2704,248 @@ mod tests {
         };
 
         assert_eq!(
-            native_executable_for_os("linux", &config),
-            sidecars.join("espeak-ng")
+            resolve_native_tts_executable(
+                "linux",
+                &config,
+                Some(Path::new("/bin/sh")),
+                Some(OsStr::new("/bin/sh")),
+                Some(OsStr::new("/bin")),
+            ),
+            Some(std::fs::canonicalize(executable).expect("canonical executable"))
+        );
+
+        std::fs::remove_dir_all(directory.path().join("sidecars/share/espeak-ng-data"))
+            .expect("remove voice data");
+        assert_eq!(
+            resolve_native_tts_executable(
+                "linux",
+                &config,
+                Some(Path::new("/bin/sh")),
+                None,
+                Some(OsStr::new("/bin")),
+            ),
+            None,
+            "a damaged packaged payload must not fall back to an ambient executable"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn developer_linux_native_tts_uses_absolute_override_then_safe_path() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let override_executable = directory.path().join("override/espeak-ng");
+        let path_executable = directory.path().join("path-bin/espeak-ng");
+        write_test_executable(&override_executable);
+        write_test_executable(&path_executable);
+        let config = ServiceConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            data_dir: directory.path().join("data"),
+            bundled_sidecar_dir: None,
+            tls: None,
+            lan_hostnames: Vec::new(),
+            allow_insecure_lan: false,
+            desktop_bootstrap: true,
+        };
+        let search_path = std::env::join_paths([
+            PathBuf::from("relative-bin"),
+            path_executable.parent().expect("PATH parent").to_path_buf(),
+        ])
+        .expect("PATH");
+
+        assert_eq!(
+            resolve_native_tts_executable(
+                "linux",
+                &config,
+                Some(&override_executable),
+                None,
+                Some(&search_path),
+            ),
+            Some(std::fs::canonicalize(&override_executable).expect("canonical override"))
+        );
+        assert_eq!(
+            resolve_native_tts_executable(
+                "linux",
+                &config,
+                Some(Path::new("relative-bin/espeak-ng")),
+                None,
+                Some(&search_path),
+            ),
+            None,
+            "an explicit unsafe override must fail closed instead of falling back to PATH"
+        );
+        assert_eq!(
+            resolve_native_tts_executable(
+                "linux",
+                &config,
+                None,
+                Some(OsStr::new("relative-bin/espeak-ng")),
+                Some(&search_path),
+            ),
+            None,
+            "an explicit unsafe environment override must also fail closed"
+        );
+        assert_eq!(
+            resolve_native_tts_executable("linux", &config, None, None, Some(&search_path)),
+            Some(std::fs::canonicalize(path_executable).expect("canonical PATH executable")),
+            "relative PATH entries must be ignored while an absolute entry remains discoverable"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn fresh_start_does_not_persist_an_unavailable_native_default() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let database = Database::open_in(directory.path()).await.expect("database");
+        let default = native_provider();
+        let config = ServiceConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            data_dir: directory.path().to_path_buf(),
+            bundled_sidecar_dir: Some(directory.path().join("missing-sidecars/bin")),
+            tls: None,
+            lan_hostnames: Vec::new(),
+            allow_insecure_lan: false,
+            desktop_bootstrap: true,
+        };
+
+        let state = AppState::new(config, database.clone())
+            .await
+            .expect("state");
+        assert!(
+            !state
+                .catalog
+                .read()
+                .await
+                .providers
+                .contains_key(&default.id)
+        );
+        assert!(
+            database
+                .repositories()
+                .providers
+                .get(ProviderProfileId::from_uuid(default.id))
+                .await
+                .expect("read provider")
+                .is_none(),
+            "unavailable auto-default must not be persisted"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn persisted_unavailable_native_profile_stays_visible_as_setup_needed() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let database = Database::open_in(directory.path()).await.expect("database");
+        let default = native_provider();
+        let now = Utc::now();
+        let family = match std::env::consts::OS {
+            "windows" => ProviderFamily::NativeWindows,
+            "macos" => ProviderFamily::NativeMacos,
+            _ => ProviderFamily::EspeakNg,
+        };
+        database
+            .repositories()
+            .providers
+            .upsert(&ProviderProfile {
+                id: ProviderProfileId::from_uuid(default.id),
+                name: default.name.clone(),
+                family,
+                role: ProviderRole::Tts,
+                deployment: ProviderDeployment::NativeInProcess,
+                endpoint: None,
+                executable_path: None,
+                working_directory: None,
+                arguments: Vec::new(),
+                environment_secret_ids: BTreeMap::new(),
+                credential_secret_id: None,
+                enabled: true,
+                concurrency_override: None,
+                settings: SettingsMap(BTreeMap::new()),
+                capability_snapshot: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .expect("persist native profile");
+        let config = ServiceConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            data_dir: directory.path().to_path_buf(),
+            bundled_sidecar_dir: Some(directory.path().join("missing-sidecars/bin")),
+            tls: None,
+            lan_hostnames: Vec::new(),
+            allow_insecure_lan: false,
+            desktop_bootstrap: true,
+        };
+
+        let state = AppState::new(config, database).await.expect("state");
+        let catalog = state.catalog.read().await;
+        let profile = catalog
+            .providers
+            .get(&default.id)
+            .expect("existing profile remains visible");
+        assert!(matches!(
+            profile.status,
+            crate::models::ProviderStatusView::Unconfigured
+        ));
+        let detail = profile.last_error.as_deref().expect("setup guidance");
+        assert!(detail.contains("eSpeak NG") || detail.contains("Speech"));
+        assert!(!detail.contains("existing absolute file"));
+    }
+
+    #[tokio::test]
+    async fn disabled_native_tombstone_suppresses_the_in_memory_default() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let database = Database::open_in(directory.path()).await.expect("database");
+        let default = native_provider();
+        let now = Utc::now();
+        let family = match std::env::consts::OS {
+            "windows" => ProviderFamily::NativeWindows,
+            "macos" => ProviderFamily::NativeMacos,
+            _ => ProviderFamily::EspeakNg,
+        };
+        database
+            .repositories()
+            .providers
+            .upsert(&ProviderProfile {
+                id: ProviderProfileId::from_uuid(default.id),
+                name: default.name.clone(),
+                family,
+                role: ProviderRole::Tts,
+                deployment: ProviderDeployment::NativeInProcess,
+                endpoint: None,
+                executable_path: None,
+                working_directory: None,
+                arguments: Vec::new(),
+                environment_secret_ids: BTreeMap::new(),
+                credential_secret_id: None,
+                enabled: false,
+                concurrency_override: None,
+                settings: SettingsMap(BTreeMap::new()),
+                capability_snapshot: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .expect("persist native tombstone");
+
+        let paths = AppPaths::from_root(directory.path());
+        let mut catalog = Catalog::new(&paths);
+        assert!(catalog.providers.contains_key(&default.id));
+
+        hydrate_providers(&database, &mut catalog)
+            .await
+            .expect("hydrate providers");
+
+        assert!(
+            !catalog.providers.contains_key(&default.id),
+            "a disabled native audit row must suppress the auto-created provider"
         );
     }
 
     #[test]
     fn managed_launch_configuration_populates_the_runtime_profile() {
-        use crate::models::{ProviderKindView, ProviderModeView, ProviderStatusView};
+        use crate::models::{
+            ProviderKindView, ProviderModeView, ProviderRoleView, ProviderStatusView,
+        };
 
         let executable = std::env::current_exe().expect("test executable");
         let working_directory = std::env::current_dir().expect("test working directory");
@@ -2362,13 +2953,14 @@ mod tests {
             id: Uuid::new_v4(),
             name: "Managed LocalAI".to_owned(),
             kind: ProviderKindView::Localai,
+            role: ProviderRoleView::Tts,
             mode: ProviderModeView::ManagedChild,
             endpoint: Some("http://127.0.0.1:8080".to_owned()),
             executable_path: Some(executable.to_string_lossy().into_owned()),
             working_directory: Some(working_directory.to_string_lossy().into_owned()),
             arguments: vec!["--address".to_owned(), "127.0.0.1:8080".to_owned()],
             status: ProviderStatusView::Offline,
-            model: None,
+            model: Some("tts-model".to_owned()),
             credential_configured: false,
             capabilities: None,
             capability_source: None,
@@ -2392,6 +2984,7 @@ mod tests {
             Some(working_directory.as_path())
         );
         assert_eq!(runtime.arguments, profile.arguments);
+        assert_eq!(runtime.model, profile.model);
         let isolated_root = config
             .data_dir
             .join("provider-runtime")
@@ -2420,6 +3013,130 @@ mod tests {
         );
         assert!(isolated_root.join("home").is_dir());
         assert!(isolated_root.join("cache").join("huggingface").is_dir());
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn restart_hydrates_role_bound_provider_capabilities() {
+        use audiobookai_core::{
+            CapabilitySnapshot, CapabilitySnapshotId, CharacterDetectionCapabilities,
+            ControlCapabilities, ProviderCapabilities, SourceProvenance,
+        };
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let database = Database::open_in(directory.path()).await.expect("database");
+        let now = Utc::now();
+        let provider_id = ProviderProfileId::new();
+        let endpoint = "http://127.0.0.1:1234/";
+        let model = "local-model";
+        let mut fingerprint = blake3::Hasher::new();
+        fingerprint.update(endpoint.as_bytes());
+        fingerprint.update(model.as_bytes());
+        fingerprint.update(b"llm");
+        let snapshot = CapabilitySnapshot {
+            id: CapabilitySnapshotId::new(),
+            provider_profile_id: provider_id,
+            model: Some(model.to_owned()),
+            provider_version: None,
+            endpoint_fingerprint: fingerprint.finalize().to_hex().to_string(),
+            capabilities: ProviderCapabilities {
+                character_detection: Some(CharacterDetectionCapabilities {
+                    model_discovery: true,
+                    ..CharacterDetectionCapabilities::default()
+                }),
+                control: Some(ControlCapabilities {
+                    start: true,
+                    stop: true,
+                    restart: true,
+                    logs: true,
+                    ..ControlCapabilities::default()
+                }),
+                recommended_concurrency: Some(1),
+                ..ProviderCapabilities::default()
+            },
+            provenance: SourceProvenance {
+                source: "restart-test".to_owned(),
+                observed_at: Some(now),
+                ..SourceProvenance::default()
+            },
+            observed_at: now,
+            expires_at: Some(now + Duration::hours(1)),
+        };
+        let mut settings = BTreeMap::new();
+        settings.insert(
+            "model".to_owned(),
+            serde_json::Value::String(model.to_owned()),
+        );
+        database
+            .repositories()
+            .providers
+            .upsert(&ProviderProfile {
+                id: provider_id,
+                name: "Managed LLM".to_owned(),
+                family: ProviderFamily::LmStudio,
+                role: ProviderRole::CharacterDetection,
+                deployment: ProviderDeployment::ManagedChild,
+                endpoint: Some(endpoint.to_owned()),
+                executable_path: Some(
+                    std::env::current_exe()
+                        .expect("test executable")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                working_directory: None,
+                arguments: Vec::new(),
+                environment_secret_ids: BTreeMap::new(),
+                credential_secret_id: None,
+                enabled: true,
+                concurrency_override: None,
+                settings: SettingsMap(settings),
+                capability_snapshot: Some(snapshot),
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .expect("persist provider");
+        let mut tombstone = database
+            .repositories()
+            .providers
+            .get(provider_id)
+            .await
+            .expect("read provider")
+            .expect("stored provider");
+        let tombstone_id = ProviderProfileId::new();
+        tombstone.id = tombstone_id;
+        tombstone.name = "Deleted audit provider".to_owned();
+        tombstone.enabled = false;
+        tombstone.capability_snapshot = None;
+        database
+            .repositories()
+            .providers
+            .upsert(&tombstone)
+            .await
+            .expect("persist disabled audit tombstone");
+
+        let paths = AppPaths::from_root(directory.path());
+        let mut catalog = Catalog::new(&paths);
+        hydrate_providers(&database, &mut catalog)
+            .await
+            .expect("hydrate providers");
+
+        let restored = catalog
+            .providers
+            .get(&provider_id.as_uuid())
+            .expect("restored provider");
+        assert!(matches!(
+            restored.role,
+            crate::models::ProviderRoleView::Llm
+        ));
+        let capabilities = restored
+            .capabilities
+            .as_ref()
+            .expect("role-bound capability snapshot");
+        assert!(capabilities.character_detection);
+        assert!(capabilities.process_control);
+        assert_eq!(restored.capability_source.as_deref(), Some("restart-test"));
+        assert!(!catalog.providers.contains_key(&tombstone_id.as_uuid()));
     }
 
     // This integration fixture intentionally seeds the complete related record
@@ -2579,6 +3296,205 @@ mod tests {
             .await
             .expect("insert alias");
         }
+    }
+
+    async fn insert_voice_profile(database: &Database, profile: &VoiceProfile) {
+        sqlx::query(
+            "INSERT INTO voice_profiles \
+             (id, provider_id, name, origin, ownership, provider_voice_id, updated_at, payload) \
+             VALUES (?, ?, ?, 'provider_catalog', 'provider', ?, ?, ?)",
+        )
+        .bind(profile.id.to_string())
+        .bind(profile.provider_profile_id.to_string())
+        .bind(&profile.name)
+        .bind(&profile.provider_voice_id)
+        .bind(profile.updated_at.to_rfc3339())
+        .bind(serde_json::to_string(profile).expect("serialize voice"))
+        .execute(database.pool())
+        .await
+        .expect("insert voice");
+    }
+
+    async fn insert_voice_assignment(database: &Database, assignment: &VoiceAssignment) {
+        sqlx::query(
+            "INSERT INTO voice_assignments \
+             (id, project_id, provider_id, voice_profile_id, speaker_key, updated_at, payload) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(assignment.id.to_string())
+        .bind(assignment.project_id.to_string())
+        .bind(assignment.provider_profile_id.to_string())
+        .bind(assignment.voice_profile_id.to_string())
+        .bind(speaker_key(&assignment.speaker))
+        .bind(assignment.updated_at.to_rfc3339())
+        .bind(serde_json::to_string(assignment).expect("serialize assignment"))
+        .execute(database.pool())
+        .await
+        .expect("insert assignment");
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn restart_hydration_keeps_piper_voices_and_assignments_model_scoped() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let database = Database::open_in(directory.path()).await.expect("database");
+        let ids = seed_project_and_provider(&database).await;
+        let now = Utc::now();
+        let selected_model = "de_DE-thorsten-medium";
+        let other_model = "en_US-lessac-medium";
+        let piper_id = ProviderProfileId::new();
+        let mut settings = BTreeMap::new();
+        settings.insert(
+            "model".to_owned(),
+            serde_json::Value::String(selected_model.to_owned()),
+        );
+        database
+            .repositories()
+            .providers
+            .upsert(&ProviderProfile {
+                id: piper_id,
+                name: "Piper".to_owned(),
+                family: ProviderFamily::Piper,
+                role: ProviderRole::Tts,
+                deployment: ProviderDeployment::NativeInProcess,
+                endpoint: None,
+                executable_path: None,
+                working_directory: None,
+                arguments: Vec::new(),
+                environment_secret_ids: BTreeMap::new(),
+                credential_secret_id: None,
+                enabled: true,
+                concurrency_override: None,
+                settings: SettingsMap(settings),
+                capability_snapshot: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .expect("persist Piper provider");
+
+        let accepted_character = Character {
+            id: CharacterId::new(),
+            project_id: ids.project,
+            role: audiobookai_core::CharacterRole::Character,
+            canonical_name: "Accepted".to_owned(),
+            aliases: Vec::new(),
+            description: None,
+            confidence: Some(1.0),
+            detection_run_id: None,
+            manually_created: true,
+            created_at: now,
+            updated_at: now,
+        };
+        let rejected_character = Character {
+            id: CharacterId::new(),
+            canonical_name: "Rejected".to_owned(),
+            ..accepted_character.clone()
+        };
+        insert_character(&database, &accepted_character).await;
+        insert_character(&database, &rejected_character).await;
+
+        let selected_voice = VoiceProfile {
+            id: VoiceProfileId::new(),
+            provider_profile_id: piper_id,
+            provider_voice_id: Some(selected_model.to_owned()),
+            name: "Selected Piper voice".to_owned(),
+            origin: VoiceOrigin::ProviderCatalog,
+            ownership: VoiceOwnership::Provider,
+            reference_audio_artifact_ids: Vec::new(),
+            language: Some("de_DE".to_owned()),
+            model: Some(selected_model.to_owned()),
+            settings: BTreeMap::new(),
+            created_at: now,
+            updated_at: now,
+        };
+        let incompatible_voice = VoiceProfile {
+            id: VoiceProfileId::new(),
+            provider_voice_id: Some(other_model.to_owned()),
+            name: "Other Piper voice".to_owned(),
+            model: Some(other_model.to_owned()),
+            ..selected_voice.clone()
+        };
+        insert_voice_profile(&database, &selected_voice).await;
+        insert_voice_profile(&database, &incompatible_voice).await;
+
+        let accepted_assignment = VoiceAssignment {
+            id: VoiceAssignmentId::new(),
+            project_id: ids.project,
+            speaker: Speaker::Character(accepted_character.id),
+            voice_profile_id: selected_voice.id,
+            provider_profile_id: piper_id,
+            model: None,
+            performance: audiobookai_core::PerformanceSettings::default(),
+            timing: audiobookai_core::TimingSettings::default(),
+            settings: BTreeMap::new(),
+            created_at: now,
+            updated_at: now,
+        };
+        let incompatible_assignment = VoiceAssignment {
+            id: VoiceAssignmentId::new(),
+            speaker: Speaker::Character(rejected_character.id),
+            model: Some(other_model.to_owned()),
+            ..accepted_assignment.clone()
+        };
+        insert_voice_assignment(&database, &accepted_assignment).await;
+        insert_voice_assignment(&database, &incompatible_assignment).await;
+
+        let paths = AppPaths::from_root(directory.path());
+        let mut catalog = Catalog::new(&paths);
+        hydrate_projects(&database, &mut catalog)
+            .await
+            .expect("hydrate projects");
+        hydrate_providers(&database, &mut catalog)
+            .await
+            .expect("hydrate providers");
+        hydrate_characters(&database, &mut catalog)
+            .await
+            .expect("hydrate characters");
+        hydrate_voices(&database, &mut catalog)
+            .await
+            .expect("hydrate voices");
+
+        let piper_voices = catalog
+            .voices
+            .iter()
+            .filter(|voice| voice.provider_profile_id == piper_id.as_uuid())
+            .collect::<Vec<_>>();
+        assert_eq!(piper_voices.len(), 1);
+        assert_eq!(piper_voices[0].id, selected_voice.id.as_uuid());
+        assert_eq!(
+            catalog
+                .voice_sources
+                .get(&selected_voice.id.as_uuid())
+                .map(String::as_str),
+            Some(selected_model)
+        );
+        assert!(
+            !catalog
+                .voice_sources
+                .contains_key(&incompatible_voice.id.as_uuid())
+        );
+
+        let characters = catalog
+            .characters
+            .get(&ids.project.as_uuid())
+            .expect("characters");
+        let accepted = characters
+            .iter()
+            .find(|character| character.id == accepted_character.id.as_uuid())
+            .expect("accepted character");
+        assert_eq!(
+            accepted
+                .voice_assignment
+                .as_ref()
+                .and_then(|assignment| assignment.model.as_deref()),
+            Some(selected_model)
+        );
+        let rejected = characters
+            .iter()
+            .find(|character| character.id == rejected_character.id.as_uuid())
+            .expect("rejected character");
+        assert!(rejected.voice_assignment.is_none());
     }
 
     #[allow(clippy::too_many_lines)]

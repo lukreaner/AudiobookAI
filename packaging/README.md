@@ -114,4 +114,14 @@ blocked until it records an exact managed CPython artifact and a checksum-verifi
 `packaging/mlx-audio-installer.lock.json` containing the complete hashed transitive closure for
 `mlx-audio[tts,server]==0.4.6`. `--allow-unresolved` is for local validation only.
 
+The `piperInstaller` section is different: it is the allowlist for an optional app-managed online
+install on Linux x86_64, not material for a release bundle. Piper must not appear in any target's
+`requiredFiles` or below `packaging/runtime/`. The section pins the official Piper 1.2.0 archive URL,
+byte count, and SHA-256, plus a curated voice catalog at one full `rhasspy/piper-voices` commit. Each
+voice model, config, and model card is locked separately. The only initially approved voice is the
+single-speaker `de_DE-thorsten-medium`; its pinned model-card dataset-license declaration and
+provenance must be shown and confirmed before download. The literal `download=true` query recorded
+for that runtime voice endpoint is not an exception to the no-query rule for bundled sidecar URLs.
+The committed `releaseReady: false` value remains unchanged.
+
 See [the sidecar compliance procedure](../docs/sidecars.md) before updating any hash.

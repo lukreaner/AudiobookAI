@@ -95,6 +95,71 @@
       "completeTransitiveClosure": false
     }
   },
+  "piperInstaller": {
+    "version": "1.2.0",
+    "license": "MIT",
+    "target": "x86_64-unknown-linux-gnu",
+    "delivery": "explicit-online-install",
+    "bundled": false,
+    "archive": {
+      "format": "tar.gz",
+      "url": "https://github.com/rhasspy/piper/releases/download/v1.2.0/piper_amd64.tar.gz",
+      "sha256": "467c17935d2a22dcce9dc9e08ba07485e29be813097e7cf08c5627aa09d32e42",
+      "bytes": 25916047
+    },
+    "installLayout": {
+      "managedRoot": "managed-providers/piper",
+      "engineExecutable": "engine/piper/piper",
+      "voicesRoot": "voices"
+    },
+    "voiceCatalog": {
+      "repository": "rhasspy/piper-voices",
+      "revision": "f5a6e9094787fd865d65cb024472f977f9c542b5",
+      "downloadBaseUrl": "https://huggingface.co/rhasspy/piper-voices/resolve/f5a6e9094787fd865d65cb024472f977f9c542b5",
+      "downloadQuery": "download=true",
+      "cardBaseUrl": "https://huggingface.co/rhasspy/piper-voices/blob/f5a6e9094787fd865d65cb024472f977f9c542b5",
+      "delivery": "explicit-online-install",
+      "bundled": false,
+      "licenseConfirmationRequired": true,
+      "attributionConfirmationRequired": true,
+      "retainOnEngineUninstall": true,
+      "voices": [
+        {
+          "id": "de_DE-thorsten-medium",
+          "language": "de_DE",
+          "quality": "medium",
+          "speakers": 1,
+          "sampleRateHz": 22050,
+          "sourceUrl": "https://github.com/thorstenMueller/deep-learning-german-tts",
+          "provenance": "German Thorsten medium voice, according to the pinned model card.",
+          "modelCardUrl": "https://huggingface.co/rhasspy/piper-voices/blob/f5a6e9094787fd865d65cb024472f977f9c542b5/de/de_DE/thorsten/medium/MODEL_CARD",
+          "declaredDatasetLicense": {
+            "id": "CC0-1.0",
+            "url": "https://creativecommons.org/publicdomain/zero/1.0/",
+            "scope": "source-dataset",
+            "declaration": "The pinned model card declares the source dataset license as CC0."
+          },
+          "files": {
+            "model": {
+              "path": "de/de_DE/thorsten/medium/de_DE-thorsten-medium.onnx",
+              "sha256": "7e64762d8e5118bb578f2eea6207e1a35a8e0c30595010b666f983fc87bb7819",
+              "bytes": 63201294
+            },
+            "config": {
+              "path": "de/de_DE/thorsten/medium/de_DE-thorsten-medium.onnx.json",
+              "sha256": "974adee790533adb273a1ac88f49027d2a1b8f0f2cf4905954a4791e79264e85",
+              "bytes": 4819
+            },
+            "modelCard": {
+              "path": "de/de_DE/thorsten/medium/MODEL_CARD",
+              "sha256": "5196b5ab0794e6056263a1f37c18bec407b61ac187529bee29d1c366871e5c9e",
+              "bytes": 285
+            }
+          }
+        }
+      ]
+    }
+  },
   "bundles": {
     "x86_64-pc-windows-msvc": {
       "archive": {

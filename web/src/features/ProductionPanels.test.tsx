@@ -16,7 +16,7 @@ function renderPanel(node: React.ReactNode) {
 }
 
 const provider = {
-  id: "provider-1", name: "Local TTS", kind: "localai", mode: "external_endpoint", arguments: [], status: "online", model: "tts-model", credentialConfigured: false,
+  id: "provider-1", name: "Local TTS", kind: "localai", role: "tts", mode: "external_endpoint", arguments: [], status: "online", model: "tts-model", credentialConfigured: false,
   capabilityUpdatedAt: new Date().toISOString(),
   capabilities: { tts: true, characterDetection: false, streaming: false, voiceCloning: false, pronunciation: false, processControl: false, modelControl: false, modelList: false, modelDownload: false, modelDelete: false, modelLoad: false, modelUnload: false, modelSwitch: false, temperature: "unsupported", reasoning: [], modelPerformance: [{ model: "tts-model", performance: { speed: { minimum: 0.5, maximum: 2 }, pitch: null, stability: null, similarity: null, style: null, speaker_boost: false, delivery_cues: [] } }] },
 } as ProviderProfile;

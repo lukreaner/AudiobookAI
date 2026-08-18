@@ -3,7 +3,7 @@ import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { api } from "../api/client";
-import type { MlxManagement, ProviderProfile } from "../api/types";
+import type { MlxManagement, PiperManagement, ProviderProfile } from "../api/types";
 import i18n from "../i18n";
 import { ProvidersPage } from "./ProvidersPage";
 
@@ -11,6 +11,7 @@ const managedProvider: ProviderProfile = {
   id: "provider-localai",
   name: "LocalAI",
   kind: "localai",
+  role: "tts",
   mode: "managed_child",
   endpoint: "http://127.0.0.1:8080",
   executablePath: "/opt/localai/local-ai",
@@ -51,6 +52,17 @@ const mlxManagement: MlxManagement = {
   profileActionRequired: false,
 };
 
+const piperManagement: PiperManagement = {
+  supported: false,
+  supportDetail: "Piper app management is available on Linux.",
+  installerStatus: "unsupported_platform",
+  installed: false,
+  catalog: [],
+  installedVoices: [],
+  voiceIssues: [],
+  profileActionRequired: false,
+};
+
 function renderProviders() {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
@@ -66,12 +78,24 @@ beforeEach(async () => {
   vi.restoreAllMocks();
   await i18n.changeLanguage("en");
   vi.spyOn(api, "providers").mockResolvedValue({ items: [structuredClone(managedProvider)], total: 1 });
+  vi.spyOn(api, "nativeProviderAvailability").mockResolvedValue({
+    platform: "linux",
+    providerName: "eSpeak NG",
+    available: true,
+    detail: null,
+  });
+  vi.spyOn(api, "piperManagement").mockResolvedValue(structuredClone(piperManagement));
+  vi.spyOn(api, "installPiper").mockResolvedValue({ id: "piper-install", kind: "install", state: "queued", progressPercent: 0, phase: "queued", message: "Queued", startedAt: new Date().toISOString() });
+  vi.spyOn(api, "uninstallPiper").mockResolvedValue({ id: "piper-uninstall", kind: "uninstall", state: "queued", progressPercent: 0, phase: "queued", message: "Queued", startedAt: new Date().toISOString() });
+  vi.spyOn(api, "cancelPiperOperation").mockResolvedValue({ id: "piper-operation", kind: "download_voice", state: "cancelling", progressPercent: 50, phase: "cancelling", message: "Cancelling", voiceId: "de_DE-thorsten-medium", startedAt: new Date().toISOString() });
+  vi.spyOn(api, "downloadPiperVoice").mockResolvedValue({ id: "piper-download", kind: "download_voice", state: "queued", progressPercent: 0, phase: "queued", message: "Queued", voiceId: "de_DE-thorsten-medium", startedAt: new Date().toISOString() });
+  vi.spyOn(api, "removePiperVoice").mockResolvedValue(undefined);
   vi.spyOn(api, "mlxManagement").mockResolvedValue(structuredClone(mlxManagement));
   vi.spyOn(api, "installMlx").mockResolvedValue({ id: "operation-install", kind: "install", state: "queued", progressPercent: 0, phase: "queued", message: "Queued", startedAt: new Date().toISOString() });
   vi.spyOn(api, "uninstallMlx").mockResolvedValue({ id: "operation-uninstall", kind: "uninstall", state: "queued", progressPercent: 0, phase: "queued", message: "Queued", startedAt: new Date().toISOString() });
   vi.spyOn(api, "removeMlxModel").mockResolvedValue(undefined);
   vi.spyOn(api, "providerModels").mockResolvedValue({ models: [], operations: [] });
-  vi.spyOn(api, "discoverProviderModels").mockResolvedValue({ items: [] });
+  vi.spyOn(api, "discoverProviderModels").mockResolvedValue({ items: [], strict: false });
   vi.spyOn(api, "createProvider").mockImplementation(async (input) => ({
     ...structuredClone(managedProvider),
     ...input,
@@ -114,15 +138,18 @@ describe("managed provider configuration", () => {
         { id: "qwen3:8b", name: "Qwen 3 8B" },
         { id: "gemma3:4b", name: "Gemma 3 4B" },
       ],
+      strict: false,
     });
     const user = userEvent.setup();
     renderProviders();
 
     await user.click(await screen.findByRole("button", { name: "Add provider" }));
+    await user.selectOptions(screen.getByLabelText(/^Provider use/), "llm");
     await user.selectOptions(screen.getByLabelText("Choose a provider type"), "ollama");
 
     await waitFor(() => expect(api.discoverProviderModels).toHaveBeenCalledWith(expect.objectContaining({
       kind: "ollama",
+      role: "llm",
       mode: "external_endpoint",
       endpoint: "http://127.0.0.1:11434/",
     })));
@@ -134,54 +161,188 @@ describe("managed provider configuration", () => {
     await user.click(screen.getByRole("button", { name: "Save and check connection" }));
     await waitFor(() => expect(api.createProvider).toHaveBeenCalledWith(expect.objectContaining({
       kind: "ollama",
+      role: "llm",
       model: "qwen3:8b",
     })));
   });
 
-  it("offers OpenAI Speech as TTS with speech-only model choices", async () => {
+  it("offers OpenAI in TTS mode with strict speech-only model choices", async () => {
     vi.mocked(api.discoverProviderModels).mockResolvedValue({
       items: [
         { id: "gpt-4o-mini-tts", name: "gpt-4o-mini-tts" },
         { id: "tts-1-hd", name: "tts-1-hd" },
       ],
+      strict: true,
     });
     const user = userEvent.setup();
     renderProviders();
 
     await user.click(await screen.findByRole("button", { name: "Add provider" }));
-    await user.selectOptions(screen.getByLabelText("Choose a provider type"), "openai_tts");
+    await user.selectOptions(screen.getByLabelText("Choose a provider type"), "openai");
 
     expect(screen.getByText("Text to speech (TTS)")).toBeInTheDocument();
     expect(screen.getByLabelText(/^Endpoint URL/)).toHaveValue("https://api.openai.com/");
-    expect(screen.getByLabelText(/^TTS model/)).toHaveValue("gpt-4o-mini-tts");
+    expect(screen.getByLabelText(/^TTS model/)).toBeDisabled();
+    expect(screen.queryByRole("option", { name: "Enter a model manually" })).not.toBeInTheDocument();
     await user.type(screen.getByLabelText(/^API key/), "test-openai-key");
 
     await waitFor(() => expect(api.discoverProviderModels).toHaveBeenCalledWith(
       expect.objectContaining({
-        kind: "openai_tts",
+        kind: "openai",
+        role: "tts",
         mode: "cloud_remote",
         endpoint: "https://api.openai.com/",
       }),
     ));
     await waitFor(() => expect(screen.getByLabelText(/^TTS model/).tagName).toBe("SELECT"));
+    expect(screen.getByLabelText(/^TTS model/)).toHaveValue("gpt-4o-mini-tts");
     expect(screen.getByRole("option", { name: "tts-1-hd" })).toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: "Enter a model manually" })).not.toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "Save and check connection" }));
     await waitFor(() => expect(api.createProvider).toHaveBeenCalledWith(
       expect.objectContaining({
-        kind: "openai_tts",
+        kind: "openai",
+        role: "tts",
         model: "gpt-4o-mini-tts",
       }),
     ));
   });
 
+  it("keeps separate OpenAI TTS and LLM connections with the same endpoint", async () => {
+    vi.mocked(api.discoverProviderModels).mockImplementation(async (input) => input.role === "tts"
+      ? { items: [{ id: "gpt-4o-mini-tts", name: "gpt-4o-mini-tts" }], strict: true }
+      : { items: [{ id: "gpt-5-mini", name: "gpt-5-mini" }], strict: true });
+    const user = userEvent.setup();
+    renderProviders();
+
+    await user.click(await screen.findByRole("button", { name: "Add provider" }));
+    await user.selectOptions(screen.getByLabelText("Choose a provider type"), "openai");
+    await user.type(screen.getByLabelText(/^API key/), "test-openai-key");
+    await waitFor(() => expect(screen.getByRole("option", { name: "gpt-4o-mini-tts" })).toBeInTheDocument());
+    await user.click(screen.getByRole("button", { name: "Save and check connection" }));
+    await waitFor(() => expect(api.createProvider).toHaveBeenCalledTimes(1));
+
+    await user.click(screen.getByRole("button", { name: "Add provider" }));
+    await user.selectOptions(screen.getByLabelText(/^Provider use/), "llm");
+    expect(screen.getByLabelText("Choose a provider type")).toHaveValue("openai");
+    await user.type(screen.getByLabelText(/^API key/), "test-openai-key");
+    await waitFor(() => expect(screen.getByRole("option", { name: "gpt-5-mini" })).toBeInTheDocument());
+    await user.selectOptions(screen.getByLabelText(/^LLM model/), "gpt-5-mini");
+    await user.click(screen.getByRole("button", { name: "Save and check connection" }));
+
+    await waitFor(() => expect(api.createProvider).toHaveBeenCalledTimes(2));
+    expect(api.createProvider).toHaveBeenNthCalledWith(1, expect.objectContaining({
+      kind: "openai", role: "tts", endpoint: "https://api.openai.com/", model: "gpt-4o-mini-tts",
+    }));
+    expect(api.createProvider).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      kind: "openai", role: "llm", endpoint: "https://api.openai.com/", model: "gpt-5-mini",
+    }));
+  });
+
+  it("clears the previous role's discovered models as soon as the role changes", async () => {
+    vi.mocked(api.discoverProviderModels).mockImplementation(async (input) => input.role === "tts"
+      ? { items: [{ id: "gpt-4o-mini-tts", name: "gpt-4o-mini-tts" }], strict: true }
+      : { items: [{ id: "gpt-5-mini", name: "gpt-5-mini" }], strict: true });
+    const user = userEvent.setup();
+    renderProviders();
+
+    await user.click(await screen.findByRole("button", { name: "Add provider" }));
+    await user.selectOptions(screen.getByLabelText("Choose a provider type"), "openai");
+    await user.type(screen.getByLabelText(/^API key/), "test-openai-key");
+    await waitFor(() => expect(screen.getByRole("option", { name: "gpt-4o-mini-tts" })).toBeInTheDocument());
+
+    await user.selectOptions(screen.getByLabelText(/^Provider use/), "llm");
+    expect(screen.queryByRole("option", { name: "gpt-4o-mini-tts" })).not.toBeInTheDocument();
+    expect(screen.getByLabelText(/^LLM model/)).toBeDisabled();
+    await waitFor(() => expect(screen.getByRole("option", { name: "gpt-5-mini" })).toBeInTheDocument());
+  });
+
+  it("edits the persisted role and revalidates the model for a dual-role provider", async () => {
+    const openaiProvider: ProviderProfile = {
+      ...structuredClone(managedProvider),
+      id: "provider-openai",
+      name: "OpenAI shared account",
+      kind: "openai",
+      role: "tts",
+      mode: "cloud_remote",
+      endpoint: "https://api.openai.com/",
+      executablePath: undefined,
+      workingDirectory: undefined,
+      arguments: [],
+      model: "gpt-4o-mini-tts",
+      credentialConfigured: true,
+      capabilities: { ...structuredClone(managedProvider.capabilities!), processControl: false },
+    };
+    vi.mocked(api.providers).mockResolvedValue({ items: [openaiProvider], total: 1 });
+    vi.mocked(api.discoverProviderModels).mockImplementation(async (input) => input.role === "tts"
+      ? { items: [{ id: "gpt-4o-mini-tts", name: "gpt-4o-mini-tts" }], strict: true }
+      : { items: [{ id: "gpt-5-mini", name: "gpt-5-mini" }], strict: true });
+    const user = userEvent.setup();
+    renderProviders();
+
+    await user.click(await screen.findByRole("button", { name: "Settings" }));
+    expect(screen.getByLabelText(/^Provider use/)).toHaveValue("tts");
+    await user.selectOptions(screen.getByLabelText(/^Provider use/), "llm");
+    await waitFor(() => expect(screen.getByRole("option", { name: "gpt-5-mini" })).toBeInTheDocument());
+    await user.selectOptions(screen.getByLabelText(/^LLM model/), "gpt-5-mini");
+    await user.click(screen.getByRole("button", { name: "Save and check connection" }));
+
+    await waitFor(() => expect(api.updateProvider).toHaveBeenCalledWith("provider-openai", expect.objectContaining({
+      role: "llm",
+      model: "gpt-5-mini",
+      endpoint: "https://api.openai.com/",
+    })));
+  });
+
+  it("normalizes a hidden legacy OpenAI Speech connection for an LLM role switch", async () => {
+    const legacyProvider: ProviderProfile = {
+      ...structuredClone(managedProvider),
+      id: "provider-openai-speech-legacy",
+      name: "OpenAI Speech",
+      kind: "openai_tts",
+      role: "tts",
+      mode: "cloud_remote",
+      endpoint: "https://api.openai.com/",
+      executablePath: undefined,
+      workingDirectory: undefined,
+      arguments: [],
+      model: "gpt-4o-mini-tts",
+      credentialConfigured: true,
+      capabilities: { ...structuredClone(managedProvider.capabilities!), processControl: false },
+    };
+    vi.mocked(api.providers).mockResolvedValue({ items: [legacyProvider], total: 1 });
+    vi.mocked(api.discoverProviderModels).mockImplementation(async (input) => input.role === "tts"
+      ? { items: [{ id: "gpt-4o-mini-tts", name: "gpt-4o-mini-tts" }], strict: true }
+      : { items: [{ id: "gpt-5-mini", name: "gpt-5-mini" }], strict: true });
+    const user = userEvent.setup();
+    renderProviders();
+
+    await user.click(await screen.findByRole("button", { name: "Settings" }));
+    expect(screen.getByLabelText("Choose a provider type")).toHaveValue("openai");
+    await user.selectOptions(screen.getByLabelText(/^Provider use/), "llm");
+    await waitFor(() => expect(screen.getByRole("option", { name: "gpt-5-mini" })).toBeInTheDocument());
+    await user.selectOptions(screen.getByLabelText(/^LLM model/), "gpt-5-mini");
+    await user.click(screen.getByRole("button", { name: "Save and check connection" }));
+
+    await waitFor(() => expect(api.updateProvider).toHaveBeenCalledWith(
+      legacyProvider.id,
+      expect.objectContaining({ role: "llm", model: "gpt-5-mini" }),
+    ));
+    expect(vi.mocked(api.updateProvider).mock.calls.at(-1)?.[1]).not.toHaveProperty("kind");
+  });
+
   it("separates configured TTS providers from LLM providers", async () => {
+    vi.mocked(api.providers).mockResolvedValue({
+      items: [{ ...structuredClone(managedProvider), id: "provider-openai-tts", name: "OpenAI narration", kind: "openai", role: "tts" }],
+      total: 1,
+    });
     renderProviders();
 
     const ttsSection = await screen.findByRole("region", { name: "Text-to-speech providers" });
     const llmSection = screen.getByRole("region", { name: "LLM providers" });
     expect(screen.getByText("Automatic model detection")).toBeInTheDocument();
-    expect(within(ttsSection).getByText("LocalAI")).toBeInTheDocument();
+    expect(within(ttsSection).getByText("OpenAI narration")).toBeInTheDocument();
     expect(within(llmSection).getByText("No LLM provider is configured yet.")).toBeInTheDocument();
     expect(within(llmSection).getByRole("button", { name: "Add LLM provider" })).toBeEnabled();
   });
@@ -218,11 +379,177 @@ describe("managed provider configuration", () => {
     renderProviders();
 
     const ttsSection = await screen.findByRole("region", { name: "Text-to-speech providers" });
-    expect(within(ttsSection).getByText("System voices · no model catalog")).toBeInTheDocument();
+    expect(within(ttsSection).getByText("Runs locally on this computer")).toBeInTheDocument();
+    expect(within(ttsSection).getByText("eSpeak NG · no model catalog")).toBeInTheDocument();
     await user.click(within(ttsSection).getByRole("button", { name: "Settings" }));
     expect(screen.getByText("This native provider uses system voices and does not expose a model catalog.")).toBeInTheDocument();
     expect(screen.queryByLabelText(/^TTS model/)).not.toBeInTheDocument();
     expect(api.discoverProviderModels).not.toHaveBeenCalled();
+  });
+
+  it("disables unavailable Linux native TTS and replaces its raw profile error with setup guidance", async () => {
+    const nativeProvider: ProviderProfile = {
+      ...structuredClone(managedProvider),
+      id: "provider-native-missing",
+      name: "Native system voices",
+      kind: "native_os",
+      mode: "native",
+      endpoint: undefined,
+      executablePath: undefined,
+      workingDirectory: undefined,
+      arguments: [],
+      model: undefined,
+      status: "unconfigured",
+      lastError: "provider configuration is invalid: native TTS executable must be an existing absolute file",
+    };
+    vi.mocked(api.providers).mockResolvedValue({ items: [nativeProvider], total: 1 });
+    vi.mocked(api.nativeProviderAvailability).mockResolvedValue({
+      platform: "linux",
+      providerName: "eSpeak NG",
+      available: false,
+      detail: "No eSpeak NG executable was found.",
+    });
+    const user = userEvent.setup();
+    renderProviders();
+
+    const ttsSection = await screen.findByRole("region", { name: "Text-to-speech providers" });
+    expect(within(ttsSection).getByText("eSpeak NG needs setup")).toBeInTheDocument();
+    expect(within(ttsSection).getByText(/Linux does not include a speech engine by default/)).toBeInTheDocument();
+    expect(within(ttsSection).getByText(/managed Piper section above/)).toBeInTheDocument();
+    expect(within(ttsSection).queryByText("No eSpeak NG executable was found.")).not.toBeInTheDocument();
+    expect(screen.queryByText(/native TTS executable must be an existing absolute file/)).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Add provider" }));
+    const dialog = screen.getByRole("dialog", { name: "Add provider" });
+    const nativeOption = within(dialog).getByRole("option", { name: "eSpeak NG — setup needed" });
+    expect(nativeOption).toBeDisabled();
+    const nativeSetupSummary = dialog.querySelector("summary");
+    expect(nativeSetupSummary).not.toBeNull();
+    await user.click(nativeSetupSummary!);
+    expect(within(dialog).getByText(/Install eSpeak NG through your system package manager/)).toBeInTheDocument();
+    expect(within(dialog).getByRole("button", { name: "Save and check connection" })).toBeEnabled();
+  });
+
+  it("does not mark a working profile-specific native executable as broken", async () => {
+    const nativeProvider: ProviderProfile = {
+      ...structuredClone(managedProvider),
+      id: "provider-native-override",
+      name: "Studio eSpeak",
+      kind: "native_os",
+      mode: "native",
+      endpoint: undefined,
+      executablePath: "/opt/studio/bin/espeak-ng",
+      workingDirectory: undefined,
+      arguments: [],
+      model: undefined,
+      status: "online",
+    };
+    vi.mocked(api.providers).mockResolvedValue({ items: [nativeProvider], total: 1 });
+    vi.mocked(api.nativeProviderAvailability).mockResolvedValue({
+      platform: "linux",
+      providerName: "eSpeak NG",
+      available: false,
+      detail: "No global eSpeak NG executable was found.",
+    });
+    const user = userEvent.setup();
+    renderProviders();
+
+    const ttsSection = await screen.findByRole("region", { name: "Text-to-speech providers" });
+    expect(within(ttsSection).getByText("Online")).toBeInTheDocument();
+    expect(within(ttsSection).queryByText("eSpeak NG needs setup")).not.toBeInTheDocument();
+    await user.click(within(ttsSection).getByRole("button", { name: "Settings" }));
+    await user.click(screen.getByRole("button", { name: "Save and check connection" }));
+
+    await waitFor(() => expect(api.updateProvider).toHaveBeenCalledWith(nativeProvider.id, expect.any(Object)));
+    const nativePatch = vi.mocked(api.updateProvider).mock.calls.at(-1)?.[1];
+    expect(nativePatch).not.toHaveProperty("executablePath");
+  });
+
+  it("rechecks native availability when Add opens and offers eSpeak NG after it is installed", async () => {
+    vi.mocked(api.nativeProviderAvailability)
+      .mockResolvedValueOnce({ platform: "linux", providerName: "eSpeak NG", available: false, detail: "Not found." })
+      .mockResolvedValue({ platform: "linux", providerName: "eSpeak NG", available: true, detail: null });
+    const user = userEvent.setup();
+    renderProviders();
+
+    expect(await screen.findByText("LocalAI")).toBeInTheDocument();
+    expect(api.nativeProviderAvailability).toHaveBeenCalledTimes(1);
+    await user.click(screen.getByRole("button", { name: "Add provider" }));
+
+    await waitFor(() => expect(screen.getByRole("option", { name: "eSpeak NG" })).toBeEnabled());
+    expect(api.nativeProviderAvailability).toHaveBeenCalledTimes(2);
+    await user.selectOptions(screen.getByLabelText("Choose a provider type"), "native_os");
+    expect(screen.getByLabelText("Title")).toHaveValue("eSpeak NG");
+    await user.click(screen.getByRole("button", { name: "Save and check connection" }));
+    await waitFor(() => expect(api.createProvider).toHaveBeenCalledWith(expect.objectContaining({
+      kind: "native_os",
+      role: "tts",
+      mode: "native",
+      name: "eSpeak NG",
+    })));
+  });
+
+  it("removes an unavailable native system-voice connection without implying software uninstall", async () => {
+    const nativeProvider: ProviderProfile = {
+      ...structuredClone(managedProvider),
+      id: "provider-native-unavailable",
+      name: "eSpeak NG",
+      kind: "native_os",
+      mode: "native",
+      endpoint: undefined,
+      executablePath: undefined,
+      workingDirectory: undefined,
+      arguments: [],
+      model: undefined,
+      status: "error",
+      lastError: "native TTS executable is unavailable",
+    };
+    vi.mocked(api.providers)
+      .mockResolvedValueOnce({ items: [nativeProvider], total: 1 })
+      .mockResolvedValue({ items: [], total: 0 });
+    const user = userEvent.setup();
+    renderProviders();
+
+    const ttsSection = await screen.findByRole("region", { name: "Text-to-speech providers" });
+    await user.click(within(ttsSection).getByRole("button", { name: "Settings" }));
+    await user.click(screen.getByRole("button", { name: "Delete provider" }));
+
+    const dialog = screen.getByRole("dialog", { name: "Delete eSpeak NG?" });
+    expect(within(dialog).getByText(/does not uninstall or change eSpeak NG/)).toBeInTheDocument();
+    expect(within(dialog).getByText(/add the connection again later/)).toBeInTheDocument();
+    await user.click(within(dialog).getByRole("button", { name: "Delete provider" }));
+
+    await waitFor(() => expect(api.deleteProvider).toHaveBeenCalledWith(nativeProvider.id));
+    await waitFor(() => expect(screen.queryByText("eSpeak NG")).not.toBeInTheDocument());
+  });
+
+  it("discovers only installed voices for a native Piper connection", async () => {
+    vi.mocked(api.discoverProviderModels).mockResolvedValue({
+      items: [{ id: "de_DE-thorsten-medium", name: "Thorsten (German, medium)" }],
+      strict: true,
+    });
+    const user = userEvent.setup();
+    renderProviders();
+
+    await user.click(await screen.findByRole("button", { name: "Add provider" }));
+    await user.selectOptions(screen.getByLabelText("Choose a provider type"), "piper");
+
+    await waitFor(() => expect(api.discoverProviderModels).toHaveBeenCalledWith(expect.objectContaining({
+      kind: "piper",
+      role: "tts",
+      mode: "native",
+      endpoint: null,
+    })));
+    expect(screen.queryByLabelText(/^API key/)).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole("option", { name: "Thorsten (German, medium) (de_DE-thorsten-medium)" })).toBeInTheDocument());
+    await user.selectOptions(screen.getByLabelText(/^TTS model/), "de_DE-thorsten-medium");
+    await user.click(screen.getByRole("button", { name: "Save and check connection" }));
+    await waitFor(() => expect(api.createProvider).toHaveBeenCalledWith(expect.objectContaining({
+      kind: "piper",
+      role: "tts",
+      mode: "native",
+      model: "de_DE-thorsten-medium",
+    })));
   });
 
   it("applies working presets and discards transient credentials when provider type changes", async () => {
@@ -234,10 +561,11 @@ describe("managed provider configuration", () => {
     await user.clear(screen.getByLabelText(/^Endpoint URL/));
     await user.type(screen.getByLabelText(/^Endpoint URL/), "https://api.example.test");
     await user.type(screen.getByLabelText(/^API key/), "temporary-provider-credential");
+    await user.selectOptions(screen.getByLabelText(/^Provider use/), "llm");
     await user.selectOptions(screen.getByLabelText("Choose a provider type"), "ollama");
 
     expect(screen.getByText("Language model (LLM)")).toBeInTheDocument();
-    expect(screen.getByLabelText("Connection mode")).toHaveValue("external_endpoint");
+    expect(screen.getByLabelText("Deployment")).toHaveValue("external_endpoint");
     expect(screen.getByLabelText(/^Endpoint URL/)).toHaveValue("http://127.0.0.1:11434/");
     expect(screen.getByLabelText(/^API key/)).toHaveValue("");
   });
@@ -257,6 +585,7 @@ describe("managed provider configuration", () => {
     await user.click(screen.getByRole("button", { name: "Save and check connection" }));
 
     await waitFor(() => expect(api.updateProvider).toHaveBeenCalledWith("provider-localai", expect.objectContaining({
+      role: "tts",
       endpoint: null,
       model: null,
       executablePath: "/opt/localai/local-ai",
@@ -272,7 +601,7 @@ describe("managed provider configuration", () => {
     await user.click(await screen.findByRole("button", { name: "Settings" }));
     await user.click(screen.getByRole("button", { name: "Delete provider" }));
 
-    expect(screen.getByText("Deleting a profile does not remove its external resources or the app-managed MLX-audio runtime and models. External processes are never stopped.")).toBeInTheDocument();
+    expect(screen.getByText(/Deleting a profile does not remove its external resources/)).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Delete provider" }));
     await waitFor(() => expect(api.deleteProvider).toHaveBeenCalledWith("provider-localai"));
   });
@@ -316,7 +645,7 @@ describe("managed provider configuration", () => {
     expect(screen.getByText("Installer exit code: 23")).toBeInTheDocument();
     expect(screen.getByText("The bundled artifact failed hash verification.")).toBeInTheDocument();
     await userEvent.setup().click(configure);
-    expect(screen.getByLabelText("Connection mode")).toHaveValue("managed_child");
+    expect(screen.getByLabelText("Deployment")).toHaveValue("managed_child");
     expect(screen.getByLabelText(/^Endpoint URL/)).toHaveValue("http://127.0.0.1:8000/");
     expect(screen.getByLabelText(/^Launch arguments/)).toHaveValue("--host\n127.0.0.1\n--port\n8000");
   });
@@ -361,6 +690,181 @@ describe("managed provider configuration", () => {
     expect(within(dialog).getByText(/Downloaded models are retained/)).toBeInTheDocument();
     await user.click(within(dialog).getByRole("button", { name: "Uninstall runtime" }));
     await waitFor(() => expect(api.uninstallMlx).toHaveBeenCalledWith(true));
+  });
+
+  it("installs the app-managed Piper engine on a supported Linux system", async () => {
+    vi.mocked(api.piperManagement).mockResolvedValue({
+      ...structuredClone(piperManagement),
+      supported: true,
+      installerStatus: "ready",
+    });
+    const user = userEvent.setup();
+    renderProviders();
+
+    await user.click(await screen.findByRole("button", { name: "Install Piper" }));
+    await waitFor(() => expect(api.installPiper).toHaveBeenCalledOnce());
+  });
+
+  it("opens an add-Piper-connection form from the installed engine card", async () => {
+    vi.mocked(api.piperManagement).mockResolvedValue({
+      ...structuredClone(piperManagement),
+      supported: true,
+      installerStatus: "ready",
+      installed: true,
+      installedVersion: "1.2.0",
+    });
+    const user = userEvent.setup();
+    renderProviders();
+
+    await user.click(await screen.findByRole("button", { name: "Add Piper connection" }));
+    expect(screen.getByLabelText("Choose a provider type")).toHaveValue("piper");
+    expect(screen.getByLabelText("Deployment")).toHaveValue("native");
+    expect(screen.queryByLabelText(/^API key/)).not.toBeInTheDocument();
+  });
+
+  it("requires confirmation before uninstalling Piper and can cancel an active operation", async () => {
+    vi.mocked(api.piperManagement).mockResolvedValue({
+      ...structuredClone(piperManagement),
+      supported: true,
+      installerStatus: "ready",
+      installed: true,
+      installedVersion: "1.2.0",
+    });
+    const user = userEvent.setup();
+    renderProviders();
+
+    await user.click(await screen.findByRole("button", { name: "Uninstall Piper" }));
+    const dialog = screen.getByRole("dialog", { name: "Uninstall Piper?" });
+    expect(api.uninstallPiper).not.toHaveBeenCalled();
+    await user.click(within(dialog).getByRole("button", { name: "Uninstall Piper" }));
+    await waitFor(() => expect(api.uninstallPiper).toHaveBeenCalledWith(true));
+
+    vi.mocked(api.piperManagement).mockResolvedValue({
+      ...structuredClone(piperManagement),
+      supported: true,
+      installerStatus: "ready",
+      activeOperation: { id: "piper-active", kind: "download_voice", state: "running", progressPercent: 50, phase: "download", message: "Downloading voice", voiceId: "de_DE-thorsten-medium", bytesDownloaded: 512, bytesTotal: 1024, startedAt: new Date().toISOString() },
+    });
+    const piperCard = screen.getByText("Piper local voices").closest("section")!;
+    await user.click(within(piperCard).getByRole("button", { name: "Refresh" }));
+    await user.click(await screen.findByRole("button", { name: "Cancel operation" }));
+    await waitFor(() => expect(vi.mocked(api.cancelPiperOperation).mock.calls[0]?.[0]).toBe("piper-active"));
+  });
+
+  it("requires explicit license acceptance before downloading a curated Piper voice", async () => {
+    vi.mocked(api.piperManagement).mockResolvedValue({
+      ...structuredClone(piperManagement),
+      supported: true,
+      installerStatus: "ready",
+      installed: true,
+      installedVersion: "1.2.0",
+      catalog: [{
+        id: "de_DE-thorsten-medium",
+        name: "Thorsten",
+        language: "German",
+        quality: "Medium",
+        speakers: 1,
+        sampleRate: 22_050,
+        sizeBytes: 64 * 1024 * 1024,
+        license: "Source dataset: CC0-1.0",
+        licenseUrl: "https://example.test/license",
+        licenseSummary: "The pinned model card declares the source dataset as CC0.",
+        modelCardUrl: "https://example.test/model-card",
+        sourceUrl: "https://example.test/source",
+      }],
+    });
+    const user = userEvent.setup();
+    renderProviders();
+
+    await user.click(await screen.findByRole("button", { name: "Download" }));
+    const dialog = screen.getByRole("dialog", { name: "Download Thorsten?" });
+    expect(within(dialog).getByRole("button", { name: "Accept and download" })).toBeDisabled();
+    expect(api.downloadPiperVoice).not.toHaveBeenCalled();
+    await user.click(within(dialog).getByRole("checkbox", { name: /reviewed the model card/ }));
+    await user.click(within(dialog).getByRole("button", { name: "Accept and download" }));
+    await waitFor(() => expect(api.downloadPiperVoice).toHaveBeenCalledWith("de_DE-thorsten-medium", true));
+  });
+
+  it("shows Piper voice issues and only offers recovery for app-owned files", async () => {
+    vi.mocked(api.piperManagement).mockResolvedValue({
+      ...structuredClone(piperManagement),
+      supported: true,
+      installerStatus: "ready",
+      installed: true,
+      installedVersion: "1.2.0",
+      catalog: [
+        { id: "de_DE-thorsten-medium", name: "Thorsten", language: "German", quality: "Medium", speakers: 1, sampleRate: 22_050, sizeBytes: 1024, license: "Source dataset: CC0-1.0", licenseUrl: "https://example.test/license", licenseSummary: "CC0 source dataset", modelCardUrl: "https://example.test/model-card", sourceUrl: "https://example.test/source" },
+        { id: "en_GB-alba-medium", name: "Alba", language: "English", quality: "Medium", speakers: 1, sampleRate: 22_050, sizeBytes: 1024, license: "Source dataset: CC0-1.0", licenseUrl: "https://example.test/license", licenseSummary: "CC0 source dataset", modelCardUrl: "https://example.test/model-card", sourceUrl: "https://example.test/source" },
+      ],
+      voiceIssues: [
+        { id: "de_DE-thorsten-medium", status: "incomplete", removable: true, detail: "The app-owned voice is incomplete and can be removed before downloading it again." },
+        { id: "en_GB-alba-medium", status: "unsafe_filesystem", removable: false, detail: "The voice path is not owned by AudiobookAI and must be resolved manually." },
+      ],
+    });
+    const user = userEvent.setup();
+    renderProviders();
+
+    expect(await screen.findByRole("heading", { name: "Voices needing attention" })).toBeInTheDocument();
+    expect(screen.getByText("The app-owned voice is incomplete and can be removed before downloading it again.")).toBeInTheDocument();
+    expect(screen.getByText("The voice path is not owned by AudiobookAI and must be resolved manually.")).toBeInTheDocument();
+    expect(screen.getByText("Manual resolution required")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Download" })).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Remove incomplete files" }));
+    const dialog = screen.getByRole("dialog", { name: "Remove Thorsten?" });
+    expect(api.removePiperVoice).not.toHaveBeenCalled();
+    await user.click(within(dialog).getByRole("button", { name: "Remove voice" }));
+    await waitFor(() => expect(api.removePiperVoice).toHaveBeenCalledWith("de_DE-thorsten-medium", true));
+  });
+
+  it("selects an installed Piper voice per connection and guards removal while in use", async () => {
+    const piperOne: ProviderProfile = {
+      ...structuredClone(managedProvider),
+      id: "piper-one",
+      name: "German narration",
+      kind: "piper",
+      mode: "native",
+      model: "de_DE-thorsten-medium",
+      executablePath: undefined,
+      workingDirectory: undefined,
+      arguments: [],
+      status: "online",
+    };
+    const piperTwo = { ...structuredClone(piperOne), id: "piper-two", name: "English narration", model: "en_US-lessac-medium" };
+    vi.mocked(api.providers).mockResolvedValue({ items: [piperOne, piperTwo], total: 2 });
+    vi.mocked(api.piperManagement).mockResolvedValue({
+      ...structuredClone(piperManagement),
+      supported: true,
+      installerStatus: "ready",
+      installed: true,
+      installedVersion: "1.2.0",
+      installedVoices: [
+        { id: "de_DE-thorsten-medium", name: "Thorsten", language: "German", quality: "Medium", modelPath: "/voices/thorsten.onnx", configPath: "/voices/thorsten.onnx.json", sizeBytes: 1024, license: "Source dataset: CC0-1.0", installedAt: "2026-08-18T00:00:00Z" },
+        { id: "en_GB-alba-medium", name: "Alba", language: "English", quality: "Medium", modelPath: "/voices/alba.onnx", configPath: "/voices/alba.onnx.json", sizeBytes: 1024, license: "Source dataset: CC0-1.0", installedAt: "2026-08-18T00:00:00Z" },
+      ],
+    });
+    const user = userEvent.setup();
+    renderProviders();
+
+    expect(await screen.findByRole("button", { name: "Uninstall Piper" })).toBeDisabled();
+    expect(screen.getByText(/Delete every Piper connection before uninstalling/)).toBeInTheDocument();
+    await user.click(screen.getAllByRole("button", { name: "Settings" })[0]);
+    expect(screen.getByRole("button", { name: "Delete provider" })).toBeEnabled();
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+
+    expect(await screen.findByRole("button", { name: "Remove Thorsten" })).toBeDisabled();
+    const albaRow = screen.getByText("Alba").closest("div")!.parentElement!;
+    await user.click(within(albaRow).getByRole("button", { name: "Use voice" }));
+    const useDialog = screen.getByRole("dialog", { name: "Use Alba" });
+    await user.selectOptions(within(useDialog).getByLabelText("Piper connection"), "piper-two");
+    await user.click(within(useDialog).getByRole("button", { name: "Use voice" }));
+    await waitFor(() => expect(api.updateProvider).toHaveBeenCalledWith("piper-two", { model: "en_GB-alba-medium" }));
+
+    await user.click(screen.getByRole("button", { name: "Remove Alba" }));
+    const removeDialog = screen.getByRole("dialog", { name: "Remove Alba?" });
+    expect(api.removePiperVoice).not.toHaveBeenCalled();
+    await user.click(within(removeDialog).getByRole("button", { name: "Remove voice" }));
+    await waitFor(() => expect(api.removePiperVoice).toHaveBeenCalledWith("en_GB-alba-medium", true));
   });
 
   it("blocks deletion while an app-owned child is online", async () => {

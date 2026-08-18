@@ -4,11 +4,12 @@ import { Activity, Cloud, Cpu, Download, HardDrive, KeyRound, Laptop, LoaderCirc
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../api/client";
-import type { MlxManagedModel, MlxManagement, ProviderKind, ProviderModel, ProviderProfile } from "../api/types";
+import type { MlxManagedModel, MlxManagement, ProviderKind, ProviderModel, ProviderProfile, ProviderRole } from "../api/types";
 import { EmptyState, ErrorState, LoadingState } from "../components/StateViews";
 import { Badge, Button, Card, Dialog, Field, Input, PageHeading, Select, Textarea } from "../components/ui";
 import { ProviderModelField } from "../providers/ProviderModelField";
-import { providerPreset, providerPresetsFor, type ProviderRole } from "../providers/presets";
+import { PiperManagementCard } from "../providers/PiperManagementCard";
+import { providerDefaultsForRole, providerPreset, providerPresetsFor, providerSupportsRole } from "../providers/presets";
 import { useProviderModels } from "../providers/useProviderModels";
 
 const statusTone: Record<ProviderProfile["status"], "positive" | "neutral" | "accent" | "warning" | "danger"> = {
@@ -25,6 +26,7 @@ function modeLabel(mode: ProviderProfile["mode"]): string {
 type ProviderForm = {
   name: string;
   kind: ProviderKind;
+  role: ProviderRole;
   mode: ProviderProfile["mode"];
   endpoint: string;
   executablePath: string;
@@ -34,18 +36,26 @@ type ProviderForm = {
   model: string;
 };
 
-function providerFormFor(kind: ProviderKind): ProviderForm {
-  const preset = providerPreset(kind);
+function providerFormFor(kind: ProviderKind, preferredRole?: ProviderRole, nativeProviderName?: string): ProviderForm {
+  const normalizedKind = kind === "openai_tts" ? "openai" : kind;
+  const preset = providerPreset(normalizedKind);
+  const role = preferredRole && providerSupportsRole(preset, preferredRole)
+    ? preferredRole
+    : kind === "openai_tts"
+      ? "tts"
+      : preset.role;
+  const roleDefaults = providerDefaultsForRole(preset, role);
   return {
-    name: preset.name,
+    name: preset.kind === "native_os" ? nativeProviderName ?? preset.name : preset.name,
     kind: preset.kind,
+    role,
     mode: preset.defaultMode,
     endpoint: preset.defaultEndpoint,
     executablePath: "",
     workingDirectory: "",
     argumentsText: "",
     credential: "",
-    model: preset.defaultModel,
+    model: roleDefaults.defaultModel,
   };
 }
 
@@ -78,6 +88,10 @@ export function ProvidersPage() {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const providers = useQuery({ queryKey: ["providers"], queryFn: api.providers });
+  const nativeAvailability = useQuery({
+    queryKey: ["native-provider-availability"],
+    queryFn: api.nativeProviderAvailability,
+  });
   const mlx = useQuery({
     queryKey: ["mlx-management"],
     queryFn: api.mlxManagement,
@@ -97,19 +111,21 @@ export function ProvidersPage() {
   const [addOpen, setAddOpen] = useState(false);
   const [form, setForm] = useState<ProviderForm>(emptyProviderForm);
   const selectedPreset = providerPreset(form.kind);
+  const selectedRoleDefaults = providerDefaultsForRole(selectedPreset, form.role);
   const availableModels = useProviderModels({
     enabled: addOpen || Boolean(editing),
     providerId: editing?.id,
     credentialConfigured: editing?.credentialConfigured,
     name: form.name,
     kind: form.kind,
+    role: form.role,
     mode: form.mode,
     endpoint: form.endpoint,
     executablePath: form.executablePath,
     workingDirectory: form.workingDirectory,
     argumentsText: form.argumentsText,
     credential: form.credential,
-    modelSource: selectedPreset.modelSource,
+    modelSource: selectedRoleDefaults.modelSource,
   });
   const providerModels = useQuery({
     queryKey: ["provider-model-library", controlling?.id],
@@ -120,17 +136,28 @@ export function ProvidersPage() {
 
   const control = useMutation({
     mutationFn: ({ id, action }: { id: string; action: "start" | "stop" | "restart" | "refresh" }) => api.providerAction(id, action),
-    onSuccess: (provider) => queryClient.setQueryData(["providers"], (current: { items: ProviderProfile[] } | undefined) => current ? { ...current, items: current.items.map((item) => item.id === provider.id ? provider : item) } : current),
+    onSuccess: async (provider) => {
+      queryClient.setQueryData(["providers"], (current: { items: ProviderProfile[] } | undefined) => current ? { ...current, items: current.items.map((item) => item.id === provider.id ? provider : item) } : current);
+      if (provider.kind === "native_os") {
+        await queryClient.invalidateQueries({ queryKey: ["native-provider-availability"] });
+      }
+    },
   });
   const save = useMutation({
     mutationFn: () => {
       const managed = form.mode === "managed_child";
       const shared = {
         name: form.name,
+        role: form.role,
         mode: form.mode,
         endpoint: form.mode === "native" ? null : form.endpoint.trim() || null,
-        executablePath: managed ? form.executablePath.trim() || null : null,
-        workingDirectory: managed ? form.workingDirectory.trim() || null : null,
+        // A legacy native profile may carry a working executable override even when the global
+        // Add-provider probe cannot find a system engine. The native editor does not expose that
+        // path, so omit these PATCH fields instead of silently clearing a working connection.
+        ...(form.mode === "native" && editing ? {} : {
+          executablePath: managed ? form.executablePath.trim() || null : null,
+          workingDirectory: managed ? form.workingDirectory.trim() || null : null,
+        }),
         arguments: managed ? argumentLines(form.argumentsText) : [],
         model: form.model.trim() || null,
         credential: form.credential || undefined,
@@ -143,8 +170,16 @@ export function ProvidersPage() {
   });
   const remove = useMutation({
     mutationFn: (id: string) => api.deleteProvider(id),
-    onSuccess: async () => {
+    onSuccess: async (_result, deletedId) => {
       setDeleting(undefined);
+      queryClient.setQueryData(["providers"], (current: { items: ProviderProfile[]; total: number } | undefined) => {
+        if (!current || !current.items.some((provider) => provider.id === deletedId)) return current;
+        return {
+          ...current,
+          items: current.items.filter((provider) => provider.id !== deletedId),
+          total: Math.max(0, current.total - 1),
+        };
+      });
       await queryClient.invalidateQueries({ queryKey: ["providers"] });
     },
   });
@@ -216,21 +251,37 @@ export function ProvidersPage() {
       void refreshProviderModels(controlling.id);
     }
   }, [lastProviderModelOperation?.id, lastProviderModelOperation?.state]);
+  useEffect(() => {
+    if (addOpen) void nativeAvailability.refetch();
+  }, [addOpen, nativeAvailability.refetch]);
 
   const closeDialog = () => { setAddOpen(false); setEditing(undefined); setForm(emptyProviderForm()); };
   const openAddForRole = (role: ProviderRole) => {
     setEditing(undefined);
-    setForm(providerFormFor(role === "tts" ? "elevenlabs" : "openai"));
+    setForm(providerFormFor(role === "tts" ? "elevenlabs" : "openai", role));
     setAddOpen(true);
   };
   const selectProviderKind = (kind: ProviderKind) => {
     const previous = providerPreset(form.kind);
     const preset = providerPreset(kind);
     const replaceName = !form.name.trim() || form.name === previous.name;
+    const role = providerSupportsRole(preset, form.role) ? form.role : preset.role;
     setForm({
-      ...providerFormFor(kind),
-      name: replaceName ? preset.name : form.name,
+      ...providerFormFor(kind, role, nativeAvailability.data?.providerName),
+      name: replaceName
+        ? preset.kind === "native_os"
+          ? nativeAvailability.data?.providerName ?? preset.name
+          : preset.name
+        : form.name,
     });
+  };
+  const selectProviderRole = (role: ProviderRole) => {
+    if (!providerSupportsRole(selectedPreset, role)) {
+      setForm(providerFormFor(role === "tts" ? "elevenlabs" : "openai", role));
+      return;
+    }
+    const defaults = providerDefaultsForRole(selectedPreset, role);
+    setForm({ ...form, role, model: defaults.defaultModel });
   };
   const selectProviderMode = (mode: ProviderProfile["mode"]) => {
     setForm({
@@ -255,7 +306,7 @@ export function ProvidersPage() {
     });
     setAddOpen(true);
   };
-  const openEdit = (provider: ProviderProfile) => { setEditing(provider); setForm({ name: provider.name, kind: provider.kind, mode: provider.mode, endpoint: provider.endpoint ?? "", executablePath: provider.executablePath ?? "", workingDirectory: provider.workingDirectory ?? "", argumentsText: provider.arguments.join("\n"), credential: "", model: provider.model ?? "" }); };
+  const openEdit = (provider: ProviderProfile) => { setEditing(provider); setForm({ name: provider.name, kind: provider.kind === "openai_tts" ? "openai" : provider.kind, role: provider.role, mode: provider.mode, endpoint: provider.endpoint ?? "", executablePath: provider.executablePath ?? "", workingDirectory: provider.workingDirectory ?? "", argumentsText: provider.arguments.join("\n"), credential: "", model: provider.model ?? "" }); };
   const requestDelete = (provider: ProviderProfile) => {
     closeDialog();
     remove.reset();
@@ -293,6 +344,11 @@ export function ProvidersPage() {
   const activeProviderModelOperation = providerModels.data?.operations.find((operation) => ["running", "cancelling"].includes(operation.state));
   const mlxInstallerUnavailable = Boolean(mlx.data && !mlx.data.installed && mlx.data.installerStatus !== "ready");
   const mlxDeveloperFallback = mlx.data?.supported && ["not_bundled", "payload_missing"].includes(mlx.data.installerStatus);
+  const nativeProviderName = nativeAvailability.data?.providerName ?? providerPreset("native_os").name;
+  const nativeProviderAvailable = nativeAvailability.data?.available === true;
+  const nativeGuidanceKey = nativeAvailability.data?.platform === "linux"
+    ? "providers.nativeUnavailableLinux"
+    : "providers.nativeUnavailableOther";
 
   if (providers.isLoading) return <LoadingState label={t("state.loadingProviders")} />;
   if (providers.isError) return <ErrorState error={providers.error} onRetry={() => void providers.refetch()} />;
@@ -304,6 +360,7 @@ export function ProvidersPage() {
         <div><strong>{t("providers.modelDiscoveryTitle")}</strong><p>{t("providers.modelDiscoveryOverview")}</p></div>
         <Badge tone="info">{t("providers.automatic")}</Badge>
       </Card>
+      <PiperManagementCard providers={providers.data?.items ?? []} onAddConnection={() => { setEditing(undefined); setForm(providerFormFor("piper", "tts")); setAddOpen(true); }} />
       {mlx.isError ? <ErrorState error={mlx.error} onRetry={() => void mlx.refetch()} /> : null}
       {mlx.data ? <Card className="mlx-management-card">
         <div className="mlx-management-head">
@@ -360,7 +417,7 @@ export function ProvidersPage() {
       {!providers.data?.items.length ? <EmptyState title={t("providers.emptyTitle")} detail={t("providers.emptyDetail")} action={<Button onClick={() => setAddOpen(true)}><Plus size={16} />{t("providers.add")}</Button>} /> : (
         <div className="provider-role-groups">
           {(["tts", "llm"] as ProviderRole[]).map((role) => {
-            const roleProviders = providers.data.items.filter((provider) => providerPreset(provider.kind).role === role);
+            const roleProviders = providers.data.items.filter((provider) => provider.role === role);
             return <section className="provider-role-section" aria-labelledby={`provider-role-${role}`} key={role}>
               <header>
                 <span>{role === "tts" ? <Waves size={18} /> : <Activity size={18} />}</span>
@@ -372,16 +429,22 @@ export function ProvidersPage() {
                   const ModeIcon = provider.mode === "cloud_remote" ? Cloud : provider.mode === "native" ? Laptop : Cpu;
                   const caps = provider.capabilities;
                   const preset = providerPreset(provider.kind);
+                  const roleDefaults = providerDefaultsForRole(preset, provider.role);
+                  const isNativeSystemProvider = provider.kind === "native_os";
+                  const nativeSetupRequired = isNativeSystemProvider && provider.status === "unconfigured";
+                  const nativeProfileGuidanceKey = nativeAvailability.data?.available === false
+                    ? nativeGuidanceKey
+                    : "providers.nativeProfileNeedsSetup";
                   return (
-                    <Card className={clsx("provider-card", provider.status === "error" && "has-error")} key={provider.id}>
+                    <Card className={clsx("provider-card", (provider.status === "error" || nativeSetupRequired) && "has-error")} key={provider.id}>
                       <div className="provider-card-head">
                         <span className="provider-logo"><ModeIcon size={21} /></span>
                         <div><h2>{provider.name}</h2><p>{t(modeLabel(provider.mode))}</p></div>
                         <Badge tone={statusTone[provider.status]}><span className="service-dot" />{t(`providers.${provider.status}`)}</Badge>
                       </div>
                       <div className="provider-connection">
-                        <span>{provider.model || (preset.modelSource === "none" ? t("providers.systemVoicesNoModelCatalog") : provider.endpoint || t(modeLabel(provider.mode)))}</span>
-                        <span className={provider.credentialConfigured ? "credential-ok" : "credential-missing"}><KeyRound size={13} />{t(provider.credentialConfigured ? "providers.apiKeyConfigured" : "providers.apiKeyMissing")}</span>
+                        <span>{provider.model || (roleDefaults.modelSource === "none" ? t("providers.systemVoicesNoModelCatalog", { name: isNativeSystemProvider ? nativeProviderName : t("providers.systemVoices") }) : provider.endpoint || t(modeLabel(provider.mode)))}</span>
+                        {provider.mode !== "native" ? <span className={provider.credentialConfigured ? "credential-ok" : "credential-missing"}><KeyRound size={13} />{t(provider.credentialConfigured ? "providers.apiKeyConfigured" : "providers.apiKeyMissing")}</span> : null}
                       </div>
                       <div className="capability-list">
                         {caps ? <>
@@ -392,7 +455,7 @@ export function ProvidersPage() {
                           {caps.modelControl ? <Badge>{t("providers.modelControl")}</Badge> : null}
                         </> : <span className="capability-unknown">{t("providers.capabilityUnknown")}</span>}
                       </div>
-                      {provider.lastError ? <div className="provider-error"><span />{provider.lastError}</div> : null}
+                      {nativeSetupRequired ? <div className="provider-error"><span /><div><strong>{t("providers.nativeSetupRequiredTitle", { name: nativeProviderName })}</strong><p>{t(nativeProfileGuidanceKey, { name: nativeProviderName })} {t("providers.nativePiperAlternative")}</p></div></div> : provider.lastError ? <div className="provider-error"><span />{provider.lastError}</div> : null}
                       <div className="provider-actions">
                         {provider.capabilities?.processControl ? <>
                           {provider.status === "online" ? <Button size="sm" variant="secondary" onClick={() => control.mutate({ id: provider.id, action: "stop" })} disabled={control.isPending}><Square size={13} />{t("providers.stop")}</Button> : <Button size="sm" variant="secondary" onClick={() => control.mutate({ id: provider.id, action: "start" })} disabled={control.isPending}><Play size={13} />{t("providers.start")}</Button>}
@@ -414,18 +477,29 @@ export function ProvidersPage() {
       )}
       {control.isError ? <ErrorState error={control.error} onRetry={() => control.reset()} /> : null}
 
-      <Dialog open={addOpen || Boolean(editing)} onOpenChange={(open) => !open && closeDialog()} title={editing ? t("providers.configure", { name: editing.name }) : t("providers.add")} description={t("providers.subtitle")} size="lg" footer={<>{editing && editing.mode !== "native" ? <Button variant="danger" onClick={() => requestDelete(editing)}><Trash2 size={16} />{t("providers.delete")}</Button> : null}<Button variant="secondary" onClick={closeDialog}>{t("common.cancel")}</Button><Button disabled={!form.name.trim() || (managed && !form.executablePath.trim()) || editBlockedByOwnedProcess || save.isPending} onClick={() => save.mutate()}>{save.isPending ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}{t("providers.saveAndCheck")}</Button></>}>
+      <Dialog open={addOpen || Boolean(editing)} onOpenChange={(open) => !open && closeDialog()} title={editing ? t("providers.configure", { name: editing.name }) : t("providers.add")} description={t("providers.subtitle")} size="lg" footer={<>{editing ? <Button variant="danger" onClick={() => requestDelete(editing)}><Trash2 size={16} />{t("providers.delete")}</Button> : null}<Button variant="secondary" onClick={closeDialog}>{t("common.cancel")}</Button><Button disabled={!form.name.trim() || (managed && !form.executablePath.trim()) || (form.kind === "piper" && !form.model.trim()) || (form.kind === "native_os" && !nativeProviderAvailable && (!editing || editing.status === "unconfigured")) || editBlockedByOwnedProcess || save.isPending} onClick={() => save.mutate()}>{save.isPending ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}{t("providers.saveAndCheck")}</Button></>}>
         <div className="provider-form stack">
           {editBlockedByOwnedProcess ? <p className="provider-form-warning">{t("providers.stopBeforeConfigure")}</p> : null}
-          <div className={`provider-role-summary provider-role-${selectedPreset.role}`}>
-            <span>{selectedPreset.role === "tts" ? <Waves size={18} /> : <Activity size={18} />}</span>
-            <div><strong>{t(selectedPreset.role === "tts" ? "providers.ttsProvider" : "providers.llmProvider")}</strong><p>{t(selectedPreset.role === "tts" ? "providers.ttsProviderDetail" : "providers.llmProviderDetail")}</p></div>
-            <Badge tone={selectedPreset.role === "tts" ? "accent" : "info"}>{selectedPreset.role.toUpperCase()}</Badge>
+          <div className={`provider-role-summary provider-role-${form.role}`}>
+            <span>{form.role === "tts" ? <Waves size={18} /> : <Activity size={18} />}</span>
+            <div><strong>{t(form.role === "tts" ? "providers.ttsProvider" : "providers.llmProvider")}</strong><p>{t(form.role === "tts" ? "providers.ttsProviderDetail" : "providers.llmProviderDetail")}</p></div>
+            <Badge tone={form.role === "tts" ? "accent" : "info"}>{form.role.toUpperCase()}</Badge>
           </div>
           <div className="grid-2">
-            <Field label={t("providers.chooseType")}><Select value={form.kind} onChange={(event) => selectProviderKind(event.target.value as ProviderKind)} disabled={Boolean(editing)}><optgroup label={t("providers.ttsProviders")}>{providerPresetsFor("tts").map((preset) => <option value={preset.kind} key={preset.kind}>{preset.name}</option>)}</optgroup><optgroup label={t("providers.llmProviders")}>{providerPresetsFor("llm").map((preset) => <option value={preset.kind} key={preset.kind}>{preset.name}</option>)}</optgroup></Select></Field>
-            <Field label={t("providers.mode")}><Select value={form.mode} onChange={(event) => selectProviderMode(event.target.value as ProviderProfile["mode"])}>{selectedPreset.modes.map((mode) => <option value={mode} key={mode}>{t(modeLabel(mode))}</option>)}</Select></Field>
+            <Field label={t("providers.role")} hint={t("providers.roleHint")}><Select value={form.role} onChange={(event) => selectProviderRole(event.target.value as ProviderRole)}><option value="tts" disabled={Boolean(editing) && !providerSupportsRole(selectedPreset, "tts")}>{t("providers.roleTts")}</option><option value="llm" disabled={Boolean(editing) && !providerSupportsRole(selectedPreset, "llm")}>{t("providers.roleLlm")}</option></Select></Field>
+            <Field label={t("providers.chooseType")}><Select value={form.kind} onChange={(event) => selectProviderKind(event.target.value as ProviderKind)} disabled={Boolean(editing)}>{editing && selectedPreset.hidden ? <option value={selectedPreset.kind}>{selectedPreset.name}</option> : null}{providerPresetsFor(form.role).map((preset) => {
+              const native = preset.kind === "native_os";
+              const label = native ? nativeProviderName : preset.name;
+              const nativeOptionLabel = nativeAvailability.isLoading
+                ? t("providers.nativeCheckingOption", { name: label })
+                : nativeAvailability.data?.available
+                  ? label
+                  : t("providers.nativeSetupOption", { name: label });
+              return <option value={preset.kind} key={preset.kind} disabled={native && !nativeProviderAvailable}>{native ? nativeOptionLabel : label}</option>;
+            })}</Select></Field>
           </div>
+          {form.role === "tts" && !nativeProviderAvailable && !nativeAvailability.isLoading ? <details className="native-provider-setup-note"><summary>{nativeAvailability.isError ? t("providers.nativeAvailabilityFailedShort") : t("providers.nativeSetupOption", { name: nativeProviderName })}</summary><div className="native-provider-warning" role="status"><strong>{nativeAvailability.isError ? t("providers.nativeAvailabilityFailed") : t("providers.nativeUnavailableTitle", { name: nativeProviderName })}</strong>{nativeAvailability.data ? <><span>{t(nativeGuidanceKey, { name: nativeProviderName })}</span><span>{t("providers.nativePiperAlternative")}</span></> : null}<Button size="sm" variant="ghost" disabled={nativeAvailability.isFetching} onClick={() => void nativeAvailability.refetch()}><RefreshCw className={nativeAvailability.isFetching ? "spin" : undefined} size={14} />{t("providers.nativeCheckAgain")}</Button></div></details> : null}
+          <Field label={t("providers.mode")}><Select value={form.mode} onChange={(event) => selectProviderMode(event.target.value as ProviderProfile["mode"])}>{selectedPreset.modes.map((mode) => <option value={mode} key={mode}>{t(modeLabel(mode))}</option>)}</Select></Field>
           <Field label={t("import.titleLabel")}><Input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} /></Field>
           {hasEndpoint ? <Field label={t("providers.endpoint")} hint={managed ? t("providers.managedEndpointHint") : t("providers.presetEndpointHint")}><Input type="url" value={form.endpoint} onChange={(event) => setForm({ ...form, endpoint: event.target.value })} placeholder={selectedPreset.defaultEndpoint || "https://provider.example/v1"} /></Field> : null}
           {managed ? <Field label={t("providers.executable")} hint={t("providers.executableHint")}><Input value={form.executablePath} onChange={(event) => setForm({ ...form, executablePath: event.target.value })} /></Field> : null}
@@ -436,7 +510,7 @@ export function ProvidersPage() {
           {managed ? <p className="provider-form-note">{t("providers.environmentSecurity")}</p> : null}
           <div className="grid-2">
             {form.mode !== "native" ? <Field label={t("providers.apiKey")} hint={editing?.credentialConfigured ? t("providers.apiKeyConfigured") : t("providers.apiKeyPlaceholder")}><Input type="password" autoComplete="new-password" value={form.credential} onChange={(event) => setForm({ ...form, credential: event.target.value })} placeholder="••••••••••••" /></Field> : null}
-            <ProviderModelField role={selectedPreset.role} source={selectedPreset.modelSource} value={form.model} models={availableModels.models} status={availableModels.status} onChange={(model) => setForm({ ...form, model })} />
+            <ProviderModelField role={form.role} source={selectedRoleDefaults.modelSource} value={form.model} models={availableModels.models} status={availableModels.status} strict={availableModels.strict} onChange={(model) => setForm((current) => ({ ...current, model }))} />
           </div>
           {save.isError ? <ErrorState error={save.error} /> : null}
         </div>
@@ -446,10 +520,10 @@ export function ProvidersPage() {
         open={Boolean(deleting)}
         onOpenChange={(open) => { if (!open) { setDeleting(undefined); remove.reset(); } }}
         title={t("providers.deleteTitle", { name: deleting?.name ?? "" })}
-        description={t(deleteBlockedByOwnedProcess ? "providers.deleteRunningDetail" : "providers.deleteDetail")}
+        description={t(deleteBlockedByOwnedProcess ? "providers.deleteRunningDetail" : deleting?.kind === "native_os" ? "providers.deleteNativeDetail" : "providers.deleteDetail")}
         footer={<><Button variant="secondary" onClick={() => { setDeleting(undefined); remove.reset(); }}>{t("common.cancel")}</Button><Button variant="danger" disabled={!deleting || deleteBlockedByOwnedProcess || remove.isPending} onClick={() => deleting && remove.mutate(deleting.id)}>{remove.isPending ? <LoaderCircle className="spin" size={16} /> : <Trash2 size={16} />}{t("providers.deleteConfirm")}</Button></>}
       >
-        {remove.isError ? <ErrorState error={remove.error} /> : <p>{t("providers.deleteOwnershipNote")}</p>}
+        {remove.isError ? <ErrorState error={remove.error} /> : <p>{t(deleting?.kind === "native_os" ? "providers.deleteNativeOwnershipNote" : "providers.deleteOwnershipNote")}</p>}
       </Dialog>
 
       <Dialog

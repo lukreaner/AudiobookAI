@@ -31,6 +31,49 @@ TARGETS = {
     "x86_64-unknown-linux-gnu",
 }
 ALLOWED_ROOTS = {"bin", "licenses", "share", "source"}
+PIPER_VERSION = "1.2.0"
+PIPER_TARGET = "x86_64-unknown-linux-gnu"
+PIPER_ARCHIVE_URL = (
+    "https://github.com/rhasspy/piper/releases/download/v1.2.0/piper_amd64.tar.gz"
+)
+PIPER_ARCHIVE_SHA256 = (
+    "467c17935d2a22dcce9dc9e08ba07485e29be813097e7cf08c5627aa09d32e42"
+)
+PIPER_ARCHIVE_BYTES = 25_916_047
+PIPER_VOICE_REVISION = "f5a6e9094787fd865d65cb024472f977f9c542b5"
+PIPER_VOICE_DOWNLOAD_BASE = (
+    "https://huggingface.co/rhasspy/piper-voices/resolve/" + PIPER_VOICE_REVISION
+)
+PIPER_VOICE_CARD_BASE = (
+    "https://huggingface.co/rhasspy/piper-voices/blob/" + PIPER_VOICE_REVISION
+)
+PIPER_VOICE_SOURCE_URL = "https://github.com/thorstenMueller/deep-learning-german-tts"
+PIPER_VOICE_LICENSE_URL = "https://creativecommons.org/publicdomain/zero/1.0/"
+PIPER_VOICES = {
+    "de_DE-thorsten-medium": {
+        "language": "de_DE",
+        "quality": "medium",
+        "speakers": 1,
+        "sampleRateHz": 22_050,
+        "files": {
+            "model": {
+                "path": "de/de_DE/thorsten/medium/de_DE-thorsten-medium.onnx",
+                "sha256": "7e64762d8e5118bb578f2eea6207e1a35a8e0c30595010b666f983fc87bb7819",
+                "bytes": 63_201_294,
+            },
+            "config": {
+                "path": "de/de_DE/thorsten/medium/de_DE-thorsten-medium.onnx.json",
+                "sha256": "974adee790533adb273a1ac88f49027d2a1b8f0f2cf4905954a4791e79264e85",
+                "bytes": 4_819,
+            },
+            "modelCard": {
+                "path": "de/de_DE/thorsten/medium/MODEL_CARD",
+                "sha256": "5196b5ab0794e6056263a1f37c18bec407b61ac187529bee29d1c366871e5c9e",
+                "bytes": 285,
+            },
+        },
+    },
+}
 
 
 class SidecarError(RuntimeError):
@@ -129,6 +172,7 @@ def validate_source(manifest: dict, unresolved: list[str]) -> None:
     validate_https_url(uv_source.get("url"), "uv source URL", unresolved)
     validate_digest(uv_source.get("sha256"), "uv source", unresolved)
     validate_mlx_installer(manifest, unresolved)
+    validate_piper_installer(manifest)
 
 
 def validate_mlx_installer(manifest: dict, unresolved: list[str]) -> None:
@@ -192,6 +236,129 @@ def validate_mlx_installer(manifest: dict, unresolved: list[str]) -> None:
         python_version=python_version,
         expected_count=artifact_count,
     )
+
+
+def validate_piper_installer(manifest: dict) -> None:
+    installer = manifest.get("piperInstaller", {})
+    if installer.get("version") != PIPER_VERSION:
+        raise SidecarError(f"Piper must remain pinned to {PIPER_VERSION}")
+    if installer.get("license") != "MIT":
+        raise SidecarError("the pinned Piper engine license must remain recorded as MIT")
+    if installer.get("target") != PIPER_TARGET:
+        raise SidecarError("the app-managed Piper installer must target Linux x86_64 only")
+    if installer.get("delivery") != "explicit-online-install":
+        raise SidecarError("Piper must be identified as an explicit online install")
+    if installer.get("bundled") is not False:
+        raise SidecarError("Piper must not be identified as a bundled release sidecar")
+
+    archive = installer.get("archive", {})
+    validate_https_url(archive.get("url"), "Piper engine archive URL", [])
+    validate_digest(archive.get("sha256"), "Piper engine archive", [])
+    expected_archive = {
+        "format": "tar.gz",
+        "url": PIPER_ARCHIVE_URL,
+        "sha256": PIPER_ARCHIVE_SHA256,
+        "bytes": PIPER_ARCHIVE_BYTES,
+    }
+    if archive != expected_archive:
+        raise SidecarError("Piper engine archive metadata does not match the audited v1.2.0 input")
+
+    expected_layout = {
+        "managedRoot": "managed-providers/piper",
+        "engineExecutable": "engine/piper/piper",
+        "voicesRoot": "voices",
+    }
+    if installer.get("installLayout") != expected_layout:
+        raise SidecarError("Piper install layout must match the app-managed runtime contract")
+
+    catalog = installer.get("voiceCatalog", {})
+    expected_catalog_fields = {
+        "repository": "rhasspy/piper-voices",
+        "revision": PIPER_VOICE_REVISION,
+        "downloadBaseUrl": PIPER_VOICE_DOWNLOAD_BASE,
+        "downloadQuery": "download=true",
+        "cardBaseUrl": PIPER_VOICE_CARD_BASE,
+        "delivery": "explicit-online-install",
+        "bundled": False,
+        "licenseConfirmationRequired": True,
+        "attributionConfirmationRequired": True,
+        "retainOnEngineUninstall": True,
+    }
+    for field, expected in expected_catalog_fields.items():
+        if catalog.get(field) != expected:
+            raise SidecarError(f"Piper voice catalog {field} does not match the runtime contract")
+    validate_https_url(catalog.get("downloadBaseUrl"), "Piper voice download base URL", [])
+    validate_https_url(catalog.get("cardBaseUrl"), "Piper model-card base URL", [])
+
+    voices = catalog.get("voices")
+    if not isinstance(voices, list) or len(voices) != len(PIPER_VOICES):
+        raise SidecarError("Piper voice catalog must contain exactly the audited curated voices")
+    seen: set[str] = set()
+    for voice in voices:
+        if not isinstance(voice, dict):
+            raise SidecarError("Piper voice catalog entries must be objects")
+        voice_id = voice.get("id")
+        if not isinstance(voice_id, str) or voice_id in seen:
+            raise SidecarError("Piper voice IDs must be unique strings")
+        seen.add(voice_id)
+        expected = PIPER_VOICES.get(voice_id)
+        if expected is None:
+            raise SidecarError(f"Piper voice {voice_id} is not in the audited catalog")
+        for field in ("language", "quality", "speakers", "sampleRateHz"):
+            if voice.get(field) != expected[field]:
+                raise SidecarError(f"Piper voice {voice_id} has invalid {field} metadata")
+        if voice.get("sourceUrl") != PIPER_VOICE_SOURCE_URL:
+            raise SidecarError(f"Piper voice {voice_id} has invalid source provenance")
+        validate_https_url(voice.get("sourceUrl"), f"Piper voice {voice_id} source URL", [])
+        if not isinstance(voice.get("provenance"), str) or not voice["provenance"].strip():
+            raise SidecarError(f"Piper voice {voice_id} must include provenance text")
+
+        expected_files = expected["files"]
+        files = voice.get("files")
+        if not isinstance(files, dict) or set(files) != set(expected_files):
+            raise SidecarError(f"Piper voice {voice_id} must lock model, config, and model card")
+        for purpose, expected_file in expected_files.items():
+            file = files[purpose]
+            if not isinstance(file, dict):
+                raise SidecarError(f"Piper voice {voice_id} {purpose} lock must be an object")
+            validate_piper_catalog_path(file.get("path"), f"Piper voice {voice_id} {purpose}")
+            validate_digest(file.get("sha256"), f"Piper voice {voice_id} {purpose}", [])
+            if file != expected_file:
+                raise SidecarError(
+                    f"Piper voice {voice_id} {purpose} does not match the audited file lock"
+                )
+
+        card_path = expected_files["modelCard"]["path"]
+        expected_card_url = f"{PIPER_VOICE_CARD_BASE}/{card_path}"
+        if voice.get("modelCardUrl") != expected_card_url:
+            raise SidecarError(f"Piper voice {voice_id} model-card URL is not revision-pinned")
+        validate_https_url(voice.get("modelCardUrl"), f"Piper voice {voice_id} model-card URL", [])
+        expected_license = {
+            "id": "CC0-1.0",
+            "url": PIPER_VOICE_LICENSE_URL,
+            "scope": "source-dataset",
+            "declaration": "The pinned model card declares the source dataset license as CC0.",
+        }
+        if voice.get("declaredDatasetLicense") != expected_license:
+            raise SidecarError(
+                f"Piper voice {voice_id} must preserve the scoped model-card license declaration"
+            )
+        validate_https_url(
+            voice["declaredDatasetLicense"]["url"],
+            f"Piper voice {voice_id} declared license URL",
+            [],
+        )
+
+    if seen != set(PIPER_VOICES):
+        raise SidecarError("Piper voice catalog is missing an audited voice")
+
+    for target, bundle in manifest.get("bundles", {}).items():
+        for item in bundle.get("requiredFiles", []):
+            path = PurePosixPath(str(item.get("path", "")))
+            if any("piper" in part.casefold() for part in path.parts):
+                raise SidecarError(
+                    f"{target} bundles Piper even though it is an explicit online install"
+                )
 
 
 def validate_mlx_artifact_lock(
@@ -289,6 +456,21 @@ def validate_relative_path(value: object, label: str) -> str:
         raise SidecarError(f"{label} path is unsafe: {value}")
     if not path.parts or path.parts[0] not in ALLOWED_ROOTS:
         raise SidecarError(f"{label} path must be rooted in one of {sorted(ALLOWED_ROOTS)}")
+    return path.as_posix()
+
+
+def validate_piper_catalog_path(value: object, label: str) -> str:
+    if not isinstance(value, str) or not value or "\\" in value:
+        raise SidecarError(f"{label} path must use non-empty POSIX syntax")
+    path = PurePosixPath(value)
+    if (
+        path.is_absolute()
+        or ".." in path.parts
+        or "." in path.parts
+        or path.as_posix() != value
+        or path.parts[:2] != ("de", "de_DE")
+    ):
+        raise SidecarError(f"{label} path is outside the pinned German voice catalog")
     return path.as_posix()
 
 

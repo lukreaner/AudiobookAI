@@ -109,6 +109,19 @@ HTTPS URLs. The fetcher has no token or authorization-header support and rejects
 credential-bearing URLs. Every sidecar tree is scanned immediately before it
 can become a GitHub artifact.
 
+Piper is not a release sidecar. On Linux x86_64, its separate app-managed flow
+starts only after an explicit install action and accepts no user-supplied URL or
+credential. It downloads the fixed public Piper 1.2.0 archive, enforces its
+exact byte count and SHA-256 before extraction, and writes only below the
+canonical marker-owned `<data_dir>/managed-providers/piper` root. Curated voice
+downloads are derived from a fixed Hugging Face repository, full commit, and
+allowlisted relative paths; the only query is the literal `download=true`.
+Every model, config, and model card has a separate expected size and SHA-256.
+The UI shows the pinned model-card provenance and scoped dataset-license
+declaration and requires confirmation before that voice is downloaded. Engine
+uninstall retains voices, while voice removal is separately confirmed and
+blocked when the voice is in use.
+
 Cloud processing is consented per project. The preflight screen identifies the
 provider and whether book text, audio, or voice references leave the computer.
 

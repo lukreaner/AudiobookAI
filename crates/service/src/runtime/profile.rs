@@ -15,6 +15,7 @@ pub enum RuntimeAdapterKind {
     MlxAudio,
     LocalAi,
     AllTalkV2,
+    Piper,
     NativeOs,
     OpenAiTts,
     OpenAi,
@@ -30,7 +31,7 @@ pub enum RuntimeAdapterKind {
 
 impl RuntimeAdapterKind {
     pub const fn is_native(self) -> bool {
-        matches!(self, Self::NativeOs)
+        matches!(self, Self::NativeOs | Self::Piper)
     }
 
     pub const fn is_character_provider(self) -> bool {
@@ -55,6 +56,7 @@ impl RuntimeAdapterKind {
                 | Self::MlxAudio
                 | Self::LocalAi
                 | Self::AllTalkV2
+                | Self::Piper
                 | Self::NativeOs
                 | Self::OpenAiTts
         )
@@ -121,6 +123,11 @@ pub struct RuntimeProfile {
     pub executable: Option<PathBuf>,
     pub arguments: Vec<String>,
     pub working_directory: Option<PathBuf>,
+    /// Exact model selected by this logical provider connection. Adapters that expose a
+    /// connection-scoped catalog (notably Piper) must fail closed outside this value.
+    pub model: Option<String>,
+    /// App-owned voice root for the command-based Piper adapter.
+    pub piper_voices_dir: Option<PathBuf>,
     pub environment: BTreeMap<String, String>,
     pub model_control: Option<RuntimeModelControl>,
     pub model_performance: Vec<audiobookai_core::ModelPerformanceCapabilities>,
@@ -142,6 +149,8 @@ impl RuntimeProfile {
             executable: None,
             arguments: Vec::new(),
             working_directory: None,
+            model: None,
+            piper_voices_dir: None,
             environment: BTreeMap::new(),
             model_control: None,
             model_performance: Vec::new(),
@@ -197,6 +206,22 @@ impl RuntimeProfile {
         }
         if let Some(directory) = &self.working_directory {
             require_absolute(directory, "managed provider working directory")?;
+        }
+        match (self.adapter, self.piper_voices_dir.as_deref()) {
+            (RuntimeAdapterKind::Piper, Some(directory)) => {
+                require_absolute(directory, "Piper voice directory")?;
+            }
+            (RuntimeAdapterKind::Piper, None) => {
+                return Err(ProviderError::Configuration(
+                    "Piper requires an absolute app-owned voice directory".to_owned(),
+                ));
+            }
+            (_, Some(_)) => {
+                return Err(ProviderError::Configuration(
+                    "only Piper profiles may define a Piper voice directory".to_owned(),
+                ));
+            }
+            (_, None) => {}
         }
         validate_arguments(&self.arguments)?;
         if self
@@ -261,6 +286,8 @@ impl fmt::Debug for RuntimeProfile {
             .field("executable", &self.executable)
             .field("argument_count", &self.arguments.len())
             .field("working_directory", &self.working_directory)
+            .field("model_configured", &self.model.is_some())
+            .field("piper_voices_dir", &self.piper_voices_dir)
             .field(
                 "environment_keys",
                 &self.environment.keys().collect::<Vec<_>>(),

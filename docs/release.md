@@ -94,6 +94,13 @@ committed public key, safe extraction, and each critical-file hash.
 Do not use private releases, pre-signed object-store links, authenticated endpoints, or expiring
 URLs for sidecars.
 
+The `piperInstaller` record in the same manifest is not a shipped sidecar input. It pins the
+optional, explicit online Linux x86_64 runtime install to the official Piper 1.2.0 archive URL,
+byte count, and SHA-256, and pins every curated voice file to a full repository commit. Release
+validation checks this metadata, but bundle preparation must not copy Piper into
+`packaging/runtime/` or describe it as offline. The runtime flow has no authenticated-download mode;
+the fixed Hugging Face voice URLs use only the literal `download=true` query.
+
 ## Workflow separation and publication boundaries
 
 - `ci.yml` runs normal locked builds and tests on GitHub-hosted native runners. It receives no
@@ -136,7 +143,9 @@ does not make an earlier secret-bearing commit safe to push.
 1. Complete every feature, provider contract, security, media, accessibility, localization, and
    clean-machine gate. A passing build is not evidence that those product gates passed.
 2. Audit native sidecar builds as described in [sidecars.md](sidecars.md), replace every placeholder
-   public URL/hash, collect detached signatures, and set `releaseReady` to `true`.
+   public URL/hash, collect detached signatures, and set `releaseReady` to `true`. Separately verify
+   that the non-bundled `piperInstaller` archive and curated per-file voice locks still match the
+   reviewed runtime contract.
 3. Set the same stable version in the Cargo workspace, Tauri config, and dashboard package. The
    release tag must be exactly `v<version>` and the major version must be at least 1.
 4. From a credential-free development checkout, run the history scanner, commit clean lockfiles,
@@ -168,6 +177,10 @@ For every supported OS, verify at minimum:
 - installer signature, notarization/stapling where applicable, double-click launch, and uninstall;
 - launch with an empty `PATH` and without Node.js, Python, Docker, FFmpeg, or eSpeak installed;
 - bundled dashboard, FFmpeg/ffprobe, Linux eSpeak voices, and offline WebView2 operation;
+- on Linux x86_64, prove Piper is absent before consent, complete its explicit online engine and
+  per-voice license-confirmed install, synthesize with the installed voice, reject a corrupt
+  engine/voice payload, retain voices across engine uninstall/reinstall, and block removal while a
+  voice is in use;
 - EPUB association is optional and opening a file creates a draft without modifying the source;
 - keychain/passphrase setup, provider configuration wizard, preview, estimate, dry run, conversion,
   progressive playback, every export format, metadata/cover/chapter markers, pause/crash/resume;
@@ -183,7 +196,8 @@ home listing, or raw signing/notarization response.
 ## Known scaffold blockers
 
 The committed sidecar lock intentionally contains unresolved hashes and `releaseReady: false`, and
-the application version remains pre-1.0. The release workflow must therefore fail today. The three
+the application version remains pre-1.0. The release workflow must therefore fail today. The fully
+pinned optional Piper inputs do not change that bundled-sidecar release gate. The three
 dedicated native release runners, local signing identities, local notarization profile, public
 sidecar bundles, verified GitHub push-protection settings, and clean-machine evidence are operator
 prerequisites that are not present in the repository. Before enabling the MLX-audio installer in a

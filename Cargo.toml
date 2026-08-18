@@ -33,6 +33,7 @@ bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
 command-group = { version = "5.0.1", features = ["with-tokio"] }
 directories = "6"
+flate2 = "1"
 fs2 = "0.4"
 futures = "0.3"
 http = "1"
@@ -49,6 +50,7 @@ rust-embed = { version = "8", features = [
     "deterministic-timestamps",
     "mime-guess",
 ] }
+rustix = { version = "1", features = ["fs"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 scraper = "0.27"
 secrecy = { version = "0.10", features = ["serde"] }
@@ -57,6 +59,7 @@ serde_json = "1"
 sha2 = "0.10"
 sqlx = { version = "0.9", default-features = false, features = ["chrono", "json", "macros", "migrate", "runtime-tokio", "sqlite", "uuid"] }
 tempfile = "3"
+tar = "0.4"
 thiserror = "2"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = { version = "0.1", features = ["sync"] }

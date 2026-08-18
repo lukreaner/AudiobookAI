@@ -78,6 +78,7 @@ const cloneProvider: ProviderProfile = {
   id: "provider-clone",
   name: "Cloud Voice Lab",
   kind: "elevenlabs",
+  role: "tts",
   mode: "cloud_remote",
   arguments: [],
   status: "online",
@@ -336,6 +337,7 @@ describe("character review", () => {
       id: "provider-ai",
       name: "Reasoning AI",
       kind: "openai",
+      role: "llm",
       capabilities: {
         ...cloneProvider.capabilities!,
         tts: false,

@@ -652,19 +652,29 @@ fn parse_models(value: &Value, flavor: CharacterFlavor) -> Result<Vec<Model>> {
     Ok(items
         .iter()
         .filter(|item| {
-            if !matches!(flavor, CharacterFlavor::Gemini) {
-                return true;
+            match flavor {
+                CharacterFlavor::Gemini => item
+                    .get("supportedGenerationMethods")
+                    .and_then(Value::as_array)
+                    .is_some_and(|methods| {
+                        methods
+                            .iter()
+                            .any(|method| method.as_str() == Some("generateContent"))
+                    }),
+                // These endpoints expose mixed catalogs without positive per-model chat
+                // capability metadata. Keep manual configuration available, but discovery must
+                // not present any entry as verified compatible.
+                CharacterFlavor::OpenAiChat(_) | CharacterFlavor::Ollama => false,
+                CharacterFlavor::OpenAiResponses | CharacterFlavor::Anthropic => true,
             }
-            item.get("supportedGenerationMethods")
-                .and_then(Value::as_array)
-                .is_none_or(|methods| {
-                    methods
-                        .iter()
-                        .any(|method| method.as_str() == Some("generateContent"))
-                })
         })
         .filter_map(|item| {
             let id = item.get("id").or_else(|| item.get("name"))?.as_str()?;
+            if matches!(flavor, CharacterFlavor::OpenAiResponses)
+                && !is_openai_responses_model_id(id)
+            {
+                return None;
+            }
             Some(Model {
                 id: id.trim_start_matches("models/").to_owned(),
                 name: item
@@ -677,6 +687,40 @@ fn parse_models(value: &Value, flavor: CharacterFlavor) -> Result<Vec<Model>> {
             })
         })
         .collect())
+}
+
+/// `OpenAI`'s model-list response has no endpoint/capability metadata. Character detection requires
+/// the Responses API plus structured text output, so discovery must positively recognize a text
+/// generation family and reject specialized audio, image, search, realtime, and Codex models.
+/// Unknown families intentionally remain hidden until the adapter contract is updated.
+pub fn is_openai_responses_model_id(id: &str) -> bool {
+    let normalized = id.to_ascii_lowercase();
+    if [
+        "audio",
+        "codex",
+        "computer-use",
+        "deep-research",
+        "embedding",
+        "image",
+        "moderation",
+        "realtime",
+        "search",
+        "transcribe",
+        "tts",
+        "video",
+        "whisper",
+    ]
+    .into_iter()
+    .any(|marker| normalized.contains(marker))
+    {
+        return false;
+    }
+
+    ["gpt-5", "gpt-4.1", "gpt-4o"].into_iter().any(|family| {
+        normalized == family
+            || normalized.starts_with(&format!("{family}-"))
+            || (family == "gpt-5" && normalized.starts_with("gpt-5."))
+    })
 }
 
 fn encode_path_segment(value: &str) -> String {
@@ -760,6 +804,15 @@ mod tests {
                         "name": "models/text-embedding",
                         "displayName": "Text Embedding",
                         "supportedGenerationMethods": ["embedContent"]
+                    },
+                    {
+                        "name": "models/unknown-without-capabilities",
+                        "displayName": "Unknown"
+                    },
+                    {
+                        "name": "models/malformed-capabilities",
+                        "displayName": "Malformed",
+                        "supportedGenerationMethods": "generateContent"
                     }
                 ]
             }),
@@ -769,6 +822,74 @@ mod tests {
 
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "gemini-generation");
+    }
+
+    #[test]
+    fn openai_compatible_mixed_catalogs_discover_no_unverified_models() {
+        let catalog = json!({
+            "data": [
+                { "id": "qwen-chat" },
+                { "id": "text-embedding" },
+                { "id": "image-model" }
+            ]
+        });
+
+        for preset in [
+            OpenAiChatPreset::Generic,
+            OpenAiChatPreset::Qwen,
+            OpenAiChatPreset::Kimi,
+            OpenAiChatPreset::Moonshot,
+            OpenAiChatPreset::LmStudio,
+        ] {
+            assert!(
+                parse_models(&catalog, CharacterFlavor::OpenAiChat(preset))
+                    .unwrap()
+                    .is_empty(),
+                "{preset:?} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn ollama_tags_discover_no_models_without_positive_chat_metadata() {
+        let models = parse_models(
+            &json!({
+                "models": [
+                    { "name": "llama3.2:latest" },
+                    { "name": "nomic-embed-text:latest" }
+                ]
+            }),
+            CharacterFlavor::Ollama,
+        )
+        .unwrap();
+
+        assert!(models.is_empty());
+    }
+
+    #[test]
+    fn openai_model_discovery_keeps_only_responses_text_models() {
+        let models = parse_models(
+            &json!({
+                "data": [
+                    { "id": "gpt-5.6-luna" },
+                    { "id": "gpt-4.1-mini" },
+                    { "id": "gpt-4o-mini-tts" },
+                    { "id": "gpt-image-1" },
+                    { "id": "text-embedding-3-large" },
+                    { "id": "whisper-1" }
+                ]
+            }),
+            CharacterFlavor::OpenAiResponses,
+        )
+        .unwrap();
+
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            ["gpt-5.6-luna", "gpt-4.1-mini"]
+        );
     }
 
     #[test]

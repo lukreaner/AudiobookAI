@@ -64,11 +64,38 @@ beforeEach(async () => {
   tauri.isTauri.mockReturnValue(true);
   await i18n.changeLanguage("en");
   vi.spyOn(api, "settings").mockResolvedValue(structuredClone(lockedSettings));
+  vi.spyOn(api, "nativeProviderAvailability").mockResolvedValue({
+    platform: "linux",
+    providerName: "eSpeak NG",
+    available: true,
+    detail: null,
+  });
   vi.spyOn(api, "unlockSecretStore").mockResolvedValue({ unlocked: true, backend: "passphrase" });
-  vi.spyOn(api, "discoverProviderModels").mockResolvedValue({ items: [] });
+  vi.spyOn(api, "discoverProviderModels").mockResolvedValue({ items: [], strict: false });
 });
 
 describe("first-run setup", () => {
+  it("explains unavailable Linux system speech in German without offering a no-op native provider", async () => {
+    const user = userEvent.setup();
+    await i18n.changeLanguage("de");
+    vi.mocked(api.nativeProviderAvailability).mockResolvedValue({
+      platform: "linux",
+      providerName: "eSpeak NG",
+      available: false,
+      detail: "eSpeak NG wurde nicht gefunden.",
+    });
+    renderSetup();
+
+    await user.click(await screen.findByRole("button", { name: "AudiobookAI einrichten" }));
+    await user.click(screen.getByRole("button", { name: "Weiter" }));
+
+    expect(screen.queryByRole("option", { name: /eSpeak NG/ })).not.toBeInTheDocument();
+    expect(screen.getByText("eSpeak NG ist nicht verfügbar")).toBeInTheDocument();
+    expect(screen.getByText(/Linux enthält standardmäßig keine Sprachengine/)).toBeInTheDocument();
+    expect(screen.getByText(/verwalteten Piper/)).toBeInTheDocument();
+    expect(screen.queryByText("eSpeak NG wurde nicht gefunden.")).not.toBeInTheDocument();
+  });
+
   it("applies TTS and LLM presets while clearing transient credentials", async () => {
     const user = userEvent.setup();
     renderSetup();
@@ -76,6 +103,7 @@ describe("first-run setup", () => {
     await user.click(await screen.findByRole("button", { name: "Set up AudiobookAI" }));
     await user.click(screen.getByRole("button", { name: /Use local and cloud providers/ }));
     await user.click(screen.getByRole("button", { name: "Continue" }));
+    expect(screen.queryByRole("option", { name: "Piper" })).not.toBeInTheDocument();
     await user.selectOptions(screen.getByLabelText("Provider"), "elevenlabs");
     const endpoint = await screen.findByLabelText(/^Endpoint URL/);
     expect(endpoint).toHaveValue("https://api.elevenlabs.io/");
@@ -84,17 +112,53 @@ describe("first-run setup", () => {
     await user.click(screen.getByRole("switch", { name: "I’ll add credentials later" }));
     await user.type(screen.getByLabelText(/^API key/), "temporary-provider-credential");
 
-    await user.selectOptions(screen.getByLabelText("Provider"), "openai_tts");
+    await user.selectOptions(screen.getByLabelText("Provider"), "openai");
     expect(screen.getByText("Text to speech (TTS)")).toBeInTheDocument();
     expect(screen.getByLabelText(/^Endpoint URL/)).toHaveValue("https://api.openai.com/");
-    expect(screen.getByLabelText(/^TTS model/)).toHaveValue("gpt-4o-mini-tts");
+    expect(screen.getByLabelText(/^TTS model/)).toBeDisabled();
+    expect(screen.queryByRole("option", { name: "Enter a model manually" })).not.toBeInTheDocument();
 
+    await user.selectOptions(screen.getByLabelText(/^Provider use/), "llm");
+    expect(screen.getByLabelText("Provider")).toHaveValue("openai");
     await user.selectOptions(screen.getByLabelText("Provider"), "ollama");
 
     expect(screen.getByText("Language model (LLM)")).toBeInTheDocument();
     expect(screen.getByLabelText(/^Endpoint URL/)).toHaveValue("http://127.0.0.1:11434/");
     expect(screen.getByRole("switch", { name: "I’ll add credentials later" })).not.toBeChecked();
     expect(screen.queryByLabelText(/^API key/)).not.toBeInTheDocument();
+  });
+
+  it("persists the explicitly selected provider role", async () => {
+    const user = userEvent.setup();
+    const readySettings = { ...structuredClone(lockedSettings), secretStore: "keychain" as const };
+    vi.mocked(api.settings).mockResolvedValue(readySettings);
+    vi.spyOn(api, "updateSettings").mockResolvedValue(readySettings);
+    vi.spyOn(api, "createProvider").mockResolvedValue({} as Awaited<ReturnType<typeof api.createProvider>>);
+    vi.spyOn(api, "completeFirstRun").mockResolvedValue({ ...readySettings, firstRunComplete: true });
+    vi.mocked(api.discoverProviderModels).mockResolvedValue({ items: [{ id: "gpt-5-mini", name: "gpt-5-mini" }], strict: true });
+    renderSetup();
+
+    await user.click(await screen.findByRole("button", { name: "Set up AudiobookAI" }));
+    await user.click(screen.getByRole("button", { name: /Use local and cloud providers/ }));
+    await user.click(screen.getByRole("button", { name: "Continue" }));
+    await user.selectOptions(screen.getByLabelText(/^Provider use/), "llm");
+    await user.selectOptions(screen.getByLabelText("Provider"), "openai");
+    await user.click(screen.getByRole("switch", { name: "I’ll add credentials later" }));
+    await user.type(screen.getByLabelText(/^API key/), "test-openai-key");
+    await waitFor(() => expect(screen.getByRole("option", { name: "gpt-5-mini" })).toBeInTheDocument());
+    await user.selectOptions(screen.getByLabelText(/^LLM model/), "gpt-5-mini");
+    await user.click(screen.getByRole("button", { name: "Continue" }));
+    await user.click(screen.getByRole("button", { name: "Continue" }));
+    await user.click(screen.getByRole("button", { name: "Continue" }));
+    await user.click(screen.getByRole("button", { name: "Finish setup" }));
+
+    await waitFor(() => expect(api.createProvider).toHaveBeenCalledWith(expect.objectContaining({
+      kind: "openai",
+      role: "llm",
+      mode: "cloud_remote",
+      endpoint: "https://api.openai.com/",
+      model: "gpt-5-mini",
+    })));
   });
 
   it("requires and verifies a passphrase in the wizard when the OS keychain is unavailable", async () => {

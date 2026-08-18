@@ -32,8 +32,8 @@ use crate::{
         ExportArtifactView, ExportOptionsInput, ImportDraft, JobStatusView, JobUnitView, JobView,
         Page, PreviewView, ProjectDetail, ProjectDisplayStatus, PronunciationRuleView,
         ProviderCapabilitiesView, ProviderKindView, ProviderModeView, ProviderProfileInput,
-        ProviderProfileView, ProviderStatusView, ReviewStatus, StartJobInput, UsageSummaryView,
-        VoiceAssignmentView, VoiceView,
+        ProviderProfileView, ProviderRoleView, ProviderStatusView, ReviewStatus, StartJobInput,
+        UsageSummaryView, VoiceAssignmentView, VoiceView,
     },
     state::ImportRecord,
 };
@@ -129,6 +129,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(list_providers).post(create_provider),
         )
         .route(
+            "/api/v1/providers/native/availability",
+            get(native_provider_availability),
+        )
+        .route(
             "/api/v1/provider-models/discover",
             post(discover_provider_models),
         )
@@ -175,6 +179,21 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/api/v1/providers/mlx-audio/models/{id}",
             delete(remove_mlx_model),
+        )
+        .route(
+            "/api/v1/providers/piper/management",
+            get(piper_management_status),
+        )
+        .route("/api/v1/providers/piper/install", post(install_piper))
+        .route("/api/v1/providers/piper/uninstall", post(uninstall_piper))
+        .route(
+            "/api/v1/providers/piper/operations/{id}/cancel",
+            post(cancel_piper_operation),
+        )
+        .route("/api/v1/providers/piper/voices", post(download_piper_voice))
+        .route(
+            "/api/v1/providers/piper/voices/{voice_id}",
+            delete(remove_piper_voice),
         )
         .route(
             "/api/v1/projects/{id}/preflight/estimate",
@@ -232,6 +251,15 @@ async fn health(State(_state): State<Arc<AppState>>) -> Json<HealthResponse> {
         version: env!("CARGO_PKG_VERSION"),
         database: "ready",
     })
+}
+
+async fn native_provider_availability(State(state): State<Arc<AppState>>) -> Response {
+    let mut response = Json(crate::state::native_tts_availability(&state.config)).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        http::HeaderValue::from_static("no-store"),
+    );
+    response
 }
 
 async fn list_diagnostics(Query(query): Query<crate::diagnostics::DiagnosticQuery>) -> Response {
@@ -2351,6 +2379,7 @@ async fn assign_voice(
             })?;
         (voice, source_id, provider)
     };
+    validate_piper_voice_selection(&provider, &source_id, assignment.model.as_deref())?;
     assignment.provider_name.clone_from(&provider.name);
     assignment.voice_name.clone_from(&voice.name);
     validate_voice_direction(
@@ -2406,6 +2435,30 @@ async fn assign_voice(
         inherited_voice: None,
         character_revision,
     }))
+}
+
+/// Piper treats one installed voice bundle as both the connection model and its only voice.
+/// Keep that invariant at assignment and dispatch boundaries even if stale catalog rows exist.
+pub(crate) fn validate_piper_voice_selection(
+    provider: &ProviderProfileView,
+    provider_voice_id: &str,
+    assignment_model: Option<&str>,
+) -> Result<(), ServiceError> {
+    if !matches!(provider.kind, ProviderKindView::Piper) {
+        return Ok(());
+    }
+    let selected = provider.model.as_deref().ok_or_else(|| {
+        ServiceError::InvalidRequest(
+            "the Piper connection has no verified selected voice".to_owned(),
+        )
+    })?;
+    if provider_voice_id != selected || assignment_model.is_some_and(|model| model != selected) {
+        return Err(ServiceError::InvalidRequest(
+            "the assigned Piper voice must exactly match the connection's selected model"
+                .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_voice_direction(
@@ -3757,6 +3810,7 @@ struct AvailableProviderModelView {
 #[serde(rename_all = "camelCase")]
 struct AvailableProviderModelsView {
     items: Vec<AvailableProviderModelView>,
+    strict: bool,
 }
 
 async fn provider_model_discovery_profile(
@@ -3774,14 +3828,18 @@ async fn provider_model_discovery_profile(
             .cloned()
             .ok_or(ServiceError::NotFound)?
     } else {
-        let kind = input
-            .kind
-            .clone()
-            .ok_or_else(|| ServiceError::InvalidRequest("provider kind is required".to_owned()))?;
+        let kind =
+            canonical_provider_kind(input.kind.clone().ok_or_else(|| {
+                ServiceError::InvalidRequest("provider kind is required".to_owned())
+            })?);
+        let role = input
+            .role
+            .ok_or_else(|| ServiceError::InvalidRequest("provider role is required".to_owned()))?;
         ProviderProfileView {
             id: Uuid::new_v4(),
             name: input.name.clone().unwrap_or_else(|| format!("{kind:?}")),
             kind,
+            role,
             mode: input.mode.unwrap_or(ProviderModeView::CloudRemote),
             endpoint: None,
             executable_path: None,
@@ -3802,7 +3860,11 @@ async fn provider_model_discovery_profile(
         profile.name.clone_from(name);
     }
     if let Some(kind) = &input.kind {
-        profile.kind.clone_from(kind);
+        profile.kind = canonical_provider_kind(kind.clone());
+    }
+    profile.kind = canonical_provider_kind(profile.kind);
+    if let Some(role) = input.role {
+        profile.role = role;
     }
     if let Some(mode) = input.mode {
         profile.mode = mode;
@@ -3855,6 +3917,17 @@ async fn provider_model_discovery_credential(
     ))
 }
 
+fn piper_uninstall_in_progress(
+    active_operation: Option<&crate::piper_management::PiperOperationView>,
+) -> bool {
+    active_operation.is_some_and(|operation| {
+        matches!(
+            operation.kind,
+            crate::piper_management::PiperOperationKind::Uninstall
+        )
+    })
+}
+
 /// Builds the selected adapter in memory and performs only its model-list request. The supplied
 /// credential is zeroized after the request and is never persisted by this preview endpoint.
 async fn discover_provider_models(
@@ -3883,11 +3956,48 @@ async fn discover_provider_models(
     )?;
     validate_provider_sensitive_fields(
         &profile.kind,
+        profile.role,
         profile.mode,
-        profile.model.as_deref(),
+        None,
         credential.is_some(),
     )?;
-    profile.capabilities = Some(default_capabilities(&profile.kind, profile.mode));
+    // Piper models are app-owned voice bundles. Use the manager's verified inventory instead of
+    // treating arbitrary directories below the shared voice root as selectable models. This path
+    // also supports choosing a model before a connection-scoped Piper adapter can be built.
+    if matches!(profile.kind, ProviderKindView::Piper) {
+        let _model_lifecycle_guard = state.model_lifecycle.lock().await;
+        let management = state.piper.view().await;
+        if piper_uninstall_in_progress(management.active_operation.as_ref()) {
+            return Err(ServiceError::Conflict(
+                "Piper is being uninstalled; wait for the operation to finish before discovering models"
+                    .to_owned(),
+            ));
+        }
+        let items = if management.installed {
+            management
+                .installed_voices
+                .into_iter()
+                .map(|voice| AvailableProviderModelView {
+                    id: voice.id,
+                    name: voice.name,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        return Ok(Json(AvailableProviderModelsView {
+            items,
+            strict: true,
+        }));
+    }
+    // A stale model from the other role must not prevent discovery of a compatible replacement.
+    // Model selection is not used to build or query the temporary adapter.
+    profile.model = None;
+    profile.capabilities = Some(default_capabilities(
+        &profile.kind,
+        profile.role,
+        profile.mode,
+    ));
 
     let runtime_profile = crate::state::runtime_profile_from_view(&profile, &state.config)?;
     let models = state
@@ -3896,9 +4006,12 @@ async fn discover_provider_models(
         .await
         .map_err(|error| ServiceError::Conflict(error.to_string()))?;
     let mut unique = BTreeMap::<String, String>::new();
+    let strict = provider_model_catalog_is_strict(&profile.kind, profile.role);
     for model in models {
         let id = model.id.trim();
-        if id.is_empty() {
+        if id.is_empty()
+            || (strict && !provider_model_is_compatible(&profile.kind, profile.role, id))
+        {
             continue;
         }
         let name = model.name.trim();
@@ -3916,6 +4029,7 @@ async fn discover_provider_models(
             .into_iter()
             .map(|(id, name)| AvailableProviderModelView { id, name })
             .collect(),
+        strict,
     }))
 }
 
@@ -4589,6 +4703,7 @@ async fn auto_configure_mlx_profile(
         id: Uuid::new_v4(),
         name: "MLX-audio (managed)".to_owned(),
         kind: ProviderKindView::MlxAudio,
+        role: ProviderRoleView::Tts,
         mode: ProviderModeView::ManagedChild,
         endpoint: Some("http://127.0.0.1:8000/".to_owned()),
         executable_path: Some(server.to_string_lossy().into_owned()),
@@ -4604,6 +4719,7 @@ async fn auto_configure_mlx_profile(
         credential_configured: false,
         capabilities: Some(default_capabilities(
             &ProviderKindView::MlxAudio,
+            ProviderRoleView::Tts,
             ProviderModeView::ManagedChild,
         )),
         capability_source: Some("app_managed_mlx_audio_0.4.6".to_owned()),
@@ -4630,6 +4746,192 @@ async fn auto_configure_mlx_profile(
         serde_json::json!({ "providerId": profile.id, "source": "mlx_install" }),
     );
     Ok(())
+}
+
+async fn piper_management_status(
+    State(state): State<Arc<AppState>>,
+) -> Json<crate::piper_management::PiperManagementView> {
+    let mut view = state.piper.view().await;
+    let has_connection = state
+        .catalog
+        .read()
+        .await
+        .providers
+        .values()
+        .any(|profile| matches!(profile.kind, ProviderKindView::Piper));
+    let action_required = view.installed && !view.installed_voices.is_empty() && !has_connection;
+    state
+        .piper
+        .set_profile_action_required(action_required)
+        .await;
+    view.profile_action_required = action_required;
+    Json(view)
+}
+
+async fn install_piper(
+    State(state): State<Arc<AppState>>,
+) -> Result<
+    (
+        StatusCode,
+        Json<crate::piper_management::PiperOperationView>,
+    ),
+    ServiceError,
+> {
+    let operation = state.piper.start_install().await?;
+    Ok((StatusCode::ACCEPTED, Json(operation)))
+}
+
+async fn uninstall_piper(
+    State(state): State<Arc<AppState>>,
+    Json(input): Json<ConfirmMlxAction>,
+) -> Result<
+    (
+        StatusCode,
+        Json<crate::piper_management::PiperOperationView>,
+    ),
+    ServiceError,
+> {
+    if !input.confirmed {
+        return Err(ServiceError::InvalidRequest(
+            "an explicit confirmed=true body is required before uninstalling Piper".to_owned(),
+        ));
+    }
+    // Provider create/update/delete also hold this guard. Keeping it until the manager records the
+    // uninstall operation makes the admission decision atomic with respect to Piper connections:
+    // either an existing connection blocks uninstall, or a later mutation observes active uninstall.
+    let _model_lifecycle_guard = state.model_lifecycle.lock().await;
+    let profiles = state
+        .catalog
+        .read()
+        .await
+        .providers
+        .values()
+        .filter(|profile| matches!(profile.kind, ProviderKindView::Piper))
+        .count();
+    if profiles > 0 {
+        return Err(ServiceError::Conflict(
+            "delete every Piper provider connection before uninstalling its runtime; downloaded voices are retained"
+                .to_owned(),
+        ));
+    }
+    let operation = state.piper.start_uninstall().await?;
+    Ok((StatusCode::ACCEPTED, Json(operation)))
+}
+
+async fn cancel_piper_operation(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<crate::piper_management::PiperOperationView>, ServiceError> {
+    state.piper.cancel(id).await.map(Json)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DownloadPiperVoiceInput {
+    voice_id: String,
+    #[serde(default)]
+    license_confirmed: bool,
+}
+
+async fn download_piper_voice(
+    State(state): State<Arc<AppState>>,
+    Json(input): Json<DownloadPiperVoiceInput>,
+) -> Result<
+    (
+        StatusCode,
+        Json<crate::piper_management::PiperOperationView>,
+    ),
+    ServiceError,
+> {
+    let _model_lifecycle_guard = state.model_lifecycle.lock().await;
+    let operation = state
+        .piper
+        .start_voice_download(&input.voice_id, input.license_confirmed)
+        .await?;
+    Ok((StatusCode::ACCEPTED, Json(operation)))
+}
+
+async fn remove_piper_voice(
+    State(state): State<Arc<AppState>>,
+    Path(voice_id): Path<String>,
+    Json(input): Json<ConfirmMlxAction>,
+) -> Result<StatusCode, ServiceError> {
+    let _model_lifecycle_guard = state.model_lifecycle.lock().await;
+    let in_use = piper_voice_is_in_use(&state, &voice_id).await?;
+    state
+        .piper
+        .remove_voice(&voice_id, input.confirmed, in_use)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn piper_voice_is_in_use(state: &AppState, voice_id: &str) -> Result<bool, ServiceError> {
+    let catalog_references = {
+        let catalog = state.catalog.read().await;
+        catalog.providers.values().any(|profile| {
+            matches!(profile.kind, ProviderKindView::Piper)
+                && profile.model.as_deref() == Some(voice_id)
+        }) || catalog.characters.values().flatten().any(|character| {
+            character
+                .voice_assignment
+                .as_ref()
+                .is_some_and(|assignment| assignment.model.as_deref() == Some(voice_id))
+        })
+    };
+    if catalog_references {
+        return Ok(true);
+    }
+    let assignment_payloads =
+        sqlx::query_scalar::<_, String>("SELECT payload FROM voice_assignments")
+            .fetch_all(state.database.pool())
+            .await
+            .map_err(|error| ServiceError::Storage(error.to_string()))?;
+    let active_job_payloads = sqlx::query_scalar::<_, String>(
+        "SELECT ju.payload FROM job_units ju \
+         JOIN jobs j ON j.id = ju.job_id \
+         WHERE j.state NOT IN ('cancelled', 'failed', 'completed')",
+    )
+    .fetch_all(state.database.pool())
+    .await
+    .map_err(|error| ServiceError::Storage(error.to_string()))?;
+    for payload in assignment_payloads.into_iter().chain(active_job_payloads) {
+        let value: serde_json::Value = serde_json::from_str(&payload).map_err(|_| {
+            ServiceError::Conflict(
+                "stored assignment or active-job metadata could not be verified; Piper voice removal is blocked"
+                    .to_owned(),
+            )
+        })?;
+        let mut candidates = Vec::new();
+        collect_model_id_candidates(&value, &mut candidates);
+        if candidates
+            .into_iter()
+            .any(|candidate| candidate == voice_id)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn collect_model_id_candidates<'a>(value: &'a serde_json::Value, output: &mut Vec<&'a str>) {
+    match value {
+        serde_json::Value::Object(fields) => {
+            for (key, value) in fields {
+                if key.eq_ignore_ascii_case("model")
+                    && let Some(candidate) = value.as_str()
+                {
+                    output.push(candidate);
+                }
+                collect_model_id_candidates(value, output);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_model_id_candidates(value, output);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Rejects a runtime replacement/removal while durable work can still dispatch through it.
@@ -4660,6 +4962,7 @@ async fn ensure_provider_runtime_mutation_allowed(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 async fn delete_provider(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
@@ -4674,11 +4977,6 @@ async fn delete_provider(
         .get(&id)
         .cloned()
         .ok_or(ServiceError::NotFound)?;
-    if matches!(profile.mode, ProviderModeView::Native) {
-        return Err(ServiceError::Conflict(
-            "the platform-native provider profile cannot be deleted".to_owned(),
-        ));
-    }
     let in_use = state
         .catalog
         .read()
@@ -4692,12 +4990,44 @@ async fn delete_provider(
                 .as_ref()
                 .is_some_and(|assignment| assignment.provider_profile_id == id)
         });
-    if in_use {
+    let durable_in_use = sqlx::query_scalar::<_, i64>(
+        "SELECT 1 FROM voice_assignments WHERE provider_id = ? LIMIT 1",
+    )
+    .bind(id.to_string())
+    .fetch_optional(state.database.pool())
+    .await
+    .map_err(|error| ServiceError::Storage(error.to_string()))?
+    .is_some();
+    if in_use || durable_in_use {
         return Err(ServiceError::Conflict(
             "remove this provider from all character voice assignments before deleting it"
                 .to_owned(),
         ));
     }
+    let retained_voice = sqlx::query_scalar::<_, i64>(
+        "SELECT 1 FROM voice_profiles WHERE provider_id = ? \
+         AND NOT (ownership = 'provider' AND origin IN ('provider_catalog', 'native_system')) \
+         LIMIT 1",
+    )
+    .bind(id.to_string())
+    .fetch_optional(state.database.pool())
+    .await
+    .map_err(|error| ServiceError::Storage(error.to_string()))?
+    .is_some();
+    if retained_voice {
+        return Err(ServiceError::Conflict(
+            "remove every cloned or user-owned voice through its dedicated voice lifecycle before deleting this provider"
+                .to_owned(),
+        ));
+    }
+    let mut tombstone = state
+        .database
+        .repositories()
+        .providers
+        .get(audiobookai_core::ProviderProfileId::from_uuid(id))
+        .await
+        .map_err(|error| ServiceError::Storage(error.to_string()))?
+        .ok_or(ServiceError::NotFound)?;
     let runtime_id = audiobookai_providers::ProviderId::new(id.to_string())
         .map_err(|error| ServiceError::Internal(error.to_string()))?;
     if state.providers.profile_ids().await.contains(&runtime_id) {
@@ -4727,21 +5057,93 @@ async fn delete_provider(
         .provider_secret_ids
         .get(&id)
         .copied();
-    state
-        .database
-        .repositories()
-        .providers
-        .delete(audiobookai_core::ProviderProfileId::from_uuid(id))
+    let mut secret_ids = tombstone
+        .environment_secret_ids
+        .values()
+        .copied()
+        .collect::<Vec<_>>();
+    for candidate in [tombstone.credential_secret_id, secret_id]
+        .into_iter()
+        .flatten()
+    {
+        if !secret_ids.contains(&candidate) {
+            secret_ids.push(candidate);
+        }
+    }
+    tombstone.enabled = false;
+    tombstone.credential_secret_id = None;
+    tombstone.environment_secret_ids.clear();
+    tombstone.capability_snapshot = None;
+    tombstone.updated_at = Utc::now();
+    let tombstone_payload = serde_json::to_string(&tombstone)
+        .map_err(|error| ServiceError::Internal(error.to_string()))?;
+    let database_delete = async {
+        let mut transaction = state
+            .database
+            .pool()
+            .begin()
+            .await
+            .map_err(|error| ServiceError::Storage(error.to_string()))?;
+        // Discovered catalog voices are children owned by the connection. Assignments were
+        // checked above, so remove these rows before the provider's RESTRICT foreign key.
+        sqlx::query(
+            "DELETE FROM voice_profiles WHERE provider_id = ? \
+             AND ownership = 'provider' AND origin IN ('provider_catalog', 'native_system')",
+        )
+        .bind(id.to_string())
+        .execute(&mut *transaction)
         .await
         .map_err(|error| ServiceError::Storage(error.to_string()))?;
-    if let Some(secret_id) = secret_id
-        && let Err(error) = state.secrets.delete(secret_id).await
-    {
-        tracing::warn!(diagnostic_code = "provider.secret.cleanup.failed", %secret_id, %error, "provider was deleted but its orphaned secret reference could not be removed");
+        // Provider IDs are durable accounting/provenance identities. Keep a credential-free,
+        // disabled tombstone so completed jobs, detections, and usage remain auditable while the
+        // connection disappears from runtime/catalog selection and no longer blocks uninstall.
+        let deleted = sqlx::query(
+            "UPDATE providers SET enabled = 0, updated_at = ?, payload = ? WHERE id = ?",
+        )
+        .bind(tombstone.updated_at.to_rfc3339())
+        .bind(&tombstone_payload)
+        .bind(id.to_string())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| ServiceError::Storage(error.to_string()))?;
+        if deleted.rows_affected() == 0 {
+            return Err(ServiceError::NotFound);
+        }
+        sqlx::query("UPDATE budgets SET enabled = 0 WHERE provider_id = ?")
+            .bind(id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| ServiceError::Storage(error.to_string()))?;
+        transaction
+            .commit()
+            .await
+            .map_err(|error| ServiceError::Storage(error.to_string()))
+    }
+    .await;
+    if let Err(error) = database_delete {
+        // The catalog still contains the unchanged profile. Restore its runtime registration so
+        // a historical FK or storage failure cannot strand a visible connection as unusable.
+        if let Err(restore_error) = state.sync_provider_runtime(id).await {
+            tracing::warn!(
+                diagnostic_code = "provider.delete.runtime_restore.failed",
+                provider_id = %id,
+                %restore_error,
+                "provider deletion failed and its runtime registration could not be restored"
+            );
+        }
+        return Err(error);
+    }
+    for secret_id in secret_ids {
+        if let Err(error) = state.secrets.delete(secret_id).await {
+            tracing::warn!(diagnostic_code = "provider.secret.cleanup.failed", %secret_id, %error, "provider was deleted but its orphaned secret reference could not be removed");
+        }
     }
     let mut catalog = state.catalog.write().await;
     catalog.providers.remove(&id);
     catalog.provider_secret_ids.remove(&id);
+    catalog
+        .budgets
+        .retain(|_, budget| budget.provider_profile_id != Some(id));
     let removed_voice_ids = catalog
         .voices
         .iter()
@@ -4762,9 +5164,14 @@ async fn create_provider(
     Json(input): Json<ProviderProfileInput>,
 ) -> Result<(StatusCode, Json<ProviderProfileView>), ServiceError> {
     let credential = input.credential;
-    let kind = input
-        .kind
-        .ok_or_else(|| ServiceError::InvalidRequest("provider kind is required".to_owned()))?;
+    let kind = canonical_provider_kind(
+        input
+            .kind
+            .ok_or_else(|| ServiceError::InvalidRequest("provider kind is required".to_owned()))?,
+    );
+    let role = input
+        .role
+        .ok_or_else(|| ServiceError::InvalidRequest("provider role is required".to_owned()))?;
     let mode = input.mode.unwrap_or(ProviderModeView::CloudRemote);
     let endpoint = input.endpoint.flatten();
     let executable_path = input.executable_path.flatten();
@@ -4783,14 +5190,25 @@ async fn create_provider(
         working_directory.as_deref(),
         &arguments,
     )?;
-    validate_provider_sensitive_fields(&kind, mode, model.as_deref(), credential.is_some())?;
+    validate_provider_sensitive_fields(&kind, role, mode, model.as_deref(), credential.is_some())?;
+    if matches!(&kind, ProviderKindView::NativeOs) {
+        let availability = crate::state::native_tts_availability(&state.config);
+        if !availability.available {
+            return Err(ServiceError::InvalidRequest(
+                availability.detail.unwrap_or_else(|| {
+                    "native system voices are unavailable on this computer".to_owned()
+                }),
+            ));
+        }
+    }
     let name = input.name.unwrap_or_else(|| format!("{kind:?}"));
     reject_empty("name", &name)?;
-    let capabilities = default_capabilities(&kind, mode);
+    let capabilities = default_capabilities(&kind, role, mode);
     let mut profile = ProviderProfileView {
         id: Uuid::new_v4(),
         name,
         kind,
+        role,
         mode,
         endpoint,
         executable_path,
@@ -4827,27 +5245,25 @@ async fn create_provider(
     drop(catalog);
     if let Err(error) = state.sync_provider_runtime(profile.id).await {
         profile.status = ProviderStatusView::Unconfigured;
-        profile.last_error = Some(error.to_string());
+        profile.last_error = Some(crate::state::provider_setup_error_detail(
+            &profile,
+            &state.config,
+            &error,
+        ));
         state
             .catalog
             .write()
             .await
             .providers
             .insert(profile.id, profile.clone());
-    } else if !matches!(profile.mode, ProviderModeView::Native) {
-        profile.status = ProviderStatusView::Offline;
-        state
-            .catalog
-            .write()
-            .await
-            .providers
-            .insert(profile.id, profile.clone());
+    } else {
+        profile = refresh_provider(&state, profile.id).await?;
     }
     Ok((StatusCode::CREATED, Json(profile)))
 }
 
-// Provider validation, secret rotation, runtime replacement, and persistence
-// must execute in this explicit order to retain rollback behavior.
+// Persist edits before reconstructing the runtime so a temporarily unavailable or invalid
+// connection remains visible as Unconfigured and can be repaired without losing its settings.
 #[allow(clippy::too_many_lines)]
 async fn update_provider(
     State(state): State<Arc<AppState>>,
@@ -4869,6 +5285,8 @@ async fn update_provider(
         .get(&id)
         .cloned()
         .ok_or(ServiceError::NotFound)?;
+    let previous_role = updated.role;
+    let previous_model = updated.model.clone();
     let was_native = is_native_provider(&updated.kind, updated.mode);
     drop(catalog);
     let runtime_id = audiobookai_providers::ProviderId::new(id.to_string())
@@ -4892,8 +5310,18 @@ async fn update_provider(
         reject_empty("name", &name)?;
         updated.name = name;
     }
-    if let Some(kind) = input.kind {
+    updated.kind = canonical_provider_kind(updated.kind);
+    if let Some(kind) = input.kind.map(canonical_provider_kind) {
+        if kind != updated.kind {
+            return Err(ServiceError::InvalidRequest(
+                "a provider connection's type cannot be changed; create a separate connection instead"
+                    .to_owned(),
+            ));
+        }
         updated.kind = kind;
+    }
+    if let Some(role) = input.role {
+        updated.role = role;
     }
     if let Some(mode) = input.mode {
         updated.mode = mode;
@@ -4913,6 +5341,39 @@ async fn update_provider(
     if let Some(model) = input.model {
         updated.model = model;
     }
+    let piper_model_changed =
+        matches!(updated.kind, ProviderKindView::Piper) && previous_model != updated.model;
+    if previous_role != updated.role || piper_model_changed {
+        let catalog_in_use = state
+            .catalog
+            .read()
+            .await
+            .characters
+            .values()
+            .flatten()
+            .any(|character| {
+                character
+                    .voice_assignment
+                    .as_ref()
+                    .is_some_and(|assignment| assignment.provider_profile_id == id)
+            });
+        let durable_in_use = sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM voice_assignments WHERE provider_id = ? LIMIT 1",
+        )
+        .bind(id.to_string())
+        .fetch_optional(state.database.pool())
+        .await
+        .map_err(|error| ServiceError::Storage(error.to_string()))?
+        .is_some();
+        if catalog_in_use || durable_in_use {
+            let detail = if piper_model_changed {
+                "remove this provider from all character voice assignments before changing its Piper voice"
+            } else {
+                "remove this provider from all character voice assignments before changing its TTS/LLM role"
+            };
+            return Err(ServiceError::Conflict(detail.to_owned()));
+        }
+    }
     validate_provider_location(
         updated.mode,
         updated.endpoint.as_deref(),
@@ -4922,6 +5383,7 @@ async fn update_provider(
     )?;
     validate_provider_sensitive_fields(
         &updated.kind,
+        updated.role,
         updated.mode,
         updated.model.as_deref(),
         credential.is_some()
@@ -4929,7 +5391,11 @@ async fn update_provider(
                 && is_native_provider(&updated.kind, updated.mode)
                 && secret_id.is_some()),
     )?;
-    updated.capabilities = Some(default_capabilities(&updated.kind, updated.mode));
+    updated.capabilities = Some(default_capabilities(
+        &updated.kind,
+        updated.role,
+        updated.mode,
+    ));
     updated.capability_source = Some("built_in_adapter_contract".to_owned());
     updated.capability_updated_at = Some(Utc::now());
     if let Some(credential) = credential {
@@ -4945,6 +5411,13 @@ async fn update_provider(
     }
     updated.credential_configured = secret_id.is_some();
     persist_provider(&state, &updated, secret_id).await?;
+    if previous_role != updated.role && matches!(updated.role, ProviderRoleView::Llm) {
+        sqlx::query("DELETE FROM voice_profiles WHERE provider_id = ?")
+            .bind(id.to_string())
+            .execute(state.database.pool())
+            .await
+            .map_err(|error| ServiceError::Storage(error.to_string()))?;
+    }
     if let (Some(old_secret_id), Some(new_secret_id)) = (old_secret_id, secret_id)
         && old_secret_id != new_secret_id
         && let Err(error) = state.secrets.delete(old_secret_id).await
@@ -4959,10 +5432,28 @@ async fn update_provider(
     drop(catalog);
     if let Err(error) = state.sync_provider_runtime(id).await {
         updated.status = ProviderStatusView::Unconfigured;
-        updated.last_error = Some(error.to_string());
-    } else if !matches!(updated.mode, ProviderModeView::Native) {
-        updated.status = ProviderStatusView::Offline;
-        updated.last_error = None;
+        updated.last_error = Some(crate::state::provider_setup_error_detail(
+            &updated,
+            &state.config,
+            &error,
+        ));
+    } else {
+        updated = refresh_provider(&state, id).await?;
+    }
+    if previous_role != updated.role && matches!(updated.role, ProviderRoleView::Llm) {
+        let mut catalog = state.catalog.write().await;
+        let removed = catalog
+            .voices
+            .iter()
+            .filter(|voice| voice.provider_profile_id == id)
+            .map(|voice| voice.id)
+            .collect::<Vec<_>>();
+        catalog
+            .voices
+            .retain(|voice| voice.provider_profile_id != id);
+        for voice_id in removed {
+            catalog.voice_sources.remove(&voice_id);
+        }
     }
     state
         .catalog
@@ -5006,8 +5497,34 @@ async fn provider_action(
             "the provider runtime is unavailable; refresh it before requesting logs".to_owned(),
         ));
     }
-    if !runtime_registered {
-        state.sync_provider_runtime(id).await?;
+    let sync_error = if !runtime_registered
+        || (action == "refresh" && matches!(profile.kind, ProviderKindView::NativeOs))
+    {
+        state.sync_provider_runtime(id).await.err()
+    } else {
+        None
+    };
+    if let Some(error) = sync_error {
+        if action == "refresh" && matches!(profile.kind, ProviderKindView::NativeOs) {
+            let mut updated = profile;
+            updated.status = ProviderStatusView::Unconfigured;
+            updated.last_error = Some(crate::state::provider_setup_error_detail(
+                &updated,
+                &state.config,
+                &error,
+            ));
+            state
+                .catalog
+                .write()
+                .await
+                .providers
+                .insert(id, updated.clone());
+            return Ok(Json(
+                serde_json::to_value(updated)
+                    .map_err(|error| ServiceError::Internal(error.to_string()))?,
+            ));
+        }
+        return Err(error);
     }
     match action.as_str() {
         "refresh" => {
@@ -5071,7 +5588,7 @@ async fn provider_action(
                 .as_ref()
                 .and_then(|Json(input)| input.model.as_deref())
                 .ok_or_else(|| ServiceError::InvalidRequest("model is required".to_owned()))?;
-            validate_provider_model(Some(model))?;
+            validate_provider_model_compatibility(&profile.kind, profile.role, Some(model))?;
             match action.as_str() {
                 "load-model" => state.providers.load_model(&runtime_id, model).await,
                 "unload-model" => state.providers.unload_model(&runtime_id, model).await,
@@ -5132,8 +5649,8 @@ struct ProviderActionInput {
 // Health probing and voice-catalog replacement are one refresh transaction;
 // the linear flow avoids publishing a partially refreshed provider.
 #[allow(clippy::too_many_lines)]
-async fn refresh_provider(
-    state: &Arc<AppState>,
+pub(crate) async fn refresh_provider(
+    state: &AppState,
     id: Uuid,
 ) -> Result<ProviderProfileView, ServiceError> {
     let profile = state
@@ -5144,39 +5661,64 @@ async fn refresh_provider(
         .get(&id)
         .cloned()
         .ok_or(ServiceError::NotFound)?;
+    if matches!(profile.kind, ProviderKindView::NativeOs) {
+        let availability =
+            crate::state::native_tts_availability_for_profile(&profile, &state.config);
+        if !availability.available {
+            let mut updated = profile;
+            updated.status = ProviderStatusView::Unconfigured;
+            updated.last_error = availability.detail;
+            state
+                .catalog
+                .write()
+                .await
+                .providers
+                .insert(id, updated.clone());
+            return Ok(updated);
+        }
+    }
+    if let Err(error) =
+        validate_provider_model_compatibility(&profile.kind, profile.role, profile.model.as_deref())
+    {
+        let mut updated = profile;
+        updated.status = ProviderStatusView::Unconfigured;
+        updated.last_error = Some(error.to_string());
+        state
+            .catalog
+            .write()
+            .await
+            .providers
+            .insert(id, updated.clone());
+        return Ok(updated);
+    }
     let runtime_id = audiobookai_providers::ProviderId::new(id.to_string())
         .map_err(|error| ServiceError::Internal(error.to_string()))?;
-    let health = if profile
-        .capabilities
-        .as_ref()
-        .is_some_and(|capabilities| capabilities.tts)
-        || matches!(
-            profile.kind,
-            ProviderKindView::Elevenlabs
-                | ProviderKindView::MlxAudio
-                | ProviderKindView::Localai
-                | ProviderKindView::AlltalkV2
-                | ProviderKindView::NativeOs
-                | ProviderKindView::OpenaiTts
-        ) {
-        state
-            .providers
-            .tts(&runtime_id)
-            .await
-            .map_err(|error| ServiceError::Conflict(error.to_string()))?
-            .health()
-            .await
-    } else {
-        state
-            .providers
-            .character(&runtime_id)
-            .await
-            .map_err(|error| ServiceError::Conflict(error.to_string()))?
-            .health()
-            .await
+    let health = match profile.role {
+        ProviderRoleView::Tts => {
+            state
+                .providers
+                .tts(&runtime_id)
+                .await
+                .map_err(|error| ServiceError::Conflict(error.to_string()))?
+                .health()
+                .await
+        }
+        ProviderRoleView::Llm => {
+            state
+                .providers
+                .character(&runtime_id)
+                .await
+                .map_err(|error| ServiceError::Conflict(error.to_string()))?
+                .health()
+                .await
+        }
     };
     let mut updated = profile;
-    updated.capabilities = Some(default_capabilities(&updated.kind, updated.mode));
+    updated.capabilities = Some(default_capabilities(
+        &updated.kind,
+        updated.role,
+        updated.mode,
+    ));
     updated.capability_source = Some(
         if health.is_ok() {
             "built_in_adapter_contract+health_probe"
@@ -5201,15 +5743,20 @@ async fn refresh_provider(
         }
     }
 
-    if updated
-        .capabilities
-        .as_ref()
-        .is_some_and(|capabilities| capabilities.tts)
+    if matches!(updated.role, ProviderRoleView::Tts)
         && matches!(updated.status, ProviderStatusView::Online)
         && let Ok(voices) = state.providers.discover_voices(&runtime_id).await
     {
+        let selected_piper_model = matches!(updated.kind, ProviderKindView::Piper)
+            .then(|| updated.model.clone())
+            .flatten();
         let mapped = voices
             .into_iter()
+            .filter(|voice| {
+                selected_piper_model
+                    .as_deref()
+                    .is_none_or(|selected| voice.id == selected)
+            })
             .map(|voice| {
                 let voice_id = stable_voice_id(id, &voice.id);
                 (
@@ -5556,15 +6103,16 @@ async fn voice_auditions(
                             "an audition voice does not belong to its provider".to_owned(),
                         )
                     })?;
-                if catalog
+                let source_id = catalog
                     .voice_sources
                     .get(&candidate.voice_id)
-                    .is_none_or(|source| source.trim().is_empty())
-                {
-                    return Err(ServiceError::Conflict(
-                        "an audition voice has no usable provider source".to_owned(),
-                    ));
-                }
+                    .filter(|source| !source.trim().is_empty())
+                    .ok_or_else(|| {
+                        ServiceError::Conflict(
+                            "an audition voice has no usable provider source".to_owned(),
+                        )
+                    })?;
+                validate_piper_voice_selection(provider, source_id, candidate.model.as_deref())?;
                 validate_voice_direction(
                     &candidate.performance,
                     &audiobookai_core::TimingSettings::default(),
@@ -6498,7 +7046,36 @@ pub(crate) async fn persist_provider(
         ReasoningCapability, SettingsMap, SourceProvenance, TemperatureCapability, TtsCapabilities,
         VoiceCloneCapabilities,
     };
-    validate_provider_model(profile.model.as_deref())?;
+    validate_provider_model_compatibility(&profile.kind, profile.role, profile.model.as_deref())?;
+    if matches!(profile.kind, ProviderKindView::Piper) && profile.model.is_none() {
+        return Err(ServiceError::InvalidRequest(
+            "a verified installed Piper voice must be selected".to_owned(),
+        ));
+    }
+    if matches!(profile.kind, ProviderKindView::Piper) {
+        let management = state.piper.view().await;
+        if piper_uninstall_in_progress(management.active_operation.as_ref()) {
+            return Err(ServiceError::Conflict(
+                "Piper is being uninstalled; wait for the operation to finish before saving a Piper connection"
+                    .to_owned(),
+            ));
+        }
+        if !management.installed {
+            return Err(ServiceError::InvalidRequest(
+                "install the managed Piper runtime before creating a Piper connection".to_owned(),
+            ));
+        }
+        if let Some(model) = profile.model.as_deref()
+            && !management
+                .installed_voices
+                .iter()
+                .any(|voice| voice.id == model)
+        {
+            return Err(ServiceError::InvalidRequest(
+                "the selected Piper voice is not installed and verified".to_owned(),
+            ));
+        }
+    }
     let provider_id = ProviderProfileId::from_uuid(profile.id);
     let existing = state
         .database
@@ -6512,6 +7089,7 @@ pub(crate) async fn persist_provider(
         ProviderKindView::MlxAudio => ProviderFamily::MlxAudio,
         ProviderKindView::Localai => ProviderFamily::LocalAi,
         ProviderKindView::AlltalkV2 => ProviderFamily::AllTalkV2,
+        ProviderKindView::Piper => ProviderFamily::Piper,
         ProviderKindView::NativeOs => match std::env::consts::OS {
             "windows" => ProviderFamily::NativeWindows,
             "macos" => ProviderFamily::NativeMacos,
@@ -6527,25 +7105,9 @@ pub(crate) async fn persist_provider(
         ProviderKindView::LmStudio => ProviderFamily::LmStudio,
         ProviderKindView::Ollama => ProviderFamily::Ollama,
     };
-    let role = if profile
-        .capabilities
-        .as_ref()
-        .is_some_and(|caps| caps.tts && caps.character_detection)
-    {
-        ProviderRole::Both
-    } else if profile.capabilities.as_ref().is_some_and(|caps| caps.tts)
-        || matches!(
-            profile.kind,
-            ProviderKindView::Elevenlabs
-                | ProviderKindView::MlxAudio
-                | ProviderKindView::AlltalkV2
-                | ProviderKindView::NativeOs
-                | ProviderKindView::OpenaiTts
-        )
-    {
-        ProviderRole::Tts
-    } else {
-        ProviderRole::CharacterDetection
+    let role = match profile.role {
+        ProviderRoleView::Tts => ProviderRole::Tts,
+        ProviderRoleView::Llm => ProviderRole::CharacterDetection,
     };
     let deployment = match profile.mode {
         ProviderModeView::CloudRemote => ProviderDeployment::CloudRemote,
@@ -6558,7 +7120,7 @@ pub(crate) async fn persist_provider(
     if let Some(model) = &profile.model {
         settings.insert("model".to_owned(), serde_json::Value::String(model.clone()));
     }
-    let capability_snapshot = profile.capabilities.as_ref().map(|capabilities| {
+    let mut capability_snapshot = profile.capabilities.as_ref().map(|capabilities| {
         let observed_at = profile.capability_updated_at.unwrap_or(now);
         let reasoning = ReasoningCapability {
             disable: capabilities
@@ -6580,6 +7142,10 @@ pub(crate) async fn persist_provider(
         let mut fingerprint = blake3::Hasher::new();
         fingerprint.update(profile.endpoint.as_deref().unwrap_or("native").as_bytes());
         fingerprint.update(profile.model.as_deref().unwrap_or("default").as_bytes());
+        fingerprint.update(match profile.role {
+            ProviderRoleView::Tts => b"tts",
+            ProviderRoleView::Llm => b"llm",
+        });
         CapabilitySnapshot {
             id: CapabilitySnapshotId::new(),
             provider_profile_id: provider_id,
@@ -6609,16 +7175,27 @@ pub(crate) async fn persist_provider(
                         ProviderKindView::Elevenlabs => {
                             vec![ProviderAudioFormat::PcmS16Le, ProviderAudioFormat::Mp3]
                         }
-                        ProviderKindView::MlxAudio
-                        | ProviderKindView::Localai
-                        | ProviderKindView::OpenaiTts => vec![
+                        ProviderKindView::MlxAudio | ProviderKindView::Localai => vec![
                             ProviderAudioFormat::PcmS16Le,
                             ProviderAudioFormat::Wav,
                             ProviderAudioFormat::Mp3,
                             ProviderAudioFormat::Flac,
                             ProviderAudioFormat::Aac,
                         ],
-                        ProviderKindView::AlltalkV2 | ProviderKindView::NativeOs => {
+                        ProviderKindView::Openai | ProviderKindView::OpenaiTts
+                            if matches!(profile.role, ProviderRoleView::Tts) =>
+                        {
+                            vec![
+                                ProviderAudioFormat::PcmS16Le,
+                                ProviderAudioFormat::Wav,
+                                ProviderAudioFormat::Mp3,
+                                ProviderAudioFormat::Flac,
+                                ProviderAudioFormat::Aac,
+                            ]
+                        }
+                        ProviderKindView::AlltalkV2
+                        | ProviderKindView::Piper
+                        | ProviderKindView::NativeOs => {
                             vec![ProviderAudioFormat::Wav]
                         }
                         _ => Vec::new(),
@@ -6626,8 +7203,11 @@ pub(crate) async fn persist_provider(
                     reports_character_usage: matches!(profile.kind, ProviderKindView::Elevenlabs),
                     reports_audio_seconds: false,
                     reports_cost: false,
-                    max_input_characters: matches!(profile.kind, ProviderKindView::OpenaiTts)
-                        .then_some(4096),
+                    max_input_characters: (matches!(
+                        profile.kind,
+                        ProviderKindView::Openai | ProviderKindView::OpenaiTts
+                    ) && matches!(profile.role, ProviderRoleView::Tts))
+                    .then_some(4096),
                     model_performance: capabilities.model_performance.clone(),
                 }),
                 character_detection: capabilities.character_detection.then_some({
@@ -6682,6 +7262,28 @@ pub(crate) async fn persist_provider(
             expires_at: Some(observed_at + ChronoDuration::hours(24)),
         }
     });
+    // Snapshot identity represents the dispatch contract, not the time of the latest health
+    // observation. Reuse it when routing, credentials, model, and effective capabilities are
+    // unchanged so a startup/connection check cannot invalidate already admitted durable work.
+    if let (Some(snapshot), Some(existing_profile)) =
+        (capability_snapshot.as_mut(), existing.as_ref())
+        && let Some(existing_snapshot) = existing_profile.capability_snapshot.as_ref()
+        && existing_profile.family == family
+        && existing_profile.role == role
+        && existing_profile.deployment == deployment
+        && existing_profile.endpoint == profile.endpoint
+        && existing_profile.executable_path == profile.executable_path
+        && existing_profile.working_directory == profile.working_directory
+        && existing_profile.arguments == profile.arguments
+        && existing_profile.credential_secret_id == secret_id
+        && existing_profile.settings.0 == settings
+        && existing_snapshot.model == snapshot.model
+        && existing_snapshot.provider_version == snapshot.provider_version
+        && existing_snapshot.endpoint_fingerprint == snapshot.endpoint_fingerprint
+        && existing_snapshot.capabilities == snapshot.capabilities
+    {
+        snapshot.id = existing_snapshot.id;
+    }
     let domain = ProviderProfile {
         id: provider_id,
         name: profile.name.clone(),
@@ -7869,17 +8471,79 @@ fn validate_optional_provider_value(field: &str, value: Option<&str>) -> Result<
 
 fn validate_provider_sensitive_fields(
     kind: &ProviderKindView,
+    role: ProviderRoleView,
     mode: ProviderModeView,
     model: Option<&str>,
     has_credential: bool,
 ) -> Result<(), ServiceError> {
-    validate_provider_model(model)?;
+    validate_provider_model_compatibility(kind, role, model)?;
     if has_credential && is_native_provider(kind, mode) {
         return Err(ServiceError::InvalidRequest(
             "native provider profiles must not be configured with credentials".to_owned(),
         ));
     }
+    validate_provider_deployment(kind, mode)?;
     Ok(())
+}
+
+/// `openai_tts` is retained only as a wire-compatible legacy input. New and edited profiles use
+/// the single dual-role `OpenAI` kind, with `role` selecting the speech or Responses adapter.
+fn canonical_provider_kind(kind: ProviderKindView) -> ProviderKindView {
+    if matches!(kind, ProviderKindView::OpenaiTts) {
+        ProviderKindView::Openai
+    } else {
+        kind
+    }
+}
+
+fn validate_provider_deployment(
+    kind: &ProviderKindView,
+    mode: ProviderModeView,
+) -> Result<(), ServiceError> {
+    let native_kind = matches!(kind, ProviderKindView::NativeOs | ProviderKindView::Piper);
+    if native_kind != matches!(mode, ProviderModeView::Native) {
+        return Err(ServiceError::InvalidRequest(
+            "native provider kinds and the native connection type must be selected together"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_provider_role(
+    kind: &ProviderKindView,
+    role: ProviderRoleView,
+) -> Result<(), ServiceError> {
+    let supported = match role {
+        ProviderRoleView::Tts => matches!(
+            kind,
+            ProviderKindView::Elevenlabs
+                | ProviderKindView::MlxAudio
+                | ProviderKindView::Localai
+                | ProviderKindView::AlltalkV2
+                | ProviderKindView::Piper
+                | ProviderKindView::NativeOs
+                | ProviderKindView::OpenaiTts
+                | ProviderKindView::Openai
+        ),
+        ProviderRoleView::Llm => matches!(
+            kind,
+            ProviderKindView::Openai
+                | ProviderKindView::OpenaiCompatible
+                | ProviderKindView::Anthropic
+                | ProviderKindView::Gemini
+                | ProviderKindView::Qwen
+                | ProviderKindView::Kimi
+                | ProviderKindView::Moonshot
+                | ProviderKindView::LmStudio
+                | ProviderKindView::Ollama
+        ),
+    };
+    supported.then_some(()).ok_or_else(|| {
+        ServiceError::InvalidRequest(
+            "the selected provider does not support this TTS/LLM role".to_owned(),
+        )
+    })
 }
 
 fn validate_provider_model(model: Option<&str>) -> Result<(), ServiceError> {
@@ -7893,35 +8557,64 @@ fn validate_provider_model(model: Option<&str>) -> Result<(), ServiceError> {
     Ok(())
 }
 
+fn validate_provider_model_compatibility(
+    kind: &ProviderKindView,
+    role: ProviderRoleView,
+    model: Option<&str>,
+) -> Result<(), ServiceError> {
+    validate_provider_model(model)?;
+    validate_provider_role(kind, role)?;
+    let Some(model) = model else {
+        return Ok(());
+    };
+    if provider_model_catalog_is_strict(kind, role)
+        && !provider_model_is_compatible(kind, role, model)
+    {
+        return Err(ServiceError::InvalidRequest(
+            "the selected model is not verified as compatible with this provider role".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn provider_model_catalog_is_strict(kind: &ProviderKindView, role: ProviderRoleView) -> bool {
+    matches!(
+        (kind, role),
+        (
+            ProviderKindView::Openai | ProviderKindView::OpenaiTts | ProviderKindView::Piper,
+            ProviderRoleView::Tts
+        ) | (ProviderKindView::Openai, ProviderRoleView::Llm)
+    )
+}
+
+fn provider_model_is_compatible(
+    kind: &ProviderKindView,
+    role: ProviderRoleView,
+    model: &str,
+) -> bool {
+    match (kind, role) {
+        (ProviderKindView::Openai | ProviderKindView::OpenaiTts, ProviderRoleView::Tts) => {
+            audiobookai_providers::adapters::is_openai_tts_model_id(model)
+        }
+        (ProviderKindView::Openai, ProviderRoleView::Llm) => {
+            audiobookai_providers::adapters::is_openai_responses_model_id(model)
+        }
+        _ => true,
+    }
+}
+
 fn is_native_provider(kind: &ProviderKindView, mode: ProviderModeView) -> bool {
-    matches!(kind, ProviderKindView::NativeOs) || matches!(mode, ProviderModeView::Native)
+    matches!(kind, ProviderKindView::NativeOs | ProviderKindView::Piper)
+        || matches!(mode, ProviderModeView::Native)
 }
 
 fn default_capabilities(
     kind: &ProviderKindView,
+    role: ProviderRoleView,
     mode: ProviderModeView,
 ) -> ProviderCapabilitiesView {
-    let tts = matches!(
-        kind,
-        ProviderKindView::Elevenlabs
-            | ProviderKindView::MlxAudio
-            | ProviderKindView::Localai
-            | ProviderKindView::AlltalkV2
-            | ProviderKindView::NativeOs
-            | ProviderKindView::OpenaiTts
-    );
-    let character_detection = matches!(
-        kind,
-        ProviderKindView::Openai
-            | ProviderKindView::OpenaiCompatible
-            | ProviderKindView::Anthropic
-            | ProviderKindView::Gemini
-            | ProviderKindView::Qwen
-            | ProviderKindView::Kimi
-            | ProviderKindView::Moonshot
-            | ProviderKindView::LmStudio
-            | ProviderKindView::Ollama
-    );
+    let tts = matches!(role, ProviderRoleView::Tts);
+    let character_detection = matches!(role, ProviderRoleView::Llm);
     let provider_model_library = matches!(
         kind,
         ProviderKindView::LmStudio | ProviderKindView::Ollama | ProviderKindView::Localai
@@ -7933,15 +8626,17 @@ fn default_capabilities(
     ProviderCapabilitiesView {
         tts,
         character_detection,
-        streaming: matches!(
-            kind,
-            ProviderKindView::Elevenlabs
-                | ProviderKindView::MlxAudio
-                | ProviderKindView::Localai
-                | ProviderKindView::OpenaiTts
-        ),
-        voice_cloning: matches!(kind, ProviderKindView::Elevenlabs),
-        pronunciation: matches!(kind, ProviderKindView::Elevenlabs),
+        streaming: tts
+            && matches!(
+                kind,
+                ProviderKindView::Elevenlabs
+                    | ProviderKindView::MlxAudio
+                    | ProviderKindView::Localai
+                    | ProviderKindView::OpenaiTts
+                    | ProviderKindView::Openai
+            ),
+        voice_cloning: tts && matches!(kind, ProviderKindView::Elevenlabs),
+        pronunciation: tts && matches!(kind, ProviderKindView::Elevenlabs),
         process_control: matches!(mode, ProviderModeView::ManagedChild),
         model_control: provider_model_library,
         model_list: provider_model_library,
@@ -7954,49 +8649,60 @@ fn default_capabilities(
         // The current provider trait's default switch operation is only an alias for load. Do
         // not advertise a true atomic switch until an adapter implements that contract.
         model_switch: false,
-        temperature: match kind {
-            ProviderKindView::Openai => "nullable",
-            ProviderKindView::OpenaiCompatible
-            | ProviderKindView::Anthropic
-            | ProviderKindView::Gemini
-            | ProviderKindView::Qwen
-            | ProviderKindView::Kimi
-            | ProviderKindView::Moonshot
-            | ProviderKindView::LmStudio
-            | ProviderKindView::Ollama => "number",
-            _ => "unsupported",
+        temperature: if character_detection {
+            match kind {
+                ProviderKindView::Openai => "nullable",
+                ProviderKindView::OpenaiCompatible
+                | ProviderKindView::Anthropic
+                | ProviderKindView::Gemini
+                | ProviderKindView::Qwen
+                | ProviderKindView::Kimi
+                | ProviderKindView::Moonshot
+                | ProviderKindView::LmStudio
+                | ProviderKindView::Ollama => "number",
+                _ => "unsupported",
+            }
+        } else {
+            "unsupported"
         }
         .to_owned(),
-        reasoning: match kind {
-            ProviderKindView::Openai | ProviderKindView::Ollama => {
-                vec!["disabled".to_owned(), "effort".to_owned()]
+        reasoning: if character_detection {
+            match kind {
+                ProviderKindView::Openai | ProviderKindView::Ollama => {
+                    vec!["disabled".to_owned(), "effort".to_owned()]
+                }
+                ProviderKindView::Anthropic => vec![
+                    "disabled".to_owned(),
+                    "adaptive".to_owned(),
+                    "token_budget".to_owned(),
+                ],
+                ProviderKindView::Gemini => {
+                    vec!["disabled".to_owned(), "token_budget".to_owned()]
+                }
+                ProviderKindView::Qwen | ProviderKindView::Kimi => {
+                    vec!["disabled".to_owned()]
+                }
+                _ => Vec::new(),
             }
-            ProviderKindView::Anthropic => vec![
-                "disabled".to_owned(),
-                "adaptive".to_owned(),
-                "token_budget".to_owned(),
-            ],
-            ProviderKindView::Gemini => {
-                vec!["disabled".to_owned(), "token_budget".to_owned()]
-            }
-            ProviderKindView::Qwen | ProviderKindView::Kimi => {
-                vec!["disabled".to_owned()]
-            }
-            _ => Vec::new(),
+        } else {
+            Vec::new()
         },
         max_concurrency: Some(1),
-        model_performance: default_model_performance(kind),
+        model_performance: default_model_performance(kind, role),
     }
 }
 
 fn default_model_performance(
     kind: &ProviderKindView,
+    role: ProviderRoleView,
 ) -> Vec<audiobookai_core::ModelPerformanceCapabilities> {
     use audiobookai_core::{
         ModelPerformanceCapabilities, PerformanceCapabilities, PerformanceRange,
     };
 
-    if matches!(kind, ProviderKindView::OpenaiTts) {
+    if matches!(role, ProviderRoleView::Tts)
+        && matches!(kind, ProviderKindView::Openai | ProviderKindView::OpenaiTts)
+    {
         return audiobookai_providers::adapters::openai_tts_model_performance_capabilities();
     }
     if !matches!(kind, ProviderKindView::Elevenlabs) {
@@ -8033,7 +8739,8 @@ pub(crate) fn provider_capabilities_are_fresh(profile: &ProviderProfileView) -> 
 pub(crate) fn validate_billable_tts_provider_readiness(
     profile: &ProviderProfileView,
 ) -> Result<(), ServiceError> {
-    if !provider_capabilities_are_fresh(profile)
+    if !matches!(profile.role, ProviderRoleView::Tts)
+        || !provider_capabilities_are_fresh(profile)
         || !profile
             .capabilities
             .as_ref()
@@ -8170,6 +8877,7 @@ mod tests {
             id: Uuid::new_v4(),
             name: "TTS fixture".to_owned(),
             kind: ProviderKindView::Localai,
+            role: ProviderRoleView::Tts,
             mode: ProviderModeView::ExternalEndpoint,
             endpoint: Some("http://127.0.0.1:8080".to_owned()),
             executable_path: None,
@@ -8180,6 +8888,7 @@ mod tests {
             credential_configured: false,
             capabilities: Some(default_capabilities(
                 &ProviderKindView::Localai,
+                ProviderRoleView::Tts,
                 ProviderModeView::ExternalEndpoint,
             )),
             capability_source: Some("test".to_owned()),
@@ -8206,6 +8915,483 @@ mod tests {
         assert!(validate_billable_tts_provider_readiness(&cloud).is_err());
         cloud.credential_configured = true;
         validate_billable_tts_provider_readiness(&cloud).expect("configured cloud provider");
+    }
+
+    #[test]
+    fn piper_assignment_is_scoped_to_the_connections_exact_model() {
+        let mut provider = billable_tts_provider_fixture();
+        provider.kind = ProviderKindView::Piper;
+        provider.mode = ProviderModeView::Native;
+        provider.model = Some("de_DE-thorsten-medium".to_owned());
+
+        validate_piper_voice_selection(&provider, "de_DE-thorsten-medium", None)
+            .expect("the connection's selected voice");
+        validate_piper_voice_selection(
+            &provider,
+            "de_DE-thorsten-medium",
+            Some("de_DE-thorsten-medium"),
+        )
+        .expect("matching explicit model");
+        assert!(
+            validate_piper_voice_selection(&provider, "planted-voice", None).is_err(),
+            "an unrelated voice directory must never enter this connection"
+        );
+        assert!(
+            validate_piper_voice_selection(
+                &provider,
+                "de_DE-thorsten-medium",
+                Some("other-model"),
+            )
+            .is_err(),
+            "an assignment cannot override the connection model"
+        );
+    }
+
+    #[test]
+    fn piper_uninstall_detection_only_matches_the_active_uninstall_operation() {
+        use crate::piper_management::{
+            PiperOperationKind, PiperOperationState, PiperOperationView,
+        };
+
+        let mut operation = PiperOperationView {
+            id: Uuid::new_v4(),
+            kind: PiperOperationKind::Uninstall,
+            state: PiperOperationState::Running,
+            progress_percent: 0,
+            phase: "preparing".to_owned(),
+            message: "Preparing Piper uninstall".to_owned(),
+            voice_id: None,
+            bytes_downloaded: None,
+            bytes_total: None,
+            started_at: Utc::now(),
+            finished_at: None,
+        };
+        assert!(piper_uninstall_in_progress(Some(&operation)));
+
+        operation.kind = PiperOperationKind::Install;
+        assert!(!piper_uninstall_in_progress(Some(&operation)));
+        assert!(!piper_uninstall_in_progress(None));
+    }
+
+    #[tokio::test]
+    async fn health_observation_preserves_an_unchanged_dispatch_snapshot_identity() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let database = audiobookai_storage::Database::open_in(directory.path())
+            .await
+            .expect("database");
+        let state = AppState::new(
+            crate::ServiceConfig {
+                bind: "127.0.0.1:0".parse().expect("address"),
+                data_dir: directory.path().to_path_buf(),
+                bundled_sidecar_dir: None,
+                tls: None,
+                lan_hostnames: Vec::new(),
+                allow_insecure_lan: false,
+                desktop_bootstrap: false,
+            },
+            database,
+        )
+        .await
+        .expect("state");
+        let mut profile = ProviderProfileView {
+            id: Uuid::new_v4(),
+            name: "Local LLM".to_owned(),
+            kind: ProviderKindView::OpenaiCompatible,
+            role: ProviderRoleView::Llm,
+            mode: ProviderModeView::ExternalEndpoint,
+            endpoint: Some("http://127.0.0.1:1234/".to_owned()),
+            executable_path: None,
+            working_directory: None,
+            arguments: Vec::new(),
+            status: ProviderStatusView::Offline,
+            model: Some("local-model".to_owned()),
+            credential_configured: false,
+            capabilities: Some(default_capabilities(
+                &ProviderKindView::OpenaiCompatible,
+                ProviderRoleView::Llm,
+                ProviderModeView::ExternalEndpoint,
+            )),
+            capability_source: Some("adapter-contract".to_owned()),
+            capability_updated_at: Some(Utc::now()),
+            last_error: None,
+        };
+        persist_provider(&state, &profile, None)
+            .await
+            .expect("initial snapshot");
+        let first = state
+            .database
+            .repositories()
+            .providers
+            .get(audiobookai_core::ProviderProfileId::from_uuid(profile.id))
+            .await
+            .expect("read provider")
+            .and_then(|stored| stored.capability_snapshot)
+            .expect("initial capability snapshot");
+
+        profile.status = ProviderStatusView::Online;
+        profile.capability_source = Some("adapter-contract+health-probe".to_owned());
+        profile.capability_updated_at = Some(Utc::now() + ChronoDuration::minutes(1));
+        persist_provider(&state, &profile, None)
+            .await
+            .expect("health observation");
+        let observed = state
+            .database
+            .repositories()
+            .providers
+            .get(audiobookai_core::ProviderProfileId::from_uuid(profile.id))
+            .await
+            .expect("read observed provider")
+            .and_then(|stored| stored.capability_snapshot)
+            .expect("observed capability snapshot");
+        assert_eq!(observed.id, first.id);
+        assert!(observed.observed_at > first.observed_at);
+
+        profile.model = Some("different-model".to_owned());
+        persist_provider(&state, &profile, None)
+            .await
+            .expect("changed dispatch contract");
+        let changed = state
+            .database
+            .repositories()
+            .providers
+            .get(audiobookai_core::ProviderProfileId::from_uuid(profile.id))
+            .await
+            .expect("read changed provider")
+            .and_then(|stored| stored.capability_snapshot)
+            .expect("changed capability snapshot");
+        assert_ne!(changed.id, first.id);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn unavailable_native_provider_creation_is_rejected_before_persistence() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let database = audiobookai_storage::Database::open_in(directory.path())
+            .await
+            .expect("database");
+        let state = Arc::new(
+            AppState::new(
+                crate::ServiceConfig {
+                    bind: "127.0.0.1:0".parse().expect("address"),
+                    data_dir: directory.path().to_path_buf(),
+                    bundled_sidecar_dir: Some(directory.path().join("missing-sidecars/bin")),
+                    tls: None,
+                    lan_hostnames: Vec::new(),
+                    allow_insecure_lan: false,
+                    desktop_bootstrap: false,
+                },
+                database.clone(),
+            )
+            .await
+            .expect("state"),
+        );
+
+        let error = create_provider(
+            State(state),
+            Json(ProviderProfileInput {
+                name: Some("Native system voices".to_owned()),
+                kind: Some(ProviderKindView::NativeOs),
+                role: Some(ProviderRoleView::Tts),
+                mode: Some(ProviderModeView::Native),
+                endpoint: None,
+                executable_path: None,
+                working_directory: None,
+                arguments: None,
+                model: None,
+                credential: None,
+            }),
+        )
+        .await
+        .expect_err("missing packaged eSpeak must reject creation");
+        let detail = error.to_string();
+        assert!(detail.contains("eSpeak NG"));
+        assert!(detail.contains("Piper"));
+        assert!(
+            database
+                .repositories()
+                .providers
+                .list(false)
+                .await
+                .expect("list providers")
+                .is_empty(),
+            "failed creation must not leave a provider or tombstone row"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn native_availability_endpoint_reports_typed_setup_guidance() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let database = audiobookai_storage::Database::open_in(directory.path())
+            .await
+            .expect("database");
+        let state = Arc::new(
+            AppState::new(
+                crate::ServiceConfig {
+                    bind: "127.0.0.1:0".parse().expect("address"),
+                    data_dir: directory.path().to_path_buf(),
+                    bundled_sidecar_dir: Some(directory.path().join("missing-sidecars/bin")),
+                    tls: None,
+                    lan_hostnames: Vec::new(),
+                    allow_insecure_lan: false,
+                    desktop_bootstrap: false,
+                },
+                database,
+            )
+            .await
+            .expect("state"),
+        );
+
+        let response = native_provider_availability(State(state)).await;
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL),
+            Some(&http::HeaderValue::from_static("no-store"))
+        );
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("availability response body");
+        let wire: serde_json::Value = serde_json::from_slice(&body).expect("availability JSON");
+        assert_eq!(
+            wire.get("platform").and_then(serde_json::Value::as_str),
+            Some("linux")
+        );
+        assert_eq!(
+            wire.get("providerName").and_then(serde_json::Value::as_str),
+            Some("eSpeak NG")
+        );
+        assert_eq!(
+            wire.get("available").and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert!(
+            wire.get("detail")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| value.contains("Piper"))
+        );
+        assert!(wire.get("executable").is_none());
+    }
+
+    #[tokio::test]
+    async fn provider_deletion_removes_its_unassigned_discovered_voice_rows() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let database = audiobookai_storage::Database::open_in(directory.path())
+            .await
+            .expect("database");
+        let state = Arc::new(
+            AppState::new(
+                crate::ServiceConfig {
+                    bind: "127.0.0.1:0".parse().expect("address"),
+                    data_dir: directory.path().to_path_buf(),
+                    bundled_sidecar_dir: None,
+                    tls: None,
+                    lan_hostnames: Vec::new(),
+                    allow_insecure_lan: false,
+                    desktop_bootstrap: false,
+                },
+                database,
+            )
+            .await
+            .expect("state"),
+        );
+        let profile = billable_tts_provider_fixture();
+        persist_provider(&state, &profile, None)
+            .await
+            .expect("persist provider");
+        state
+            .catalog
+            .write()
+            .await
+            .providers
+            .insert(profile.id, profile.clone());
+        let voice_id = stable_voice_id(profile.id, "fixture-voice");
+        let voice = VoiceView {
+            id: voice_id,
+            provider_profile_id: profile.id,
+            name: "Fixture voice".to_owned(),
+            locale: Some("en".to_owned()),
+            gender: None,
+            kind: crate::models::VoiceKindView::Catalog,
+            owned: false,
+            preview_url: None,
+        };
+        persist_discovered_voice(&state, &profile, voice_id, "fixture-voice", &voice)
+            .await
+            .expect("persist discovered voice");
+        let budget = BudgetView {
+            id: Uuid::new_v4(),
+            name: "Provider budget".to_owned(),
+            provider_profile_id: Some(profile.id),
+            period: crate::models::BudgetPeriodView::Lifetime,
+            metric: crate::models::BudgetMetricView::Characters,
+            limit: 10_000,
+            used: 0,
+            reserved: 0,
+            hard: true,
+            currency: None,
+            warning_percent: 80,
+        };
+        persist_budget(&state, &budget)
+            .await
+            .expect("persist provider budget");
+        state
+            .catalog
+            .write()
+            .await
+            .budgets
+            .insert(budget.id, budget.clone());
+
+        let response = delete_provider(State(Arc::clone(&state)), Path(profile.id))
+            .await
+            .expect("delete provider with unassigned catalog voice");
+        assert_eq!(response, StatusCode::NO_CONTENT);
+        let tombstone = state
+            .database
+            .repositories()
+            .providers
+            .get(audiobookai_core::ProviderProfileId::from_uuid(profile.id))
+            .await
+            .expect("read deleted provider")
+            .expect("audit tombstone");
+        assert!(!tombstone.enabled);
+        assert!(tombstone.credential_secret_id.is_none());
+        assert!(tombstone.capability_snapshot.is_none());
+        let remaining = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM voice_profiles WHERE provider_id = ?",
+        )
+        .bind(profile.id.to_string())
+        .fetch_one(state.database.pool())
+        .await
+        .expect("count voice rows");
+        assert_eq!(remaining, 0);
+        assert!(
+            !state.catalog.read().await.budgets.contains_key(&budget.id),
+            "the disabled provider budget must not remain visible in the live catalog"
+        );
+        let budget_enabled =
+            sqlx::query_scalar::<_, i64>("SELECT enabled FROM budgets WHERE id = ?")
+                .bind(budget.id.to_string())
+                .fetch_one(state.database.pool())
+                .await
+                .expect("read disabled provider budget");
+        assert_eq!(budget_enabled, 0);
+    }
+
+    async fn ensure_existing_native_fixture(state: &Arc<AppState>) -> ProviderProfileView {
+        let canonical_id = Uuid::parse_str(match std::env::consts::OS {
+            "macos" => "9f85e64a-f687-4e86-8b6c-fc71938249eb",
+            "windows" => "5dd70ee1-eb54-430e-bb3b-e4bb31d7ee91",
+            _ => "e76afdb2-3458-46cb-874b-1c242d1336d9",
+        })
+        .expect("canonical native provider UUID");
+        if let Some(profile) = state
+            .catalog
+            .read()
+            .await
+            .providers
+            .get(&canonical_id)
+            .cloned()
+        {
+            return profile;
+        }
+        let profile = ProviderProfileView {
+            id: canonical_id,
+            name: "Native system voices".to_owned(),
+            kind: ProviderKindView::NativeOs,
+            role: ProviderRoleView::Tts,
+            mode: ProviderModeView::Native,
+            endpoint: None,
+            executable_path: None,
+            working_directory: None,
+            arguments: Vec::new(),
+            status: ProviderStatusView::Unconfigured,
+            model: None,
+            credential_configured: true,
+            capabilities: Some(default_capabilities(
+                &ProviderKindView::NativeOs,
+                ProviderRoleView::Tts,
+                ProviderModeView::Native,
+            )),
+            capability_source: Some("test".to_owned()),
+            capability_updated_at: Some(Utc::now()),
+            last_error: Some("setup required".to_owned()),
+        };
+        persist_provider(state, &profile, None)
+            .await
+            .expect("persist unavailable existing native profile");
+        state
+            .catalog
+            .write()
+            .await
+            .providers
+            .insert(profile.id, profile.clone());
+        profile
+    }
+
+    #[tokio::test]
+    async fn native_provider_and_legacy_duplicates_can_be_removed_without_respawning() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let database = audiobookai_storage::Database::open_in(directory.path())
+            .await
+            .expect("database");
+        let config = crate::ServiceConfig {
+            bind: "127.0.0.1:0".parse().expect("address"),
+            data_dir: directory.path().to_path_buf(),
+            bundled_sidecar_dir: None,
+            tls: None,
+            lan_hostnames: Vec::new(),
+            allow_insecure_lan: false,
+            desktop_bootstrap: false,
+        };
+        let state = Arc::new(
+            AppState::new(config.clone(), database.clone())
+                .await
+                .expect("state"),
+        );
+        let canonical = ensure_existing_native_fixture(&state).await;
+        let mut legacy_duplicate = canonical.clone();
+        legacy_duplicate.id = Uuid::new_v4();
+        legacy_duplicate.name = "Legacy native duplicate".to_owned();
+        persist_provider(&state, &legacy_duplicate, None)
+            .await
+            .expect("persist legacy duplicate");
+        state
+            .catalog
+            .write()
+            .await
+            .providers
+            .insert(legacy_duplicate.id, legacy_duplicate.clone());
+
+        for id in [canonical.id, legacy_duplicate.id] {
+            let response = delete_provider(State(Arc::clone(&state)), Path(id))
+                .await
+                .expect("delete native profile");
+            assert_eq!(response, StatusCode::NO_CONTENT);
+            let tombstone = state
+                .database
+                .repositories()
+                .providers
+                .get(audiobookai_core::ProviderProfileId::from_uuid(id))
+                .await
+                .expect("read deleted provider")
+                .expect("retained audit tombstone");
+            assert!(!tombstone.enabled);
+            assert!(tombstone.credential_secret_id.is_none());
+        }
+
+        drop(state);
+        let restarted = AppState::new(config, database)
+            .await
+            .expect("restarted state");
+        assert!(
+            restarted
+                .catalog
+                .read()
+                .await
+                .providers
+                .values()
+                .all(|profile| !matches!(profile.kind, ProviderKindView::NativeOs)),
+            "neither the canonical nor legacy native connection may respawn"
+        );
     }
 
     #[test]
@@ -8341,6 +9527,7 @@ mod tests {
             id: provider_id,
             name: "Local fixture".to_owned(),
             kind: ProviderKindView::Localai,
+            role: ProviderRoleView::Tts,
             mode: ProviderModeView::ExternalEndpoint,
             endpoint: Some("http://127.0.0.1:8080".to_owned()),
             executable_path: None,
@@ -8351,6 +9538,7 @@ mod tests {
             credential_configured: false,
             capabilities: Some(default_capabilities(
                 &ProviderKindView::Localai,
+                ProviderRoleView::Tts,
                 ProviderModeView::ExternalEndpoint,
             )),
             capability_source: Some("fixture".to_owned()),
@@ -8443,6 +9631,7 @@ mod tests {
             id: provider_id,
             name: "LocalAI".to_owned(),
             kind: ProviderKindView::Localai,
+            role: ProviderRoleView::Tts,
             mode: ProviderModeView::ExternalEndpoint,
             endpoint: Some("http://127.0.0.1:8080".to_owned()),
             executable_path: None,
@@ -8453,6 +9642,7 @@ mod tests {
             credential_configured: false,
             capabilities: Some(default_capabilities(
                 &ProviderKindView::Localai,
+                ProviderRoleView::Tts,
                 ProviderModeView::ExternalEndpoint,
             )),
             capability_source: Some("test".to_owned()),
@@ -8509,6 +9699,7 @@ mod tests {
             "providerId": provider_id,
             "name": "Local model preview",
             "kind": "ollama",
+            "role": "llm",
             "mode": "external_endpoint",
             "endpoint": "http://127.0.0.1:11434/",
             "model": null
@@ -8517,6 +9708,7 @@ mod tests {
 
         assert_eq!(input.provider_id, Some(provider_id));
         assert!(matches!(input.profile.kind, Some(ProviderKindView::Ollama)));
+        assert_eq!(input.profile.role, Some(ProviderRoleView::Llm));
         assert!(matches!(
             input.profile.endpoint,
             Some(Some(ref endpoint)) if endpoint == "http://127.0.0.1:11434/"
@@ -8637,6 +9829,7 @@ mod tests {
         for model in [prefixed.clone(), jwt, format!("owner/{prefixed}")] {
             let error = validate_provider_sensitive_fields(
                 &ProviderKindView::Ollama,
+                ProviderRoleView::Llm,
                 ProviderModeView::ExternalEndpoint,
                 Some(&model),
                 false,
@@ -8649,6 +9842,7 @@ mod tests {
         assert!(
             validate_provider_sensitive_fields(
                 &ProviderKindView::Ollama,
+                ProviderRoleView::Llm,
                 ProviderModeView::ExternalEndpoint,
                 Some("gemma3:latest"),
                 false,
@@ -8664,13 +9858,15 @@ mod tests {
             ),
             (ProviderKindView::Elevenlabs, ProviderModeView::Native),
         ] {
-            let error = validate_provider_sensitive_fields(&kind, mode, None, true)
-                .expect_err("native credentials must be rejected");
+            let error =
+                validate_provider_sensitive_fields(&kind, ProviderRoleView::Tts, mode, None, true)
+                    .expect_err("native credentials must be rejected");
             assert!(error.to_string().contains("must not be configured"));
         }
         assert!(
             validate_provider_sensitive_fields(
                 &ProviderKindView::NativeOs,
+                ProviderRoleView::Tts,
                 ProviderModeView::Native,
                 None,
                 false,
@@ -8680,9 +9876,234 @@ mod tests {
     }
 
     #[test]
+    fn provider_roles_and_openai_models_are_validated_fail_closed() {
+        assert_eq!(
+            canonical_provider_kind(ProviderKindView::OpenaiTts),
+            ProviderKindView::Openai,
+            "legacy OpenAI Speech input must enter the dual-role provider path"
+        );
+        for role in [ProviderRoleView::Tts, ProviderRoleView::Llm] {
+            validate_provider_role(&ProviderKindView::Openai, role)
+                .expect("OpenAI supports independent TTS and LLM connections");
+        }
+        assert!(
+            validate_provider_role(&ProviderKindView::OpenaiTts, ProviderRoleView::Llm).is_err()
+        );
+        assert!(
+            validate_provider_role(&ProviderKindView::Elevenlabs, ProviderRoleView::Llm).is_err()
+        );
+        assert!(validate_provider_role(&ProviderKindView::Ollama, ProviderRoleView::Tts).is_err());
+
+        validate_provider_model_compatibility(
+            &ProviderKindView::Openai,
+            ProviderRoleView::Tts,
+            Some("tts-1-hd-1106"),
+        )
+        .expect("documented OpenAI speech model");
+        validate_provider_model_compatibility(
+            &ProviderKindView::Openai,
+            ProviderRoleView::Llm,
+            Some("gpt-5.6-luna"),
+        )
+        .expect("documented OpenAI Responses model family");
+
+        for (role, model) in [
+            (ProviderRoleView::Tts, "gpt-5.6-luna"),
+            (ProviderRoleView::Llm, "tts-1-hd-1106"),
+            (ProviderRoleView::Llm, "text-embedding-3-large"),
+            (ProviderRoleView::Llm, "gpt-4o-mini-transcribe"),
+        ] {
+            assert!(
+                validate_provider_model_compatibility(
+                    &ProviderKindView::Openai,
+                    role,
+                    Some(model),
+                )
+                .is_err(),
+                "{model} must not be accepted for {role:?}"
+            );
+        }
+        assert!(provider_model_catalog_is_strict(
+            &ProviderKindView::Openai,
+            ProviderRoleView::Tts
+        ));
+        assert!(provider_model_catalog_is_strict(
+            &ProviderKindView::Openai,
+            ProviderRoleView::Llm
+        ));
+    }
+
+    #[tokio::test]
+    async fn openai_connections_persist_independent_roles_and_models() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let database = audiobookai_storage::Database::open_in(directory.path())
+            .await
+            .expect("database");
+        let state = AppState::new(
+            crate::ServiceConfig {
+                bind: "127.0.0.1:0".parse().expect("address"),
+                data_dir: directory.path().to_path_buf(),
+                bundled_sidecar_dir: None,
+                tls: None,
+                lan_hostnames: Vec::new(),
+                allow_insecure_lan: false,
+                desktop_bootstrap: false,
+            },
+            database,
+        )
+        .await
+        .expect("state");
+        let tts_id = Uuid::new_v4();
+        let llm_id = Uuid::new_v4();
+        for (id, role, model) in [
+            (tts_id, ProviderRoleView::Tts, "tts-1-hd-1106"),
+            (llm_id, ProviderRoleView::Llm, "gpt-5.6-luna"),
+        ] {
+            let profile = ProviderProfileView {
+                id,
+                name: "OpenAI".to_owned(),
+                kind: ProviderKindView::Openai,
+                role,
+                mode: ProviderModeView::CloudRemote,
+                endpoint: Some("https://api.openai.com/".to_owned()),
+                executable_path: None,
+                working_directory: None,
+                arguments: Vec::new(),
+                status: ProviderStatusView::Offline,
+                model: Some(model.to_owned()),
+                credential_configured: false,
+                capabilities: Some(default_capabilities(
+                    &ProviderKindView::Openai,
+                    role,
+                    ProviderModeView::CloudRemote,
+                )),
+                capability_source: Some("test".to_owned()),
+                capability_updated_at: Some(Utc::now()),
+                last_error: None,
+            };
+            persist_provider(&state, &profile, None)
+                .await
+                .expect("persist role-specific OpenAI connection");
+        }
+
+        let tts = state
+            .database
+            .repositories()
+            .providers
+            .get(audiobookai_core::ProviderProfileId::from_uuid(tts_id))
+            .await
+            .expect("read TTS provider")
+            .expect("stored TTS provider");
+        let llm = state
+            .database
+            .repositories()
+            .providers
+            .get(audiobookai_core::ProviderProfileId::from_uuid(llm_id))
+            .await
+            .expect("read LLM provider")
+            .expect("stored LLM provider");
+        assert_eq!(tts.role, audiobookai_core::ProviderRole::Tts);
+        assert_eq!(llm.role, audiobookai_core::ProviderRole::CharacterDetection);
+        assert_eq!(
+            tts.settings
+                .0
+                .get("model")
+                .and_then(serde_json::Value::as_str),
+            Some("tts-1-hd-1106")
+        );
+        assert_eq!(
+            llm.settings
+                .0
+                .get("model")
+                .and_then(serde_json::Value::as_str),
+            Some("gpt-5.6-luna")
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_llm_health_probe_replaces_the_hydrated_offline_status() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("fixture listener");
+        let address = listener.local_addr().expect("fixture address");
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().route(
+                    "/v1/models",
+                    axum::routing::get(|| async { axum::Json(serde_json::json!({ "data": [] })) }),
+                ),
+            )
+            .await
+            .expect("fixture server");
+        });
+        let directory = tempfile::tempdir().expect("tempdir");
+        let database = audiobookai_storage::Database::open_in(directory.path())
+            .await
+            .expect("database");
+        let state = AppState::new(
+            crate::ServiceConfig {
+                bind: "127.0.0.1:0".parse().expect("address"),
+                data_dir: directory.path().to_path_buf(),
+                bundled_sidecar_dir: None,
+                tls: None,
+                lan_hostnames: Vec::new(),
+                allow_insecure_lan: false,
+                desktop_bootstrap: false,
+            },
+            database,
+        )
+        .await
+        .expect("state");
+        let id = Uuid::new_v4();
+        let profile = ProviderProfileView {
+            id,
+            name: "Loopback LLM".to_owned(),
+            kind: ProviderKindView::OpenaiCompatible,
+            role: ProviderRoleView::Llm,
+            mode: ProviderModeView::ExternalEndpoint,
+            endpoint: Some(format!("http://{address}/")),
+            executable_path: None,
+            working_directory: None,
+            arguments: Vec::new(),
+            status: ProviderStatusView::Offline,
+            model: Some("fixture-chat".to_owned()),
+            credential_configured: false,
+            capabilities: Some(default_capabilities(
+                &ProviderKindView::OpenaiCompatible,
+                ProviderRoleView::Llm,
+                ProviderModeView::ExternalEndpoint,
+            )),
+            capability_source: Some("built_in_adapter_contract".to_owned()),
+            capability_updated_at: Some(Utc::now()),
+            last_error: None,
+        };
+        persist_provider(&state, &profile, None)
+            .await
+            .expect("persist provider");
+        state.catalog.write().await.providers.insert(id, profile);
+        state
+            .sync_provider_runtime(id)
+            .await
+            .expect("register runtime");
+
+        let refreshed = refresh_provider(&state, id).await.expect("health refresh");
+
+        assert!(matches!(refreshed.status, ProviderStatusView::Online));
+        assert_eq!(
+            refreshed.capability_source.as_deref(),
+            Some("built_in_adapter_contract+health_probe")
+        );
+        server.abort();
+    }
+
+    #[test]
     fn built_in_capabilities_only_advertise_reachable_controls() {
-        let local_ai =
-            default_capabilities(&ProviderKindView::Localai, ProviderModeView::ManagedChild);
+        let local_ai = default_capabilities(
+            &ProviderKindView::Localai,
+            ProviderRoleView::Tts,
+            ProviderModeView::ManagedChild,
+        );
         assert!(local_ai.tts);
         assert!(!local_ai.character_detection);
         assert!(!local_ai.voice_cloning);
@@ -8697,6 +10118,7 @@ mod tests {
 
         let ollama = default_capabilities(
             &ProviderKindView::Ollama,
+            ProviderRoleView::Llm,
             ProviderModeView::ExternalEndpoint,
         );
         assert!(!ollama.tts);
@@ -8705,8 +10127,11 @@ mod tests {
         assert_eq!(ollama.temperature, "number");
         assert_eq!(ollama.reasoning, ["disabled", "effort"]);
 
-        let openai_speech =
-            default_capabilities(&ProviderKindView::OpenaiTts, ProviderModeView::CloudRemote);
+        let openai_speech = default_capabilities(
+            &ProviderKindView::Openai,
+            ProviderRoleView::Tts,
+            ProviderModeView::CloudRemote,
+        );
         assert!(openai_speech.tts);
         assert!(openai_speech.streaming);
         assert!(!openai_speech.character_detection);
@@ -8799,6 +10224,7 @@ mod tests {
             id: provider_id,
             name: "Ollama fixture".to_owned(),
             kind: ProviderKindView::Ollama,
+            role: ProviderRoleView::Llm,
             mode: ProviderModeView::ExternalEndpoint,
             endpoint: Some("http://127.0.0.1:11434/".to_owned()),
             executable_path: None,
@@ -8809,6 +10235,7 @@ mod tests {
             credential_configured: false,
             capabilities: Some(default_capabilities(
                 &ProviderKindView::Ollama,
+                ProviderRoleView::Llm,
                 ProviderModeView::ExternalEndpoint,
             )),
             capability_source: Some("test".to_owned()),
@@ -9002,6 +10429,7 @@ mod tests {
                 Json(ProviderProfileInput {
                     name: None,
                     kind: None,
+                    role: None,
                     mode: None,
                     endpoint: Some(Some("http://127.0.0.1:9999/".to_owned())),
                     executable_path: None,
@@ -9169,6 +10597,7 @@ mod tests {
             id: provider_id,
             name: "MLX fixture".to_owned(),
             kind: ProviderKindView::MlxAudio,
+            role: ProviderRoleView::Tts,
             mode: ProviderModeView::ManagedChild,
             endpoint: Some("http://127.0.0.1:8000/".to_owned()),
             executable_path: Some("/app-owned/mlx_audio.server".to_owned()),

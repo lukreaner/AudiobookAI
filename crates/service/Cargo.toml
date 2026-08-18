@@ -23,12 +23,14 @@ bytes.workspace = true
 chrono.workspace = true
 directories.workspace = true
 futures.workspace = true
+flate2.workspace = true
 fs2.workspace = true
 http.workspace = true
 keyring.workspace = true
 mime_guess = { workspace = true, optional = true }
 rand.workspace = true
 regex.workspace = true
+reqwest.workspace = true
 rust-embed = { workspace = true, optional = true }
 rustls.workspace = true
 secrecy.workspace = true
@@ -40,6 +42,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 tempfile.workspace = true
+tar.workspace = true
 tower.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
@@ -54,9 +57,11 @@ audiobookai-media = { path = "../media" }
 audiobookai-providers = { path = "../providers" }
 audiobookai-storage = { path = "../storage" }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix.workspace = true
+
 [dev-dependencies]
 rcgen.workspace = true
-reqwest.workspace = true
 tempfile.workspace = true
 
 [lints]

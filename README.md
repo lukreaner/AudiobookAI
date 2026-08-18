@@ -16,9 +16,10 @@ out of scope.
 - Character/dialogue detection with editable speaker review
 - Per-character providers, models, catalog voices, reference audio, and clones
 - Typed voice direction and side-by-side, explicitly billable voice auditions
-- ElevenLabs, MLX-audio, LocalAI, AllTalk V2, native OS TTS, OpenAI, Anthropic,
+- ElevenLabs, MLX-audio, Piper, LocalAI, AllTalk V2, native OS TTS, OpenAI, Anthropic,
   Gemini, Qwen, Kimi/Moonshot, LM Studio, and Ollama adapter families
 - In-app MLX-audio installation plus capability-gated local model management
+- Explicit in-app online Piper engine and curated-voice installation on Linux x86_64
 - Preview, estimate, dry-run, budgets, reservations, and provenance-led usage
 - Durable resumable jobs, per-provider concurrency, retries, and a content cache
 - A durable proofing workbench with text overrides, review states, take history,
@@ -102,7 +103,9 @@ diagnostic exports, build artifacts, or Git history.
   `.deb` (Linux)
 - Base desktop: no separately installed Node.js, Python, Docker, or system
   FFmpeg; an explicitly requested MLX-audio install creates its own isolated,
-  app-managed Python/tool environment
+  app-managed Python/tool environment. Piper is not bundled: on Linux x86_64,
+  its engine and a selected curated voice are downloaded only after explicit
+  user actions.
 
 The signed desktop installers are the only supported public application
 distributions; SBOMs, notices, checksums, and corresponding source accompany

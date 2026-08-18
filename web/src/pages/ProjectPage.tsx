@@ -170,7 +170,7 @@ function CharactersPanel({ projectId, reviewStatus, consentCloudAudio }: { proje
   });
   const providers = useQuery({ queryKey: ["providers"], queryFn: api.providers });
   const voices = useQuery({ queryKey: ["voices"], queryFn: () => api.voices() });
-  const aiProviders = providers.data?.items.filter((provider) => provider.capabilities?.characterDetection) ?? [];
+  const aiProviders = providers.data?.items.filter((provider) => provider.role === "llm" && provider.capabilities?.characterDetection) ?? [];
   const [detectionProvider, setDetectionProvider] = useState("");
   const [temperatureMode, setTemperatureMode] = useState<DetectionTemperature["mode"]>("default");
   const [temperatureValue, setTemperatureValue] = useState(0.2);
@@ -331,7 +331,7 @@ function CharactersPanel({ projectId, reviewStatus, consentCloudAudio }: { proje
     return () => source.close();
   }, [activeDetection?.id, projectId, queryClient]);
   const filteredVoices = voices.data?.items.filter((voice) => !voiceProvider || voice.providerProfileId === voiceProvider) ?? [];
-  const cloneProviders = providers.data?.items.filter((provider) => provider.capabilities?.voiceCloning) ?? [];
+  const cloneProviders = providers.data?.items.filter((provider) => provider.role === "tts" && provider.capabilities?.voiceCloning) ?? [];
   const selectedDetectionProvider = aiProviders.find((provider) => provider.id === detectionProvider);
   const characterMutationPending = detection.isPending || approve.isPending || assignment.isPending || identity.isPending
     || speakerOverride.isPending || createIdentity.isPending || mergeIdentity.isPending || deleteIdentity.isPending;
@@ -448,7 +448,7 @@ function CharactersPanel({ projectId, reviewStatus, consentCloudAudio }: { proje
 
       <Dialog open={Boolean(assigning)} onOpenChange={(open) => !open && !assignment.isPending && setAssigning(undefined)} title={t("characters.assignVoice", { name: assigning?.canonicalName })} description={t("characters.subtitle")} footer={<><Button variant="secondary" disabled={assignment.isPending} onClick={() => setAssigning(undefined)}>{t("common.cancel")}</Button><Button disabled={!voiceProvider || !voiceId || characterMutationPending} onClick={() => assignment.mutate()}>{assignment.isPending ? t("state.saving") : t("common.save")}</Button></>}>
         <div className="stack">
-          <Field label={t("providers.title")}><Select value={voiceProvider} disabled={characterMutationPending} onChange={(event) => { setVoiceProvider(event.target.value); setVoiceId(""); }}><option value="">{t("common.select")}</option>{providers.data?.items.filter((provider) => provider.capabilities?.tts).map((provider) => <option value={provider.id} key={provider.id}>{provider.name}</option>)}</Select></Field>
+          <Field label={t("providers.title")}><Select value={voiceProvider} disabled={characterMutationPending} onChange={(event) => { setVoiceProvider(event.target.value); setVoiceId(""); }}><option value="">{t("common.select")}</option>{providers.data?.items.filter((provider) => provider.role === "tts" && provider.capabilities?.tts).map((provider) => <option value={provider.id} key={provider.id}>{provider.name}</option>)}</Select></Field>
           <Field label={t("characters.voice")}><Select value={voiceId} onChange={(event) => setVoiceId(event.target.value)} disabled={!voiceProvider || characterMutationPending}><option value="">{t("common.select")}</option>{filteredVoices.map((voice) => <option value={voice.id} key={voice.id}>{voice.name}{voice.locale ? ` · ${voice.locale}` : ""}</option>)}</Select></Field>
           {providers.data?.items.find((provider) => provider.id === voiceProvider)?.capabilities?.voiceCloning ? <Button variant="secondary" onClick={() => { setAssigning(undefined); setVoiceLibraryOpen(true); }}><Plus size={16} />{t("characters.manageVoiceClones")}</Button> : null}
           {assignment.isError ? <ErrorState error={assignment.error} /> : null}

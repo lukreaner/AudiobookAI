@@ -63,7 +63,7 @@ function rangeHint(range?: PerformanceRange | null): string {
 
 function auditionProviderReady(provider: ProviderProfile): boolean {
   const updatedAt = provider.capabilityUpdatedAt ? Date.parse(provider.capabilityUpdatedAt) : Number.NaN;
-  return provider.status === "online" && Number.isFinite(updatedAt) && updatedAt + 24 * 60 * 60 * 1000 > Date.now() && provider.capabilities?.tts === true;
+  return provider.role === "tts" && provider.status === "online" && Number.isFinite(updatedAt) && updatedAt + 24 * 60 * 60 * 1000 > Date.now() && provider.capabilities?.tts === true;
 }
 
 export function VoiceAuditionPanel({ projectId }: { projectId: string }) {

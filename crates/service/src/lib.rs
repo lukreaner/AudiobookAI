@@ -12,6 +12,7 @@ mod events;
 mod idempotency;
 mod mlx_management;
 mod models;
+mod piper_management;
 mod proofing;
 mod provider_models;
 pub mod runtime;
@@ -99,6 +100,12 @@ impl ServiceHandle {
             tracing::warn!(
                 diagnostic_code = "mlx.management.shutdown.timeout",
                 "an app-owned MLX-audio operation did not stop before the shutdown deadline"
+            );
+        }
+        if !self.state.piper.shutdown_owned().await {
+            tracing::warn!(
+                diagnostic_code = "piper.management.shutdown.timeout",
+                "an app-owned Piper operation did not stop before the shutdown deadline"
             );
         }
         let remaining_model_operations = self.state.provider_models.shutdown_owned().await;

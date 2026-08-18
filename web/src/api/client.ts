@@ -45,10 +45,14 @@ import type {
   ProviderModelDiscoveryInput,
   ProviderModelOperation,
   ProviderProfile,
-  ProviderProfileInput,
+  ProviderProfileCreateInput,
+  ProviderProfilePatchInput,
+  NativeProviderAvailability,
   AvailableProviderModels,
   MlxManagement,
   MlxOperation,
+  PiperManagement,
+  PiperOperation,
   RateCard,
   RateCardInput,
   SecretStatus,
@@ -319,6 +323,8 @@ export const api = {
       body: json(input),
     }),
   providers: () => request<PageResponse<ProviderProfile>>("/api/v1/providers"),
+  nativeProviderAvailability: () =>
+    request<NativeProviderAvailability>("/api/v1/providers/native/availability"),
   discoverProviderModels: (profile: ProviderModelDiscoveryInput) =>
     request<AvailableProviderModels>("/api/v1/provider-models/discover", {
       method: "POST",
@@ -352,12 +358,27 @@ export const api = {
       method: "DELETE",
       body: json({ model, confirmed }),
     }),
-  updateProvider: (id: string, patch: ProviderProfileInput) =>
+  updateProvider: (id: string, patch: ProviderProfilePatchInput) =>
     request<ProviderProfile>(`/api/v1/providers/${id}`, { method: "PATCH", body: json(patch) }),
-  createProvider: (profile: ProviderProfileInput) =>
+  createProvider: (profile: ProviderProfileCreateInput) =>
     request<ProviderProfile>("/api/v1/providers", { method: "POST", body: json(profile) }),
   deleteProvider: (id: string) =>
     request<void>(`/api/v1/providers/${id}`, { method: "DELETE" }),
+  piperManagement: () => request<PiperManagement>("/api/v1/providers/piper/management"),
+  installPiper: () => request<PiperOperation>("/api/v1/providers/piper/install", { method: "POST" }),
+  uninstallPiper: (confirmed: true) => request<PiperOperation>("/api/v1/providers/piper/uninstall", {
+    method: "POST",
+    body: json({ confirmed }),
+  }),
+  cancelPiperOperation: (operationId: string) => request<PiperOperation>(`/api/v1/providers/piper/operations/${encodeURIComponent(operationId)}/cancel`, { method: "POST" }),
+  downloadPiperVoice: (voiceId: string, licenseConfirmed: true) => request<PiperOperation>("/api/v1/providers/piper/voices", {
+    method: "POST",
+    body: json({ voiceId, licenseConfirmed }),
+  }),
+  removePiperVoice: (voiceId: string, confirmed: true) => request<void>(`/api/v1/providers/piper/voices/${encodeURIComponent(voiceId)}`, {
+    method: "DELETE",
+    body: json({ confirmed }),
+  }),
   mlxManagement: () => request<MlxManagement>("/api/v1/providers/mlx-audio/management"),
   installMlx: () => request<MlxOperation>("/api/v1/providers/mlx-audio/install", { method: "POST" }),
   uninstallMlx: (confirmed: true) => request<MlxOperation>("/api/v1/providers/mlx-audio/uninstall", {

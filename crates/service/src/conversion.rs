@@ -92,6 +92,8 @@ struct SpeakerAssignment {
     provider_name: String,
     provider_kind: ProviderKindView,
     #[serde(default)]
+    provider_role: Option<crate::models::ProviderRoleView>,
+    #[serde(default)]
     provider_mode: Option<ProviderModeView>,
     provider_endpoint: Option<String>,
     #[serde(default)]
@@ -1914,6 +1916,7 @@ async fn build_assignments(
     .await
 }
 
+#[allow(clippy::too_many_lines)]
 async fn build_assignments_for(
     project: &Project,
     characters: &[crate::models::CharacterView],
@@ -1958,6 +1961,11 @@ async fn build_assignments_for(
                     character.canonical_name
                 ))
             })?;
+        crate::api::validate_piper_voice_selection(
+            provider,
+            &voice_source,
+            assignment.model.as_deref(),
+        )?;
         let domain_provider = state
             .database
             .repositories()
@@ -2005,6 +2013,7 @@ async fn build_assignments_for(
                 provider_id: assignment.provider_profile_id,
                 provider_name: provider.name.clone(),
                 provider_kind: provider.kind.clone(),
+                provider_role: Some(provider.role),
                 provider_mode: Some(provider.mode),
                 provider_endpoint: provider.endpoint.clone(),
                 provider_snapshot_id,
@@ -2056,6 +2065,11 @@ async fn validate_segment_dispatch_boundary(
     crate::api::validate_billable_tts_provider_readiness(&profile)
         .map_err(|error| ProviderError::Configuration(error.to_string()))?;
     if profile.kind != segment.assignment.provider_kind
+        || !matches!(profile.role, crate::models::ProviderRoleView::Tts)
+        || segment
+            .assignment
+            .provider_role
+            .is_some_and(|role| role != profile.role)
         || Some(profile.mode) != segment.assignment.provider_mode
         || profile.endpoint != segment.assignment.provider_endpoint
     {
@@ -2757,6 +2771,7 @@ fn validate_durable_segment_snapshot(
         segment_semantic_input_hash(&snapshot)? == segment_semantic_input_hash(current)?;
     let provider_identity_matches = snapshot.assignment.provider_kind
         == current.assignment.provider_kind
+        && snapshot.assignment.provider_role == current.assignment.provider_role
         && snapshot.assignment.provider_mode == current.assignment.provider_mode
         && snapshot.assignment.provider_endpoint == current.assignment.provider_endpoint
         && snapshot.assignment.provider_snapshot_id == current.assignment.provider_snapshot_id;
@@ -4520,28 +4535,35 @@ pub(crate) fn semantic_input_hash(
 }
 
 fn provider_endpoint_family(assignment: &SpeakerAssignment) -> &'static str {
-    match assignment.provider_kind {
-        ProviderKindView::Elevenlabs => "elevenlabs-v1",
-        ProviderKindView::MlxAudio => "openai-audio-mlx",
-        ProviderKindView::Localai => "openai-audio-localai",
-        ProviderKindView::AlltalkV2 => "alltalk-v2",
-        ProviderKindView::NativeOs => "native-os",
-        ProviderKindView::OpenaiTts => "openai-speech-v1",
-        ProviderKindView::Openai => "openai",
-        ProviderKindView::OpenaiCompatible => "openai-compatible",
-        ProviderKindView::Anthropic => "anthropic",
-        ProviderKindView::Gemini => "gemini",
-        ProviderKindView::Qwen => "qwen",
-        ProviderKindView::Kimi => "kimi",
-        ProviderKindView::Moonshot => "moonshot",
-        ProviderKindView::LmStudio => "lm-studio",
-        ProviderKindView::Ollama => "ollama",
+    match (&assignment.provider_kind, assignment.provider_role) {
+        (ProviderKindView::Elevenlabs, _) => "elevenlabs-v1",
+        (ProviderKindView::MlxAudio, _) => "openai-audio-mlx",
+        (ProviderKindView::Localai, _) => "openai-audio-localai",
+        (ProviderKindView::AlltalkV2, _) => "alltalk-v2",
+        (ProviderKindView::Piper, _) => "piper-cli-v1",
+        (ProviderKindView::NativeOs, _) => "native-os",
+        (ProviderKindView::OpenaiTts, _)
+        | (ProviderKindView::Openai, Some(crate::models::ProviderRoleView::Tts)) => {
+            "openai-speech-v1"
+        }
+        (ProviderKindView::Openai, _) => "openai",
+        (ProviderKindView::OpenaiCompatible, _) => "openai-compatible",
+        (ProviderKindView::Anthropic, _) => "anthropic",
+        (ProviderKindView::Gemini, _) => "gemini",
+        (ProviderKindView::Qwen, _) => "qwen",
+        (ProviderKindView::Kimi, _) => "kimi",
+        (ProviderKindView::Moonshot, _) => "moonshot",
+        (ProviderKindView::LmStudio, _) => "lm-studio",
+        (ProviderKindView::Ollama, _) => "ollama",
     }
 }
 
 fn requested_audio_format(assignment: &SpeakerAssignment) -> AudioFormat {
-    match assignment.provider_kind {
-        ProviderKindView::Elevenlabs | ProviderKindView::OpenaiTts => AudioFormat::Mp3,
+    match (&assignment.provider_kind, assignment.provider_role) {
+        (ProviderKindView::Elevenlabs | ProviderKindView::OpenaiTts, _)
+        | (ProviderKindView::Openai, Some(crate::models::ProviderRoleView::Tts)) => {
+            AudioFormat::Mp3
+        }
         _ => AudioFormat::Wav,
     }
 }
@@ -4651,6 +4673,11 @@ async fn validate_regeneration_retry_provider_snapshot(
         )
     })?;
     if profile.kind != segment.assignment.provider_kind
+        || !matches!(profile.role, crate::models::ProviderRoleView::Tts)
+        || segment
+            .assignment
+            .provider_role
+            .is_some_and(|role| role != profile.role)
         || profile.endpoint != segment.assignment.provider_endpoint
         || !persisted_provider_mode_matches(segment.assignment.provider_mode, profile.mode)
         || !voice_matches
@@ -8769,6 +8796,7 @@ mod tests {
                 provider_id: Uuid::from_u128(4),
                 provider_name: "Provider".to_owned(),
                 provider_kind: ProviderKindView::Elevenlabs,
+                provider_role: Some(crate::models::ProviderRoleView::Tts),
                 provider_mode: Some(ProviderModeView::CloudRemote),
                 provider_endpoint: None,
                 provider_snapshot_id: Some(Uuid::from_u128(6)),
@@ -9499,7 +9527,7 @@ mod tests {
                 provider_name: "Offline cloud".to_owned(),
                 voice_id,
                 voice_name: "Stored voice".to_owned(),
-                model: Some("stored-model".to_owned()),
+                model: Some("tts-1".to_owned()),
                 performance: PerformanceSettings::default(),
                 timing: TimingSettings::default(),
             }),
@@ -9509,13 +9537,14 @@ mod tests {
             id: provider_id,
             name: "Offline cloud".to_owned(),
             kind: ProviderKindView::Openai,
+            role: crate::models::ProviderRoleView::Tts,
             mode: ProviderModeView::CloudRemote,
             endpoint: Some("https://example.invalid".to_owned()),
             executable_path: None,
             working_directory: None,
             arguments: Vec::new(),
             status: crate::models::ProviderStatusView::Offline,
-            model: Some("stored-model".to_owned()),
+            model: Some("tts-1".to_owned()),
             credential_configured: false,
             capabilities: None,
             capability_source: None,

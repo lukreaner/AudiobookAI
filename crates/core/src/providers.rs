@@ -16,6 +16,7 @@ pub enum ProviderFamily {
     MlxAudio,
     LocalAi,
     AllTalkV2,
+    Piper,
     NativeWindows,
     NativeMacos,
     EspeakNg,

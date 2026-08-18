@@ -11,6 +11,7 @@ interface ProviderModelFieldProps {
   value: string;
   models: AvailableProviderModel[];
   status: ProviderModelDiscoveryStatus;
+  strict: boolean;
   onChange: (model: string) => void;
 }
 
@@ -20,6 +21,7 @@ export function ProviderModelField({
   value,
   models,
   status,
+  strict,
   onChange,
 }: ProviderModelFieldProps) {
   const { t } = useTranslation();
@@ -28,8 +30,13 @@ export function ProviderModelField({
   const discoveredValue = modelIds.includes(value);
 
   useEffect(() => {
+    if (strict) {
+      setManual(false);
+      if (status === "success" && value && !modelIds.includes(value)) onChange("");
+      return;
+    }
     setManual(Boolean(value) && !modelIds.includes(value));
-  }, [models, value]);
+  }, [models, onChange, status, strict, value]);
 
   const label = t(role === "tts" ? "providers.ttsModel" : "providers.llmModel");
   const discoveryDetail = source === "none"
@@ -44,7 +51,7 @@ export function ProviderModelField({
             ? t("providers.modelDiscoveryWaiting")
             : source === "default_only"
               ? t("providers.providerDefaultModelHint")
-              : t("providers.noAvailableModels");
+              : t(strict ? "providers.noVerifiedModels" : "providers.noAvailableModels");
   const discoveryTone = source === "none" || status === "waiting"
     ? "is-neutral"
     : status === "error"
@@ -71,9 +78,9 @@ export function ProviderModelField({
   if (models.length > 0) {
     return <div className="provider-model-picker">
       {discoveryStatus}
-      <Field label={label} hint={t("providers.availableModelsHint")}>
+      <Field label={label} hint={t(strict ? "providers.verifiedModelsHint" : "providers.availableModelsHint")}>
         <Select
-          value={manual ? "__manual__" : discoveredValue ? value : ""}
+          value={!strict && manual ? "__manual__" : discoveredValue ? value : ""}
           onChange={(event) => {
             if (event.target.value === "__manual__") {
               setManual(true);
@@ -85,10 +92,17 @@ export function ProviderModelField({
         >
           <option value="">{t("providers.chooseModel")}</option>
           {models.map((model) => <option value={model.id} key={model.id}>{model.name === model.id ? model.id : `${model.name} (${model.id})`}</option>)}
-          <option value="__manual__">{t("providers.customModel")}</option>
+          {!strict ? <option value="__manual__">{t("providers.customModel")}</option> : null}
         </Select>
       </Field>
-      {manual ? <Field label={t("providers.customModel")} hint={t("providers.customModelHint")}><Input value={value} onChange={(event) => onChange(event.target.value)} /></Field> : null}
+      {!strict && manual ? <Field label={t("providers.customModel")} hint={t("providers.customModelHint")}><Input value={value} onChange={(event) => onChange(event.target.value)} /></Field> : null}
+    </div>;
+  }
+
+  if (strict) {
+    return <div className="provider-model-picker">
+      {discoveryStatus}
+      <Field label={label} hint={t("providers.noVerifiedModels")}><Select disabled value=""><option value="">{t("providers.noVerifiedModels")}</option></Select></Field>
     </div>;
   }
 

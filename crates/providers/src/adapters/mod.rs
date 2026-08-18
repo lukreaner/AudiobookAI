@@ -2,19 +2,21 @@
 
 mod character;
 mod native;
+mod piper;
 mod tts;
 
 pub use character::{
     AnthropicProvider, GeminiProvider, OllamaProvider, OpenAiChatPreset, OpenAiCompatibleProvider,
-    OpenAiResponsesProvider,
+    OpenAiResponsesProvider, is_openai_responses_model_id,
 };
 pub use native::{
     NativeCapture, NativeCommand, NativeCommandArgument, NativeCommandOutput, NativeCommandRunner,
     NativePlatform, NativeTtsConfig, NativeTtsProvider, TokioNativeCommandRunner,
 };
+pub use piper::{PIPER_VERSION, PiperTtsConfig, PiperTtsProvider};
 pub use tts::{
     AllTalkProvider, ElevenLabsProvider, LocalAiProvider, MlxAudioProvider, OpenAiTtsProvider,
-    openai_tts_model_performance_capabilities,
+    is_openai_tts_model_id, openai_tts_model_performance_capabilities,
 };
 
 use std::{collections::BTreeMap, sync::Arc};

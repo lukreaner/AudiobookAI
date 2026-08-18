@@ -486,7 +486,9 @@ mod tests {
             Ok(HttpResponse {
                 status: 200,
                 headers: BTreeMap::new(),
-                body: Bytes::from_static(br#"{"data":[{"id":"model-b"},{"id":"model-a"}]}"#),
+                body: Bytes::from_static(
+                    br#"{"data":[{"id":"gpt-5.6-luna"},{"id":"gpt-4.1-mini"}]}"#,
+                ),
             })
         }
     }
@@ -501,7 +503,7 @@ mod tests {
         let mut profile = RuntimeProfile::new(
             ProviderId::new("model-preview").unwrap(),
             "Model preview",
-            RuntimeAdapterKind::OpenAiCompatible,
+            RuntimeAdapterKind::OpenAi,
             ProviderKind::ExternalEndpoint,
         );
         profile.endpoint = Some(Url::parse("http://127.0.0.1:19090/").unwrap());
@@ -513,7 +515,7 @@ mod tests {
                 .iter()
                 .map(|model| model.id.as_str())
                 .collect::<Vec<_>>(),
-            ["model-b", "model-a"]
+            ["gpt-5.6-luna", "gpt-4.1-mini"]
         );
         assert!(runtime.profile_ids().await.is_empty());
     }
