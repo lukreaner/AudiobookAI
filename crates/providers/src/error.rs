@@ -17,6 +17,8 @@ pub enum ProviderError {
     Http { status: u16, message: String },
     #[error("provider model context window is too small for the request")]
     ContextWindowExceeded,
+    #[error("provider output was truncated before the structured result completed")]
+    OutputTruncated,
     #[error("provider transport failed: {0}")]
     Transport(String),
     #[error("provider returned malformed data: {0}")]

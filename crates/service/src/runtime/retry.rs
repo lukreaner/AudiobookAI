@@ -282,7 +282,8 @@ pub const fn classify_provider_error(error: &ProviderError) -> FailureClass {
         ProviderError::Configuration(_)
         | ProviderError::Unsupported { .. }
         | ProviderError::InvalidResponse(_)
-        | ProviderError::ContextWindowExceeded => FailureClass::Validation,
+        | ProviderError::ContextWindowExceeded
+        | ProviderError::OutputTruncated => FailureClass::Validation,
         ProviderError::RateLimited { .. } | ProviderError::Http { status: 429, .. } => {
             FailureClass::RateLimited
         }
@@ -372,6 +373,10 @@ mod tests {
         );
         assert_eq!(
             classify_provider_error(&ProviderError::Configuration("bad".to_owned())),
+            FailureClass::Validation
+        );
+        assert_eq!(
+            classify_provider_error(&ProviderError::OutputTruncated),
             FailureClass::Validation
         );
         assert_eq!(

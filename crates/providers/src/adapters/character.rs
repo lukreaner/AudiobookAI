@@ -203,9 +203,11 @@ impl JsonCharacterProvider {
             result => result?,
         };
         let envelope = json_body(&response)?;
+        if output_was_truncated(&envelope, self.flavor) {
+            return Err(ProviderError::OutputTruncated);
+        }
         let content = extract_content(&envelope, self.flavor)?;
-        let mut result: CharacterDetectionResult = serde_json::from_str(strip_json_fence(&content))
-            .map_err(|error| ProviderError::InvalidResponse(error.to_string()))?;
+        let mut result = parse_detection_content(&content)?;
         result.usage = extract_usage(&envelope, self.flavor);
         result.validate(&request)
     }
@@ -630,6 +632,49 @@ fn extract_content(envelope: &Value, flavor: CharacterFlavor) -> Result<String> 
     content.ok_or_else(|| ProviderError::InvalidResponse("missing model output text".to_owned()))
 }
 
+fn output_was_truncated(envelope: &Value, flavor: CharacterFlavor) -> bool {
+    match flavor {
+        CharacterFlavor::OpenAiResponses => {
+            envelope
+                .pointer("/incomplete_details/reason")
+                .and_then(Value::as_str)
+                .is_some_and(|reason| matches!(reason, "max_output_tokens" | "max_tokens"))
+                || (envelope.get("status").and_then(Value::as_str) == Some("incomplete")
+                    && envelope
+                        .get("incomplete_details")
+                        .is_none_or(Value::is_null))
+        }
+        CharacterFlavor::OpenAiChat(_) => {
+            envelope
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str)
+                == Some("length")
+        }
+        CharacterFlavor::Anthropic => {
+            envelope.get("stop_reason").and_then(Value::as_str) == Some("max_tokens")
+        }
+        CharacterFlavor::Gemini => {
+            envelope
+                .pointer("/candidates/0/finishReason")
+                .and_then(Value::as_str)
+                == Some("MAX_TOKENS")
+        }
+        CharacterFlavor::Ollama => {
+            envelope.get("done_reason").and_then(Value::as_str) == Some("length")
+        }
+    }
+}
+
+fn parse_detection_content(content: &str) -> Result<CharacterDetectionResult> {
+    serde_json::from_str(strip_json_fence(content)).map_err(|error| {
+        if error.is_eof() {
+            ProviderError::OutputTruncated
+        } else {
+            ProviderError::InvalidResponse(error.to_string())
+        }
+    })
+}
+
 fn strip_json_fence(content: &str) -> &str {
     let trimmed = content.trim();
     trimmed
@@ -1032,6 +1077,47 @@ mod tests {
 
         assert_eq!(window.loaded_tokens, None);
         assert_eq!(window.maximum_tokens, Some(262_144));
+    }
+
+    #[test]
+    fn provider_completion_limits_are_classified_as_output_truncation() {
+        let limited = [
+            (
+                json!({"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}}),
+                CharacterFlavor::OpenAiResponses,
+            ),
+            (
+                json!({"choices": [{"finish_reason": "length"}]}),
+                CharacterFlavor::OpenAiChat(OpenAiChatPreset::LmStudio),
+            ),
+            (
+                json!({"stop_reason": "max_tokens"}),
+                CharacterFlavor::Anthropic,
+            ),
+            (
+                json!({"candidates": [{"finishReason": "MAX_TOKENS"}]}),
+                CharacterFlavor::Gemini,
+            ),
+            (json!({"done_reason": "length"}), CharacterFlavor::Ollama),
+        ];
+
+        for (envelope, flavor) in limited {
+            assert!(output_was_truncated(&envelope, flavor), "{flavor:?}");
+        }
+        assert!(!output_was_truncated(
+            &json!({"choices": [{"finish_reason": "stop"}]}),
+            CharacterFlavor::OpenAiChat(OpenAiChatPreset::LmStudio),
+        ));
+    }
+
+    #[test]
+    fn json_eof_is_classified_without_retaining_model_content() {
+        let error =
+            parse_detection_content(r#"{"characters":[{"canonical_name":"private source text"#)
+                .unwrap_err();
+
+        assert!(matches!(error, ProviderError::OutputTruncated));
+        assert!(!error.to_string().contains("private source text"));
     }
 
     #[test]

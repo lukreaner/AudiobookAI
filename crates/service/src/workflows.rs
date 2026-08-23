@@ -44,6 +44,7 @@ const DETECTION_MAX_OUTPUT_TOKENS: u64 = 4_096;
 const DETECTION_MIN_PARAGRAPH_TOKENS: u64 = 256;
 const DETECTION_PARAGRAPH_OVERHEAD_TOKENS: u64 = 128;
 const DETECTION_CONTEXT_FALLBACK_LIMIT: usize = 8;
+const DETECTION_OUTPUT_FALLBACK_LIMIT: usize = 8;
 
 static ACTIVE_DETECTION_WORKERS: OnceLock<StdMutex<BTreeSet<Uuid>>> = OnceLock::new();
 
@@ -771,53 +772,13 @@ impl DetectionBatch {
     }
 
     fn split_for_context_retry(&self) -> Result<Vec<Self>, ServiceError> {
-        let core = self.core_paragraphs();
         let fallback_output = if self.max_output_tokens > 256 {
             (self.max_output_tokens / 2).max(256)
         } else {
             self.max_output_tokens
         };
-        if core.len() > 1 {
-            let middle = core.len().div_ceil(2);
-            return Ok([&core[..middle], &core[middle..]]
-                .into_iter()
-                .filter(|paragraphs| !paragraphs.is_empty())
-                .map(|paragraphs| Self {
-                    paragraphs: paragraphs
-                        .iter()
-                        .cloned()
-                        .map(|fragment| DetectionBatchParagraph {
-                            fragment,
-                            context_only: false,
-                        })
-                        .collect(),
-                    max_output_tokens: fallback_output,
-                })
-                .collect());
-        }
-        let Some(fragment) = core.first() else {
-            return Err(ServiceError::Conflict(
-                "character-detection context fallback has no source text".to_owned(),
-            ));
-        };
-        if fragment.text.chars().count() > 1 {
-            let end = preferred_fragment_end(&fragment.text, 0, fragment.text.len() / 2);
-            if end > 0 && end < fragment.text.len() {
-                let fragments = [
-                    detection_fragment_slice(fragment, 0, end),
-                    detection_fragment_slice(fragment, end, fragment.text.len()),
-                ];
-                return Ok(fragments
-                    .into_iter()
-                    .map(|fragment| Self {
-                        paragraphs: vec![DetectionBatchParagraph {
-                            fragment,
-                            context_only: false,
-                        }],
-                        max_output_tokens: fallback_output,
-                    })
-                    .collect());
-            }
+        if let Some(children) = self.split_core(fallback_output)? {
+            return Ok(children);
         }
         if self.max_output_tokens > 256 {
             return Ok(vec![Self {
@@ -828,6 +789,65 @@ impl DetectionBatch {
         Err(ServiceError::Conflict(
             "the provider context window remains too small after adaptive batching".to_owned(),
         ))
+    }
+
+    fn split_for_output_retry(&self) -> Result<Vec<Self>, ServiceError> {
+        self.split_core(self.max_output_tokens)?.ok_or_else(|| {
+            ServiceError::Conflict(
+                "the provider output remains incomplete after adaptive batching".to_owned(),
+            )
+        })
+    }
+
+    fn split_core(&self, max_output_tokens: u32) -> Result<Option<Vec<Self>>, ServiceError> {
+        let core = self.core_paragraphs();
+        if core.len() > 1 {
+            let middle = core.len().div_ceil(2);
+            return Ok(Some(
+                [&core[..middle], &core[middle..]]
+                    .into_iter()
+                    .filter(|paragraphs| !paragraphs.is_empty())
+                    .map(|paragraphs| Self {
+                        paragraphs: paragraphs
+                            .iter()
+                            .cloned()
+                            .map(|fragment| DetectionBatchParagraph {
+                                fragment,
+                                context_only: false,
+                            })
+                            .collect(),
+                        max_output_tokens,
+                    })
+                    .collect(),
+            ));
+        }
+        let Some(fragment) = core.first() else {
+            return Err(ServiceError::Conflict(
+                "character-detection adaptive batching has no source text".to_owned(),
+            ));
+        };
+        if fragment.text.chars().count() > 1 {
+            let end = preferred_fragment_end(&fragment.text, 0, fragment.text.len() / 2);
+            if end > 0 && end < fragment.text.len() {
+                let fragments = [
+                    detection_fragment_slice(fragment, 0, end),
+                    detection_fragment_slice(fragment, end, fragment.text.len()),
+                ];
+                return Ok(Some(
+                    fragments
+                        .into_iter()
+                        .map(|fragment| Self {
+                            paragraphs: vec![DetectionBatchParagraph {
+                                fragment,
+                                context_only: false,
+                            }],
+                            max_output_tokens,
+                        })
+                        .collect(),
+                ));
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -1227,6 +1247,7 @@ pub async fn reset_detection_units_for_restart(
         if explicit_retry {
             unit.payload.remove("requestId");
             unit.payload.remove("contextFallbackCount");
+            unit.payload.remove("outputFallbackCount");
             unit.payload.insert(
                 "dispatchState".to_owned(),
                 serde_json::json!("explicit_retry"),
@@ -1298,6 +1319,7 @@ pub(crate) async fn prepare_detection_retry_units(
         .await?;
         unit.payload.remove("requestId");
         unit.payload.remove("contextFallbackCount");
+        unit.payload.remove("outputFallbackCount");
         unit.payload.insert(
             "dispatchState".to_owned(),
             serde_json::json!("explicit_retry"),
@@ -2302,6 +2324,12 @@ async fn execute_detection_batch(
         .and_then(serde_json::Value::as_u64)
         .and_then(|value| usize::try_from(value).ok())
         .unwrap_or_default();
+    let mut output_fallbacks = unit
+        .payload
+        .get("outputFallbackCount")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or_default();
     let mut combined = CharacterDetectionResult {
         characters: Vec::new(),
         dialogue: Vec::new(),
@@ -2406,6 +2434,33 @@ async fn execute_detection_batch(
                     unit.payload.insert(
                         "dispatchState".to_owned(),
                         serde_json::json!("context_rebatch"),
+                    );
+                    mark_detection_unit(state, unit, JobUnitState::Running, None).await?;
+                    for child in children.into_iter().rev() {
+                        pending.push_front((child, repair));
+                    }
+                    break;
+                }
+                Err(crate::runtime::RetryExecutionError::Provider {
+                    source: ProviderError::OutputTruncated,
+                    ..
+                }) => {
+                    output_fallbacks = output_fallbacks.saturating_add(1);
+                    if output_fallbacks > DETECTION_OUTPUT_FALLBACK_LIMIT {
+                        return Err(ServiceError::Conflict(
+                            "the provider output remains incomplete after adaptive batching"
+                                .to_owned(),
+                        ));
+                    }
+                    let children = current_batch.split_for_output_retry()?;
+                    unit.payload.insert(
+                        "outputFallbackCount".to_owned(),
+                        serde_json::json!(output_fallbacks),
+                    );
+                    unit.payload.remove("requestId");
+                    unit.payload.insert(
+                        "dispatchState".to_owned(),
+                        serde_json::json!("output_rebatch"),
                     );
                     mark_detection_unit(state, unit, JobUnitState::Running, None).await?;
                     for child in children.into_iter().rev() {
@@ -3806,6 +3861,84 @@ mod tests {
                 .all(|paragraph| !paragraph.context_only)
         );
         assert!(children.iter().all(|child| child.max_output_tokens == 512));
+    }
+
+    #[test]
+    fn output_truncation_fallback_halves_the_core_batch_and_preserves_output_budget() {
+        let fragments = (0..4)
+            .map(|index| DetectionBatchParagraph {
+                fragment: DetectionFragment {
+                    request_id: format!("p{index}"),
+                    source_id: format!("p{index}"),
+                    source_byte_start: 0,
+                    text: "dialogue".to_owned(),
+                },
+                context_only: index == 0,
+            })
+            .collect();
+        let batch = DetectionBatch {
+            paragraphs: fragments,
+            max_output_tokens: 1_024,
+        };
+        let children = batch.split_for_output_retry().expect("output split");
+
+        assert_eq!(children.len(), 2);
+        assert_eq!(
+            children
+                .iter()
+                .map(|child| child.paragraphs.len())
+                .sum::<usize>(),
+            3
+        );
+        assert!(
+            children
+                .iter()
+                .flat_map(|child| &child.paragraphs)
+                .all(|paragraph| !paragraph.context_only)
+        );
+        assert!(
+            children
+                .iter()
+                .all(|child| child.max_output_tokens == 1_024)
+        );
+    }
+
+    #[test]
+    fn output_truncation_splits_one_fragment_without_losing_source_offsets() {
+        let source_text = "First half. Second half.";
+        let batch = DetectionBatch {
+            paragraphs: vec![DetectionBatchParagraph {
+                fragment: DetectionFragment {
+                    request_id: "p1@11".to_owned(),
+                    source_id: "p1".to_owned(),
+                    source_byte_start: 11,
+                    text: source_text.to_owned(),
+                },
+                context_only: false,
+            }],
+            max_output_tokens: 1_024,
+        };
+        let children = batch.split_for_output_retry().expect("fragment split");
+        let fragments = children
+            .iter()
+            .flat_map(DetectionBatch::core_paragraphs)
+            .collect::<Vec<_>>();
+
+        assert_eq!(fragments.len(), 2);
+        assert_eq!(
+            fragments
+                .iter()
+                .map(|fragment| fragment.text.as_str())
+                .collect::<String>(),
+            source_text
+        );
+        assert_eq!(fragments[0].source_byte_start, 11);
+        assert_eq!(fragments[1].source_byte_start, 11 + fragments[0].text.len());
+        assert!(
+            children
+                .iter()
+                .all(|child| child.max_output_tokens == 1_024)
+        );
     }
 
     #[test]

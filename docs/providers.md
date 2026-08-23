@@ -111,6 +111,9 @@ reserves prompt, schema, output, and safety capacity, batches source text by a t
 byte upper bound, splits oversized paragraphs at UTF-8 boundaries, and rebases dialogue offsets to
 the original paragraph. A recognized provider context-overflow response is retried with smaller
 core batches and a smaller output allowance instead of entering the generic transient retry loop.
+If a provider reaches its completion-token limit, or the returned JSON ends at EOF, the workflow
+instead splits only the source batch and preserves the full output allowance. This prevents a
+truncated structured result from being resent unchanged as a generic JSON-repair attempt.
 
 Provider-native download progress is visible and cancellable for the current app
 session, but its operation journal is not yet durable across a service restart.
