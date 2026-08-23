@@ -692,6 +692,7 @@ mod tests {
         assert_eq!(response.content_type, "audio/wav");
         let commands = runner.commands.lock().unwrap();
         let command = commands.last().unwrap();
+        let expected_voice_root = voices.join(SELECTED_VOICE);
         let expected_espeak_data = command
             .executable
             .parent()
@@ -709,14 +710,14 @@ mod tests {
             vec![
                 literal("--model"),
                 literal(
-                    voices
-                        .join("de_DE-thorsten-medium/de_DE-thorsten-medium.onnx")
+                    expected_voice_root
+                        .join(format!("{SELECTED_VOICE}.onnx"))
                         .to_string_lossy(),
                 ),
                 literal("--config"),
                 literal(
-                    voices
-                        .join("de_DE-thorsten-medium/de_DE-thorsten-medium.onnx.json")
+                    expected_voice_root
+                        .join(format!("{SELECTED_VOICE}.onnx.json"))
                         .to_string_lossy(),
                 ),
                 literal("--espeak_data"),
