@@ -692,6 +692,13 @@ mod tests {
         assert_eq!(response.content_type, "audio/wav");
         let commands = runner.commands.lock().unwrap();
         let command = commands.last().unwrap();
+        let expected_espeak_data = command
+            .executable
+            .parent()
+            .unwrap()
+            .join("espeak-ng-data")
+            .canonicalize()
+            .unwrap();
         assert_eq!(command.stdin, Bytes::from_static(b"Hallo Welt"));
         assert_eq!(
             command.capture,
@@ -713,14 +720,7 @@ mod tests {
                         .to_string_lossy(),
                 ),
                 literal("--espeak_data"),
-                literal(
-                    command
-                        .executable
-                        .parent()
-                        .unwrap()
-                        .join("espeak-ng-data")
-                        .to_string_lossy(),
-                ),
+                literal(expected_espeak_data.to_string_lossy()),
                 literal("--output_file"),
                 NativeCommandArgument::OutputFile,
             ]
