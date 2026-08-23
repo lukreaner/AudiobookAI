@@ -168,7 +168,13 @@ function CharactersPanel({ projectId, reviewStatus, consentCloudAudio }: { proje
     queryFn: () => api.characterDetectionStatus(projectId),
     refetchInterval: (query) => query.state.data?.activeJob ? 3_000 : false,
   });
-  const providers = useQuery({ queryKey: ["providers"], queryFn: api.providers });
+  const providers = useQuery({
+    queryKey: ["providers"],
+    queryFn: api.providers,
+    refetchInterval: (query) => query.state.data?.items.some((provider) =>
+      provider.kind === "lm_studio" && provider.mode === "external_endpoint" && ["offline", "error"].includes(provider.status)
+    ) ? 5_000 : false,
+  });
   const voices = useQuery({ queryKey: ["voices"], queryFn: () => api.voices() });
   const aiProviders = providers.data?.items.filter((provider) => provider.role === "llm" && provider.capabilities?.characterDetection) ?? [];
   const [detectionProvider, setDetectionProvider] = useState("");

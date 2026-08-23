@@ -355,6 +355,8 @@ pub struct ProviderProfileView {
     pub arguments: Vec<String>,
     pub status: ProviderStatusView,
     pub model: Option<String>,
+    /// Optional operator override for the model's effective total context window.
+    pub context_window_tokens: Option<u64>,
     pub credential_configured: bool,
     pub capabilities: Option<ProviderCapabilitiesView>,
     pub capability_source: Option<String>,
@@ -378,6 +380,8 @@ pub struct ProviderProfileInput {
     pub arguments: Option<Vec<String>>,
     #[serde(default, deserialize_with = "deserialize_nullable_patch")]
     pub model: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_nullable_patch")]
+    pub context_window_tokens: Option<Option<u64>>,
     pub credential: Option<zeroize::Zeroizing<String>>,
 }
 
@@ -406,6 +410,10 @@ impl fmt::Debug for ProviderProfileInput {
                 &self.arguments.as_ref().map(std::vec::Vec::len),
             )
             .field("model_patch", &self.model.as_ref().map(Option::is_some))
+            .field(
+                "context_window_tokens_patch",
+                &self.context_window_tokens.as_ref().map(Option::is_some),
+            )
             .field(
                 "credential",
                 &self.credential.as_ref().map(|_| "[REDACTED]"),

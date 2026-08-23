@@ -166,6 +166,39 @@ describe("managed provider configuration", () => {
     })));
   });
 
+  it("stores an optional LM Studio context-window override and validates its bounds", async () => {
+    vi.mocked(api.discoverProviderModels).mockResolvedValue({
+      items: [{ id: "google/gemma", name: "Gemma" }],
+      strict: false,
+    });
+    const user = userEvent.setup();
+    renderProviders();
+
+    await user.click(await screen.findByRole("button", { name: "Add provider" }));
+    await user.selectOptions(screen.getByLabelText(/^Provider use/), "llm");
+    await user.selectOptions(screen.getByLabelText("Choose a provider type"), "lm_studio");
+    expect(screen.getByLabelText(/^Provider use/)).toHaveValue("llm");
+    expect(screen.getByLabelText("Choose a provider type")).toHaveValue("lm_studio");
+    const contextWindow = await screen.findByLabelText(/^Context window \(tokens\)/);
+    expect(contextWindow).toHaveAttribute("placeholder", "4096");
+
+    await user.type(contextWindow, "1024");
+    expect(screen.getByText("Enter a whole number between 2,048 and 2,097,152 tokens.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Save and check connection" })).toBeDisabled();
+    await user.clear(contextWindow);
+    await user.type(contextWindow, "8192");
+    await waitFor(() => expect(screen.getByRole("option", { name: "Gemma (google/gemma)" })).toBeInTheDocument());
+    await user.selectOptions(screen.getByLabelText(/^LLM model/), "google/gemma");
+    await user.click(screen.getByRole("button", { name: "Save and check connection" }));
+
+    await waitFor(() => expect(api.createProvider).toHaveBeenCalledWith(expect.objectContaining({
+      kind: "lm_studio",
+      role: "llm",
+      model: "google/gemma",
+      contextWindowTokens: 8_192,
+    })));
+  });
+
   it("offers OpenAI in TTS mode with strict speech-only model choices", async () => {
     vi.mocked(api.discoverProviderModels).mockResolvedValue({
       items: [

@@ -860,6 +860,11 @@ async fn hydrate_providers(
             .get("model")
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned);
+        let context_window_tokens = profile
+            .settings
+            .0
+            .get("context_window_tokens")
+            .and_then(serde_json::Value::as_u64);
         let mut fingerprint = blake3::Hasher::new();
         fingerprint.update(profile.endpoint.as_deref().unwrap_or("native").as_bytes());
         fingerprint.update(model.as_deref().unwrap_or("default").as_bytes());
@@ -945,6 +950,7 @@ async fn hydrate_providers(
                     ProviderStatusView::Offline
                 },
                 model,
+                context_window_tokens,
                 credential_configured: profile.credential_secret_id.is_some()
                     || matches!(mode, ProviderModeView::Native),
                 capabilities,
@@ -2591,6 +2597,7 @@ fn native_provider() -> ProviderProfileView {
         arguments: Vec::new(),
         status: ProviderStatusView::Online,
         model: None,
+        context_window_tokens: None,
         credential_configured: true,
         capabilities: Some(ProviderCapabilitiesView {
             tts: true,
@@ -2961,6 +2968,7 @@ mod tests {
             arguments: vec!["--address".to_owned(), "127.0.0.1:8080".to_owned()],
             status: ProviderStatusView::Offline,
             model: Some("tts-model".to_owned()),
+            context_window_tokens: None,
             credential_configured: false,
             capabilities: None,
             capability_source: None,

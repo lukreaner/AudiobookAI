@@ -4,10 +4,10 @@ use async_trait::async_trait;
 
 use crate::{
     AudioChunk, CancellationFlag, CharacterDetectionRequest, CharacterDetectionResult, Model,
-    ModelDownloadRequest, ModelDownloadStatus, OwnedProcessHandle, ProcessLogLine, ProcessSpec,
-    ProcessStatus, ProviderCapabilities, ProviderDescriptor, ProviderHealth, ProviderModelInfo,
-    Result, StreamingSynthesisResponse, SynthesisRequest, SynthesisResponse, Voice, VoiceClone,
-    VoiceCloneRequest,
+    ModelContextWindow, ModelDownloadRequest, ModelDownloadStatus, OwnedProcessHandle,
+    ProcessLogLine, ProcessSpec, ProcessStatus, ProviderCapabilities, ProviderDescriptor,
+    ProviderHealth, ProviderModelInfo, Result, StreamingSynthesisResponse, SynthesisRequest,
+    SynthesisResponse, Voice, VoiceClone, VoiceCloneRequest,
 };
 
 #[async_trait]
@@ -58,6 +58,9 @@ pub trait CharacterProvider: fmt::Debug + Send + Sync {
     fn capabilities(&self) -> &ProviderCapabilities;
     async fn health(&self) -> Result<ProviderHealth>;
     async fn discover_models(&self) -> Result<Vec<Model>>;
+    async fn model_context_window(&self, _model: &str) -> Result<ModelContextWindow> {
+        Ok(ModelContextWindow::default())
+    }
     async fn detect_characters(
         &self,
         request: CharacterDetectionRequest,

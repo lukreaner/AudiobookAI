@@ -3784,7 +3784,70 @@ pub(crate) fn apply_pronunciation_rule(
     }
 }
 
+const LM_STUDIO_STATUS_RECOVERY_BUDGET: Duration = Duration::from_secs(4);
+
+/// Rechecks only stale external LM Studio profiles while serving a provider list. This lets a
+/// server that starts after `AudiobookAI` recover from its startup-time Offline observation without
+/// turning every provider-list read into cloud traffic or taking ownership of a managed child.
+async fn recover_stale_external_lm_studio_statuses(state: &Arc<AppState>) {
+    let candidates = state
+        .catalog
+        .read()
+        .await
+        .providers
+        .values()
+        .filter(|profile| {
+            matches!(profile.kind, ProviderKindView::LmStudio)
+                && matches!(profile.mode, ProviderModeView::ExternalEndpoint)
+                && matches!(
+                    profile.status,
+                    ProviderStatusView::Offline | ProviderStatusView::Error
+                )
+        })
+        .map(|profile| profile.id)
+        .collect::<Vec<_>>();
+
+    for id in candidates {
+        let Ok(_lifecycle_guard) = state.model_lifecycle.try_lock() else {
+            return;
+        };
+        let still_recoverable =
+            state
+                .catalog
+                .read()
+                .await
+                .providers
+                .get(&id)
+                .is_some_and(|profile| {
+                    matches!(profile.kind, ProviderKindView::LmStudio)
+                        && matches!(profile.mode, ProviderModeView::ExternalEndpoint)
+                        && matches!(
+                            profile.status,
+                            ProviderStatusView::Offline | ProviderStatusView::Error
+                        )
+                });
+        if !still_recoverable {
+            continue;
+        }
+        match tokio::time::timeout(
+            LM_STUDIO_STATUS_RECOVERY_BUDGET,
+            refresh_provider(state, id),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                tracing::debug!(diagnostic_code = "provider.status.recovery.failed", provider_id = %id, %error, "LM Studio status recovery failed");
+            }
+            Err(_) => {
+                tracing::debug!(diagnostic_code = "provider.status.recovery.timeout", provider_id = %id, "LM Studio status recovery timed out");
+            }
+        }
+    }
+}
+
 async fn list_providers(State(state): State<Arc<AppState>>) -> Json<Page<ProviderProfileView>> {
+    recover_stale_external_lm_studio_statuses(&state).await;
     let catalog = state.catalog.read().await;
     let mut providers = catalog.providers.values().cloned().collect::<Vec<_>>();
     providers.sort_by(|left, right| left.name.cmp(&right.name));
@@ -3847,6 +3910,7 @@ async fn provider_model_discovery_profile(
             arguments: Vec::new(),
             status: ProviderStatusView::Unconfigured,
             model: None,
+            context_window_tokens: input.context_window_tokens.flatten(),
             credential_configured: false,
             capabilities: None,
             capability_source: None,
@@ -3883,6 +3947,9 @@ async fn provider_model_discovery_profile(
     }
     if let Some(model) = &input.model {
         profile.model.clone_from(model);
+    }
+    if let Some(context_window_tokens) = input.context_window_tokens {
+        profile.context_window_tokens = context_window_tokens;
     }
     Ok(profile)
 }
@@ -4716,6 +4783,7 @@ async fn auto_configure_mlx_profile(
         ],
         status: ProviderStatusView::Offline,
         model: None,
+        context_window_tokens: None,
         credential_configured: false,
         capabilities: Some(default_capabilities(
             &ProviderKindView::MlxAudio,
@@ -5159,6 +5227,7 @@ async fn delete_provider(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[allow(clippy::too_many_lines)]
 async fn create_provider(
     State(state): State<Arc<AppState>>,
     Json(input): Json<ProviderProfileInput>,
@@ -5178,6 +5247,7 @@ async fn create_provider(
     let working_directory = input.working_directory.flatten();
     let arguments = input.arguments.unwrap_or_default();
     let model = input.model.flatten();
+    let context_window_tokens = input.context_window_tokens.flatten();
     let _model_lifecycle_guard = if model.is_some() {
         Some(state.model_lifecycle.lock().await)
     } else {
@@ -5191,6 +5261,7 @@ async fn create_provider(
         &arguments,
     )?;
     validate_provider_sensitive_fields(&kind, role, mode, model.as_deref(), credential.is_some())?;
+    validate_provider_context_window(role, context_window_tokens)?;
     if matches!(&kind, ProviderKindView::NativeOs) {
         let availability = crate::state::native_tts_availability(&state.config);
         if !availability.available {
@@ -5216,6 +5287,7 @@ async fn create_provider(
         arguments,
         status: ProviderStatusView::Unconfigured,
         model,
+        context_window_tokens,
         credential_configured: false,
         capabilities: Some(capabilities),
         capability_source: Some("built_in_adapter_contract".to_owned()),
@@ -5341,6 +5413,9 @@ async fn update_provider(
     if let Some(model) = input.model {
         updated.model = model;
     }
+    if let Some(context_window_tokens) = input.context_window_tokens {
+        updated.context_window_tokens = context_window_tokens;
+    }
     let piper_model_changed =
         matches!(updated.kind, ProviderKindView::Piper) && previous_model != updated.model;
     if previous_role != updated.role || piper_model_changed {
@@ -5391,6 +5466,7 @@ async fn update_provider(
                 && is_native_provider(&updated.kind, updated.mode)
                 && secret_id.is_some()),
     )?;
+    validate_provider_context_window(updated.role, updated.context_window_tokens)?;
     updated.capabilities = Some(default_capabilities(
         &updated.kind,
         updated.role,
@@ -7120,6 +7196,12 @@ pub(crate) async fn persist_provider(
     if let Some(model) = &profile.model {
         settings.insert("model".to_owned(), serde_json::Value::String(model.clone()));
     }
+    if let Some(tokens) = profile.context_window_tokens {
+        settings.insert(
+            "context_window_tokens".to_owned(),
+            serde_json::json!(tokens),
+        );
+    }
     let mut capability_snapshot = profile.capabilities.as_ref().map(|capabilities| {
         let observed_at = profile.capability_updated_at.unwrap_or(now);
         let reasoning = ReasoningCapability {
@@ -7229,7 +7311,7 @@ pub(crate) async fn persist_provider(
                             _ => TemperatureCapability::Unsupported,
                         },
                         reasoning,
-                        context_window_tokens: None,
+                        context_window_tokens: profile.context_window_tokens,
                     }
                 }),
                 control: (capabilities.process_control || capabilities.model_control).then_some({
@@ -8486,6 +8568,26 @@ fn validate_provider_sensitive_fields(
     Ok(())
 }
 
+fn validate_provider_context_window(
+    role: ProviderRoleView,
+    context_window_tokens: Option<u64>,
+) -> Result<(), ServiceError> {
+    let Some(tokens) = context_window_tokens else {
+        return Ok(());
+    };
+    if !matches!(role, ProviderRoleView::Llm) {
+        return Err(ServiceError::InvalidRequest(
+            "only LLM provider profiles may define a context window".to_owned(),
+        ));
+    }
+    if !(2_048..=2_097_152).contains(&tokens) {
+        return Err(ServiceError::InvalidRequest(
+            "provider context window must be between 2048 and 2097152 tokens".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// `openai_tts` is retained only as a wire-compatible legacy input. New and edited profiles use
 /// the single dual-role `OpenAI` kind, with `role` selecting the speech or Responses adapter.
 fn canonical_provider_kind(kind: ProviderKindView) -> ProviderKindView {
@@ -8885,6 +8987,7 @@ mod tests {
             arguments: Vec::new(),
             status: ProviderStatusView::Online,
             model: Some("tts-model".to_owned()),
+            context_window_tokens: None,
             credential_configured: false,
             capabilities: Some(default_capabilities(
                 &ProviderKindView::Localai,
@@ -9005,6 +9108,7 @@ mod tests {
             arguments: Vec::new(),
             status: ProviderStatusView::Offline,
             model: Some("local-model".to_owned()),
+            context_window_tokens: None,
             credential_configured: false,
             capabilities: Some(default_capabilities(
                 &ProviderKindView::OpenaiCompatible,
@@ -9060,6 +9164,37 @@ mod tests {
             .and_then(|stored| stored.capability_snapshot)
             .expect("changed capability snapshot");
         assert_ne!(changed.id, first.id);
+
+        profile.context_window_tokens = Some(4_096);
+        persist_provider(&state, &profile, None)
+            .await
+            .expect("changed context contract");
+        let stored = state
+            .database
+            .repositories()
+            .providers
+            .get(audiobookai_core::ProviderProfileId::from_uuid(profile.id))
+            .await
+            .expect("read context-aware provider")
+            .expect("stored provider");
+        assert_eq!(
+            stored
+                .settings
+                .0
+                .get("context_window_tokens")
+                .and_then(serde_json::Value::as_u64),
+            Some(4_096)
+        );
+        let context_snapshot = stored.capability_snapshot.expect("context snapshot");
+        assert_ne!(context_snapshot.id, changed.id);
+        assert_eq!(
+            context_snapshot
+                .capabilities
+                .character_detection
+                .expect("character capabilities")
+                .context_window_tokens,
+            Some(4_096)
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -9098,6 +9233,7 @@ mod tests {
                 working_directory: None,
                 arguments: None,
                 model: None,
+                context_window_tokens: None,
                 credential: None,
             }),
         )
@@ -9305,6 +9441,7 @@ mod tests {
             arguments: Vec::new(),
             status: ProviderStatusView::Unconfigured,
             model: None,
+            context_window_tokens: None,
             credential_configured: true,
             capabilities: Some(default_capabilities(
                 &ProviderKindView::NativeOs,
@@ -9535,6 +9672,7 @@ mod tests {
             arguments: Vec::new(),
             status: ProviderStatusView::Online,
             model: Some("fixture-model".to_owned()),
+            context_window_tokens: None,
             credential_configured: false,
             capabilities: Some(default_capabilities(
                 &ProviderKindView::Localai,
@@ -9639,6 +9777,7 @@ mod tests {
             arguments: Vec::new(),
             status: ProviderStatusView::Online,
             model: None,
+            context_window_tokens: None,
             credential_configured: false,
             capabilities: Some(default_capabilities(
                 &ProviderKindView::Localai,
@@ -9680,6 +9819,7 @@ mod tests {
             "executablePath": null,
             "workingDirectory": null,
             "model": null,
+            "contextWindowTokens": null,
             "arguments": []
         }))
         .expect("clear patch");
@@ -9689,7 +9829,16 @@ mod tests {
         assert!(matches!(cleared.executable_path, Some(None)));
         assert!(matches!(cleared.working_directory, Some(None)));
         assert!(matches!(cleared.model, Some(None)));
+        assert!(matches!(cleared.context_window_tokens, Some(None)));
         assert_eq!(cleared.arguments, Some(Vec::new()));
+    }
+
+    #[test]
+    fn provider_context_window_is_llm_only_and_bounded() {
+        assert!(validate_provider_context_window(ProviderRoleView::Llm, Some(4_096)).is_ok());
+        assert!(validate_provider_context_window(ProviderRoleView::Tts, Some(4_096)).is_err());
+        assert!(validate_provider_context_window(ProviderRoleView::Llm, Some(2_047)).is_err());
+        assert!(validate_provider_context_window(ProviderRoleView::Llm, Some(2_097_153)).is_err());
     }
 
     #[test]
@@ -9971,6 +10120,7 @@ mod tests {
                 arguments: Vec::new(),
                 status: ProviderStatusView::Offline,
                 model: Some(model.to_owned()),
+                context_window_tokens: None,
                 credential_configured: false,
                 capabilities: Some(default_capabilities(
                     &ProviderKindView::Openai,
@@ -10068,6 +10218,7 @@ mod tests {
             arguments: Vec::new(),
             status: ProviderStatusView::Offline,
             model: Some("fixture-chat".to_owned()),
+            context_window_tokens: None,
             credential_configured: false,
             capabilities: Some(default_capabilities(
                 &ProviderKindView::OpenaiCompatible,
@@ -10094,6 +10245,91 @@ mod tests {
             refreshed.capability_source.as_deref(),
             Some("built_in_adapter_contract+health_probe")
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn provider_listing_recovers_an_external_lm_studio_started_late() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("fixture listener");
+        let address = listener.local_addr().expect("fixture address");
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().route(
+                    "/v1/models",
+                    axum::routing::get(|| async { axum::Json(serde_json::json!({ "data": [] })) }),
+                ),
+            )
+            .await
+            .expect("fixture server");
+        });
+        let directory = tempfile::tempdir().expect("tempdir");
+        let database = audiobookai_storage::Database::open_in(directory.path())
+            .await
+            .expect("database");
+        let state = Arc::new(
+            AppState::new(
+                crate::ServiceConfig {
+                    bind: "127.0.0.1:0".parse().expect("address"),
+                    data_dir: directory.path().to_path_buf(),
+                    bundled_sidecar_dir: None,
+                    tls: None,
+                    lan_hostnames: Vec::new(),
+                    allow_insecure_lan: false,
+                    desktop_bootstrap: false,
+                },
+                database,
+            )
+            .await
+            .expect("state"),
+        );
+        let id = Uuid::new_v4();
+        let profile = ProviderProfileView {
+            id,
+            name: "LM Studio".to_owned(),
+            kind: ProviderKindView::LmStudio,
+            role: ProviderRoleView::Llm,
+            mode: ProviderModeView::ExternalEndpoint,
+            endpoint: Some(format!("http://{address}/")),
+            executable_path: None,
+            working_directory: None,
+            arguments: Vec::new(),
+            status: ProviderStatusView::Offline,
+            model: Some("fixture-chat".to_owned()),
+            context_window_tokens: None,
+            credential_configured: false,
+            capabilities: Some(default_capabilities(
+                &ProviderKindView::LmStudio,
+                ProviderRoleView::Llm,
+                ProviderModeView::ExternalEndpoint,
+            )),
+            capability_source: Some("built_in_adapter_contract".to_owned()),
+            capability_updated_at: Some(Utc::now()),
+            last_error: None,
+        };
+        persist_provider(&state, &profile, None)
+            .await
+            .expect("persist provider");
+        state.catalog.write().await.providers.insert(id, profile);
+        state
+            .sync_provider_runtime(id)
+            .await
+            .expect("register runtime");
+
+        recover_stale_external_lm_studio_statuses(&state).await;
+
+        assert!(matches!(
+            state
+                .catalog
+                .read()
+                .await
+                .providers
+                .get(&id)
+                .map(|profile| profile.status),
+            Some(ProviderStatusView::Online)
+        ));
         server.abort();
     }
 
@@ -10232,6 +10468,7 @@ mod tests {
             arguments: Vec::new(),
             status: ProviderStatusView::Offline,
             model: None,
+            context_window_tokens: None,
             credential_configured: false,
             capabilities: Some(default_capabilities(
                 &ProviderKindView::Ollama,
@@ -10436,6 +10673,7 @@ mod tests {
                     working_directory: None,
                     arguments: None,
                     model: None,
+                    context_window_tokens: None,
                     credential: None,
                 }),
             )
@@ -10605,6 +10843,7 @@ mod tests {
             arguments: Vec::new(),
             status: ProviderStatusView::Offline,
             model: None,
+            context_window_tokens: None,
             credential_configured: false,
             capabilities: None,
             capability_source: None,

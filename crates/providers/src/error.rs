@@ -15,6 +15,8 @@ pub enum ProviderError {
     UncertainCharge,
     #[error("provider returned HTTP {status}: {message}")]
     Http { status: u16, message: String },
+    #[error("provider model context window is too small for the request")]
+    ContextWindowExceeded,
     #[error("provider transport failed: {0}")]
     Transport(String),
     #[error("provider returned malformed data: {0}")]
@@ -31,6 +33,9 @@ pub enum ProviderError {
 
 impl ProviderError {
     pub fn from_status(status: u16, body: &[u8]) -> Self {
+        if is_context_window_error(status, body) {
+            return Self::ContextWindowExceeded;
+        }
         match status {
             401 | 403 => Self::Authentication,
             429 => Self::RateLimited { retry_after: None },
@@ -40,6 +45,59 @@ impl ProviderError {
             },
         }
     }
+}
+
+fn is_context_window_error(status: u16, body: &[u8]) -> bool {
+    if !matches!(status, 400 | 413 | 422) {
+        return false;
+    }
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    let symbolic = value
+        .pointer("/error/code")
+        .or_else(|| value.pointer("/error/type"))
+        .or_else(|| value.get("code"))
+        .or_else(|| value.get("type"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "context_length_exceeded"
+                    | "context_window_exceeded"
+                    | "context_overflow"
+                    | "max_context_length"
+                    | "prompt_too_long"
+                    | "too_many_tokens"
+            )
+        });
+    if symbolic {
+        return true;
+    }
+
+    // LM Studio versions also return a plain `error` string without a symbolic code. Inspect it
+    // only transiently for narrow context-overflow phrases; it is never retained or displayed.
+    let message = value
+        .get("error")
+        .and_then(|error| {
+            error
+                .as_str()
+                .or_else(|| error.get("message").and_then(serde_json::Value::as_str))
+        })
+        .or_else(|| value.get("message").and_then(serde_json::Value::as_str));
+    let Some(message) = message else {
+        return false;
+    };
+    let message = message.to_ascii_lowercase();
+    (message.contains("context length")
+        && (message.contains("not enough")
+            || message.contains("greater than")
+            || message.contains("exceed")
+            || message.contains("too small")))
+        || (message.contains("context window") && message.contains("exceed"))
+        || (message.contains("context the overflows") && message.contains("tokens"))
+        || (message.contains("tokens to keep") && message.contains("context"))
+        || (message.contains("available context size") && message.contains("tokens"))
 }
 
 fn sanitized_message(body: &[u8]) -> String {
@@ -90,5 +148,22 @@ mod tests {
             sanitized_message(b"arbitrary provider prose"),
             "provider returned an error response"
         );
+    }
+
+    #[test]
+    fn classifies_structured_and_lm_studio_context_overflow_without_retaining_text() {
+        assert!(matches!(
+            ProviderError::from_status(
+                400,
+                br#"{"error":{"code":"context_length_exceeded","message":"private book text"}}"#,
+            ),
+            ProviderError::ContextWindowExceeded
+        ));
+        let error = ProviderError::from_status(
+            400,
+            br#"{"error":"Trying to keep the first 9000 tokens when context the overflows. However, the model is loaded with context length of only 4096 tokens, which is not enough. private book text"}"#,
+        );
+        assert!(matches!(error, ProviderError::ContextWindowExceeded));
+        assert!(!error.to_string().contains("private book text"));
     }
 }

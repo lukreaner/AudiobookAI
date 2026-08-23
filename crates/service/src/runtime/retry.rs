@@ -281,7 +281,8 @@ pub const fn classify_provider_error(error: &ProviderError) -> FailureClass {
         ProviderError::Authentication => FailureClass::Authentication,
         ProviderError::Configuration(_)
         | ProviderError::Unsupported { .. }
-        | ProviderError::InvalidResponse(_) => FailureClass::Validation,
+        | ProviderError::InvalidResponse(_)
+        | ProviderError::ContextWindowExceeded => FailureClass::Validation,
         ProviderError::RateLimited { .. } | ProviderError::Http { status: 429, .. } => {
             FailureClass::RateLimited
         }

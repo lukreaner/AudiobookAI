@@ -9545,6 +9545,7 @@ mod tests {
             arguments: Vec::new(),
             status: crate::models::ProviderStatusView::Offline,
             model: Some("tts-1".to_owned()),
+            context_window_tokens: None,
             credential_configured: false,
             capabilities: None,
             capability_source: None,

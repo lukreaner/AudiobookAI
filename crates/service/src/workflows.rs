@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     str::FromStr,
     sync::{Arc, Mutex as StdMutex, OnceLock},
     time::Duration,
@@ -35,7 +35,15 @@ use crate::{
 
 const DETECTION_BATCH_PARAGRAPHS: usize = 24;
 const DETECTION_CONTEXT_OVERLAP: usize = 2;
-const DETECTION_JOB_SCHEMA_VERSION: u32 = 4;
+const DETECTION_JOB_SCHEMA_VERSION: u32 = 5;
+const DETECTION_DEFAULT_CONTEXT_TOKENS: u64 = 16_384;
+const LM_STUDIO_DEFAULT_CONTEXT_TOKENS: u64 = 4_096;
+const DETECTION_PROMPT_TOKEN_RESERVE: u64 = 1_024;
+const DETECTION_MIN_OUTPUT_TOKENS: u64 = 512;
+const DETECTION_MAX_OUTPUT_TOKENS: u64 = 4_096;
+const DETECTION_MIN_PARAGRAPH_TOKENS: u64 = 256;
+const DETECTION_PARAGRAPH_OVERHEAD_TOKENS: u64 = 128;
+const DETECTION_CONTEXT_FALLBACK_LIMIT: usize = 8;
 
 static ACTIVE_DETECTION_WORKERS: OnceLock<StdMutex<BTreeSet<Uuid>>> = OnceLock::new();
 
@@ -77,6 +85,10 @@ struct DetectionJobConfig {
     provider_snapshot_id: Option<Uuid>,
     temperature: Temperature,
     reasoning: ReasoningControl,
+    #[serde(default)]
+    context_window_tokens: Option<u64>,
+    #[serde(default)]
+    max_output_tokens: Option<u32>,
     detection_run_id: DetectionRunId,
     #[serde(default)]
     base_character_revision: u64,
@@ -126,6 +138,78 @@ enum DetectionPermission {
     Terminal,
 }
 
+async fn effective_detection_context_window(
+    state: &AppState,
+    profile: &ProviderProfileView,
+    model: &str,
+) -> Result<u64, ServiceError> {
+    let runtime_id = audiobookai_providers::ProviderId::new(profile.id.to_string())
+        .map_err(|error| ServiceError::Internal(error.to_string()))?;
+    let observed = match state.providers.character(&runtime_id).await {
+        Ok(provider) => {
+            match tokio::time::timeout(Duration::from_secs(4), provider.model_context_window(model))
+                .await
+            {
+                Ok(Ok(window)) => window,
+                Ok(Err(error)) => {
+                    tracing::debug!(
+                        diagnostic_code = "detection.context.discovery.failed",
+                        provider_id = %profile.id,
+                        %error,
+                        "provider context-window discovery failed; using the safe configured fallback"
+                    );
+                    audiobookai_providers::ModelContextWindow::default()
+                }
+                Err(_) => {
+                    tracing::debug!(
+                        diagnostic_code = "detection.context.discovery.timeout",
+                        provider_id = %profile.id,
+                        "provider context-window discovery timed out; using the safe configured fallback"
+                    );
+                    audiobookai_providers::ModelContextWindow::default()
+                }
+            }
+        }
+        Err(error) => {
+            tracing::debug!(
+                diagnostic_code = "detection.context.runtime_unavailable",
+                provider_id = %profile.id,
+                %error,
+                "provider context-window runtime is unavailable; using the safe configured fallback"
+            );
+            audiobookai_providers::ModelContextWindow::default()
+        }
+    };
+    Ok(select_effective_context_window(profile, observed))
+}
+
+fn select_effective_context_window(
+    profile: &ProviderProfileView,
+    observed: audiobookai_providers::ModelContextWindow,
+) -> u64 {
+    let configured = profile.context_window_tokens;
+    let detected_or_configured = match (observed.loaded_tokens, configured) {
+        (Some(loaded), Some(configured)) => Some(loaded.min(configured)),
+        (Some(loaded), None) => Some(loaded),
+        (None, configured) => configured,
+    };
+    let fallback = if matches!(profile.kind, crate::models::ProviderKindView::LmStudio) {
+        LM_STUDIO_DEFAULT_CONTEXT_TOKENS
+    } else {
+        DETECTION_DEFAULT_CONTEXT_TOKENS
+    };
+    let selected = detected_or_configured
+        .or_else(|| {
+            (!matches!(profile.kind, crate::models::ProviderKindView::LmStudio))
+                .then_some(observed.maximum_tokens)
+                .flatten()
+        })
+        .unwrap_or(fallback);
+    observed
+        .maximum_tokens
+        .map_or(selected, |maximum| selected.min(maximum))
+}
+
 /// Creates the complete durable detection graph before the first provider request is dispatched.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn persist_detection_job(
@@ -152,15 +236,18 @@ pub async fn persist_detection_job(
             "the selected chapters contain no speakable paragraphs".to_owned(),
         ));
     }
-    let batches = paragraph_batches(&paragraphs);
-    let provider_mode = state
+    let profile = state
         .catalog
         .read()
         .await
         .providers
         .get(&provider_id)
-        .map(|provider| provider.mode)
+        .cloned()
         .ok_or_else(|| ServiceError::Conflict("detection provider was removed".to_owned()))?;
+    let provider_mode = profile.mode;
+    let context_window_tokens = effective_detection_context_window(state, &profile, &model).await?;
+    let context_budget = DetectionContextBudget::new(context_window_tokens)?;
+    let batches = paragraph_batches(&paragraphs, context_budget)?;
     let provider_snapshot_id = state
         .database
         .repositories()
@@ -185,6 +272,8 @@ pub async fn persist_detection_job(
         provider_snapshot_id: Some(provider_snapshot_id),
         temperature,
         reasoning,
+        context_window_tokens: Some(context_window_tokens),
+        max_output_tokens: Some(context_budget.max_output),
         detection_run_id,
         base_character_revision,
     };
@@ -415,7 +504,7 @@ async fn run_character_detection_inner(
                 .to_owned(),
         ));
     }
-    let batches = paragraph_batches(&paragraphs);
+    let batches = detection_batches_for_config(&paragraphs, &config)?;
     if batches.len() != units.len() {
         return Err(ServiceError::Conflict(
             "the durable detection graph no longer matches the selected text".to_owned(),
@@ -602,6 +691,146 @@ struct DetectionSourceParagraph {
     chapter_id: audiobookai_core::ChapterId,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DetectionContextBudget {
+    context_window: u64,
+    paragraph_budget: u64,
+    max_output: u32,
+    safety_margin: u64,
+}
+
+impl DetectionContextBudget {
+    fn new(context_window_tokens: u64) -> Result<Self, ServiceError> {
+        let safety_tokens = (context_window_tokens / 16).clamp(128, 1_024);
+        let fixed = DETECTION_PROMPT_TOKEN_RESERVE.saturating_add(safety_tokens);
+        let available = context_window_tokens.checked_sub(fixed).ok_or_else(|| {
+            ServiceError::Conflict(
+                "the configured model context window is too small for character detection"
+                    .to_owned(),
+            )
+        })?;
+        if available < DETECTION_MIN_OUTPUT_TOKENS.saturating_add(DETECTION_MIN_PARAGRAPH_TOKENS) {
+            return Err(ServiceError::Conflict(
+                "the configured model context window is too small for character detection"
+                    .to_owned(),
+            ));
+        }
+        let desired_output = (context_window_tokens / 4)
+            .clamp(DETECTION_MIN_OUTPUT_TOKENS, DETECTION_MAX_OUTPUT_TOKENS);
+        let output_tokens = desired_output.min(available - DETECTION_MIN_PARAGRAPH_TOKENS);
+        let max_output_tokens = u32::try_from(output_tokens).map_err(|_| {
+            ServiceError::Conflict("the configured model output limit is too large".to_owned())
+        })?;
+        Ok(Self {
+            context_window: context_window_tokens,
+            paragraph_budget: available - output_tokens,
+            max_output: max_output_tokens,
+            safety_margin: safety_tokens,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DetectionFragment {
+    request_id: String,
+    source_id: String,
+    source_byte_start: usize,
+    text: String,
+}
+
+#[derive(Clone, Debug)]
+struct DetectionBatchParagraph {
+    fragment: DetectionFragment,
+    context_only: bool,
+}
+
+#[derive(Clone, Debug)]
+struct DetectionBatch {
+    paragraphs: Vec<DetectionBatchParagraph>,
+    max_output_tokens: u32,
+}
+
+impl DetectionBatch {
+    fn request_paragraphs(&self) -> Vec<DetectionParagraph> {
+        self.paragraphs
+            .iter()
+            .map(|paragraph| DetectionParagraph {
+                id: paragraph.fragment.request_id.clone(),
+                text: paragraph.fragment.text.clone(),
+                context_only: paragraph.context_only,
+            })
+            .collect()
+    }
+
+    fn core_paragraphs(&self) -> Vec<DetectionFragment> {
+        self.paragraphs
+            .iter()
+            .filter(|paragraph| !paragraph.context_only)
+            .map(|paragraph| paragraph.fragment.clone())
+            .collect()
+    }
+
+    fn split_for_context_retry(&self) -> Result<Vec<Self>, ServiceError> {
+        let core = self.core_paragraphs();
+        let fallback_output = if self.max_output_tokens > 256 {
+            (self.max_output_tokens / 2).max(256)
+        } else {
+            self.max_output_tokens
+        };
+        if core.len() > 1 {
+            let middle = core.len().div_ceil(2);
+            return Ok([&core[..middle], &core[middle..]]
+                .into_iter()
+                .filter(|paragraphs| !paragraphs.is_empty())
+                .map(|paragraphs| Self {
+                    paragraphs: paragraphs
+                        .iter()
+                        .cloned()
+                        .map(|fragment| DetectionBatchParagraph {
+                            fragment,
+                            context_only: false,
+                        })
+                        .collect(),
+                    max_output_tokens: fallback_output,
+                })
+                .collect());
+        }
+        let Some(fragment) = core.first() else {
+            return Err(ServiceError::Conflict(
+                "character-detection context fallback has no source text".to_owned(),
+            ));
+        };
+        if fragment.text.chars().count() > 1 {
+            let end = preferred_fragment_end(&fragment.text, 0, fragment.text.len() / 2);
+            if end > 0 && end < fragment.text.len() {
+                let fragments = [
+                    detection_fragment_slice(fragment, 0, end),
+                    detection_fragment_slice(fragment, end, fragment.text.len()),
+                ];
+                return Ok(fragments
+                    .into_iter()
+                    .map(|fragment| Self {
+                        paragraphs: vec![DetectionBatchParagraph {
+                            fragment,
+                            context_only: false,
+                        }],
+                        max_output_tokens: fallback_output,
+                    })
+                    .collect());
+            }
+        }
+        if self.max_output_tokens > 256 {
+            return Ok(vec![Self {
+                paragraphs: self.paragraphs.clone(),
+                max_output_tokens: fallback_output,
+            }]);
+        }
+        Err(ServiceError::Conflict(
+            "the provider context window remains too small after adaptive batching".to_owned(),
+        ))
+    }
+}
+
 async fn selected_paragraphs(
     state: &AppState,
     project: &audiobookai_core::Project,
@@ -632,44 +861,240 @@ async fn selected_paragraphs(
     Ok(output)
 }
 
-fn paragraph_batches(paragraphs: &[DetectionSourceParagraph]) -> Vec<Vec<DetectionParagraph>> {
+fn legacy_paragraph_batches(paragraphs: &[DetectionSourceParagraph]) -> Vec<DetectionBatch> {
     (0..paragraphs.len())
         .step_by(DETECTION_BATCH_PARAGRAPHS)
         .map(|start| {
             let end = (start + DETECTION_BATCH_PARAGRAPHS).min(paragraphs.len());
             let context_start = start.saturating_sub(DETECTION_CONTEXT_OVERLAP);
             let context_end = (end + DETECTION_CONTEXT_OVERLAP).min(paragraphs.len());
-            paragraphs[context_start..context_end]
-                .iter()
-                .enumerate()
-                .map(|(offset, paragraph)| {
-                    let absolute = context_start + offset;
-                    DetectionParagraph {
-                        id: paragraph.id.to_string(),
-                        text: paragraph.text.clone(),
-                        context_only: absolute < start || absolute >= end,
-                    }
-                })
-                .collect()
+            DetectionBatch {
+                paragraphs: paragraphs[context_start..context_end]
+                    .iter()
+                    .enumerate()
+                    .map(|(offset, paragraph)| {
+                        let absolute = context_start + offset;
+                        let source_id = paragraph.id.to_string();
+                        DetectionBatchParagraph {
+                            fragment: DetectionFragment {
+                                request_id: source_id.clone(),
+                                source_id,
+                                source_byte_start: 0,
+                                text: paragraph.text.clone(),
+                            },
+                            context_only: absolute < start || absolute >= end,
+                        }
+                    })
+                    .collect(),
+                max_output_tokens: 4_096,
+            }
         })
         .collect()
 }
 
+fn paragraph_batches(
+    paragraphs: &[DetectionSourceParagraph],
+    budget: DetectionContextBudget,
+) -> Result<Vec<DetectionBatch>, ServiceError> {
+    let mut fragments = Vec::new();
+    for paragraph in paragraphs {
+        fragments.extend(fragment_source_paragraph(
+            paragraph,
+            budget.paragraph_budget,
+        )?);
+    }
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    while start < fragments.len() {
+        let mut end = start;
+        let mut tokens = 0_u64;
+        while end < fragments.len() && end - start < DETECTION_BATCH_PARAGRAPHS {
+            let next = detection_fragment_tokens(&fragments[end]);
+            if end > start && tokens.saturating_add(next) > budget.paragraph_budget {
+                break;
+            }
+            if next > budget.paragraph_budget {
+                return Err(ServiceError::Conflict(
+                    "a paragraph fragment exceeds the character-detection token budget".to_owned(),
+                ));
+            }
+            tokens = tokens.saturating_add(next);
+            end += 1;
+        }
+        if end == start {
+            return Err(ServiceError::Conflict(
+                "the character-detection token budget produced an empty batch".to_owned(),
+            ));
+        }
+        ranges.push((start, end, tokens));
+        start = end;
+    }
+
+    Ok(ranges
+        .into_iter()
+        .map(|(start, end, mut tokens)| {
+            let mut indexes = BTreeMap::new();
+            for index in start..end {
+                indexes.insert(index, false);
+            }
+            let before_start = start.saturating_sub(DETECTION_CONTEXT_OVERLAP);
+            for index in (before_start..start)
+                .rev()
+                .chain(end..(end + DETECTION_CONTEXT_OVERLAP).min(fragments.len()))
+            {
+                let next = detection_fragment_tokens(&fragments[index]);
+                if tokens.saturating_add(next) <= budget.paragraph_budget {
+                    tokens = tokens.saturating_add(next);
+                    indexes.insert(index, true);
+                }
+            }
+            DetectionBatch {
+                paragraphs: indexes
+                    .into_iter()
+                    .map(|(index, context_only)| DetectionBatchParagraph {
+                        fragment: fragments[index].clone(),
+                        context_only,
+                    })
+                    .collect(),
+                max_output_tokens: budget.max_output,
+            }
+        })
+        .collect())
+}
+
+fn detection_batches_for_config(
+    paragraphs: &[DetectionSourceParagraph],
+    config: &DetectionJobConfig,
+) -> Result<Vec<DetectionBatch>, ServiceError> {
+    if config.schema_version < DETECTION_JOB_SCHEMA_VERSION {
+        return Ok(legacy_paragraph_batches(paragraphs));
+    }
+    let context_window_tokens = config.context_window_tokens.ok_or_else(|| {
+        ServiceError::Conflict(
+            "the durable detection job is missing its context-window budget".to_owned(),
+        )
+    })?;
+    let budget = DetectionContextBudget::new(context_window_tokens)?;
+    if config.max_output_tokens != Some(budget.max_output) {
+        return Err(ServiceError::Conflict(
+            "the durable detection job has an inconsistent output-token budget".to_owned(),
+        ));
+    }
+    paragraph_batches(paragraphs, budget)
+}
+
+fn fragment_source_paragraph(
+    paragraph: &DetectionSourceParagraph,
+    paragraph_tokens: u64,
+) -> Result<Vec<DetectionFragment>, ServiceError> {
+    let source_id = paragraph.id.to_string();
+    let unsplit = DetectionFragment {
+        request_id: source_id.clone(),
+        source_id: source_id.clone(),
+        source_byte_start: 0,
+        text: paragraph.text.clone(),
+    };
+    if detection_fragment_tokens(&unsplit) <= paragraph_tokens {
+        return Ok(vec![unsplit]);
+    }
+    let fixed = DETECTION_PARAGRAPH_OVERHEAD_TOKENS
+        .saturating_add(u64::try_from(source_id.len()).unwrap_or(u64::MAX))
+        .saturating_add(21);
+    let max_text_bytes = paragraph_tokens
+        .checked_sub(fixed)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            ServiceError::Conflict(
+                "the configured context window cannot hold a paragraph fragment".to_owned(),
+            )
+        })?;
+    let mut fragments = Vec::new();
+    let mut start = 0;
+    while start < paragraph.text.len() {
+        let end = preferred_fragment_end(&paragraph.text, start, max_text_bytes);
+        if end <= start {
+            return Err(ServiceError::Conflict(
+                "a paragraph could not be split at a UTF-8 boundary".to_owned(),
+            ));
+        }
+        let fragment = DetectionFragment {
+            request_id: format!("{source_id}@{start}"),
+            source_id: source_id.clone(),
+            source_byte_start: start,
+            text: paragraph.text[start..end].to_owned(),
+        };
+        if detection_fragment_tokens(&fragment) > paragraph_tokens {
+            return Err(ServiceError::Conflict(
+                "a paragraph fragment exceeds the configured context window".to_owned(),
+            ));
+        }
+        fragments.push(fragment);
+        start = end;
+    }
+    Ok(fragments)
+}
+
+fn preferred_fragment_end(text: &str, start: usize, max_bytes: usize) -> usize {
+    if start >= text.len() {
+        return text.len();
+    }
+    let mut hard_end = start.saturating_add(max_bytes).min(text.len());
+    while hard_end > start && !text.is_char_boundary(hard_end) {
+        hard_end -= 1;
+    }
+    if hard_end == text.len() || hard_end == start {
+        return hard_end;
+    }
+    let minimum = max_bytes / 2;
+    text[start..hard_end]
+        .char_indices()
+        .rev()
+        .find_map(|(offset, character)| {
+            (character.is_whitespace() && offset >= minimum)
+                .then_some(start + offset + character.len_utf8())
+        })
+        .unwrap_or(hard_end)
+}
+
+fn detection_fragment_slice(
+    fragment: &DetectionFragment,
+    start: usize,
+    end: usize,
+) -> DetectionFragment {
+    let source_byte_start = fragment.source_byte_start.saturating_add(start);
+    DetectionFragment {
+        request_id: format!("{}@{source_byte_start}", fragment.source_id),
+        source_id: fragment.source_id.clone(),
+        source_byte_start,
+        text: fragment.text[start..end].to_owned(),
+    }
+}
+
+fn detection_fragment_tokens(fragment: &DetectionFragment) -> u64 {
+    u64::try_from(fragment.text.len())
+        .unwrap_or(u64::MAX)
+        .saturating_add(u64::try_from(fragment.request_id.len()).unwrap_or(u64::MAX))
+        .saturating_add(DETECTION_PARAGRAPH_OVERHEAD_TOKENS)
+}
+
 fn detection_request_estimate(
-    paragraphs: &[DetectionParagraph],
+    batch: &DetectionBatch,
     reasoning: &ReasoningControl,
 ) -> UsageQuantities {
-    let characters = paragraphs.iter().fold(0_u64, |total, paragraph| {
-        total.saturating_add(u64::try_from(paragraph.text.chars().count()).unwrap_or(u64::MAX))
+    let characters = batch.paragraphs.iter().fold(0_u64, |total, paragraph| {
+        total.saturating_add(
+            u64::try_from(paragraph.fragment.text.chars().count()).unwrap_or(u64::MAX),
+        )
     });
     // A byte-per-token upper estimate plus stable schema/prompt and paragraph-ID overhead is
     // deliberately conservative across tokenizers without persisting the source text.
-    let input_tokens = paragraphs.iter().fold(2_048_u64, |total, paragraph| {
-        total
-            .saturating_add(u64::try_from(paragraph.text.len()).unwrap_or(u64::MAX))
-            .saturating_add(u64::try_from(paragraph.id.len()).unwrap_or(u64::MAX))
-            .saturating_add(128)
-    });
+    let input_tokens = batch
+        .paragraphs
+        .iter()
+        .fold(DETECTION_PROMPT_TOKEN_RESERVE, |total, paragraph| {
+            total.saturating_add(detection_fragment_tokens(&paragraph.fragment))
+        });
     let reasoning_tokens = match reasoning {
         ReasoningControl::Disabled => 0,
         ReasoningControl::TokenBudget { tokens } => u64::from(*tokens),
@@ -684,7 +1109,7 @@ fn detection_request_estimate(
     UsageQuantities {
         characters: Some(characters),
         input_tokens: Some(input_tokens),
-        output_tokens: Some(4_096),
+        output_tokens: Some(u64::from(batch.max_output_tokens)),
         reasoning_tokens: Some(reasoning_tokens),
         ..UsageQuantities::default()
     }
@@ -801,6 +1226,7 @@ pub async fn reset_detection_units_for_restart(
         }
         if explicit_retry {
             unit.payload.remove("requestId");
+            unit.payload.remove("contextFallbackCount");
             unit.payload.insert(
                 "dispatchState".to_owned(),
                 serde_json::json!("explicit_retry"),
@@ -871,6 +1297,7 @@ pub(crate) async fn prepare_detection_retry_units(
         )
         .await?;
         unit.payload.remove("requestId");
+        unit.payload.remove("contextFallbackCount");
         unit.payload.insert(
             "dispatchState".to_owned(),
             serde_json::json!("explicit_retry"),
@@ -1392,6 +1819,7 @@ fn progress_fraction(completed: u64, total: u64) -> f32 {
 fn detection_request(
     model: &str,
     paragraphs: &[DetectionParagraph],
+    max_output_tokens: u32,
     repair: bool,
     temperature: Temperature,
     reasoning: ReasoningControl,
@@ -1407,7 +1835,7 @@ fn detection_request(
         paragraphs: paragraphs.to_vec(),
         temperature,
         reasoning,
-        max_output_tokens: 4_096,
+        max_output_tokens,
     }
 }
 
@@ -1556,7 +1984,10 @@ fn detection_config(unit: &JobUnit) -> Result<DetectionJobConfig, ServiceError> 
     let config: DetectionJobConfig = serde_json::from_value(config).map_err(|error| {
         ServiceError::Conflict(format!("invalid detection job config: {error}"))
     })?;
-    if !matches!(config.schema_version, 2 | 3 | DETECTION_JOB_SCHEMA_VERSION) {
+    if !matches!(
+        config.schema_version,
+        2 | 3 | 4 | DETECTION_JOB_SCHEMA_VERSION
+    ) {
         return Err(ServiceError::Conflict(format!(
             "unsupported detection job schema version {}",
             config.schema_version
@@ -1854,126 +2285,249 @@ async fn execute_detection_batch(
     provider: &Arc<dyn audiobookai_providers::CharacterProvider>,
     policy: &RetryPolicy,
     config: &DetectionJobConfig,
-    batch: &[DetectionParagraph],
+    batch: &DetectionBatch,
     unit: &mut JobUnit,
     profile: &ProviderProfileView,
     project_id: Uuid,
 ) -> Result<Option<CharacterDetectionResult>, ServiceError> {
-    let mut repair = unit
+    let initial_repair = unit
         .payload
         .get("needsRepair")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    loop {
-        if repair {
-            let mut run = load_detection_run(state, config.detection_run_id).await?;
-            if !run.repair_attempted {
-                run.repair_attempted = true;
-                update_detection_run(state, &run).await?;
-            }
-        }
-        let request = detection_request(
-            &config.model,
-            batch,
-            repair,
-            config.temperature,
-            config.reasoning.clone(),
-        );
-        unit.payload.insert(
-            "requestId".to_owned(),
-            serde_json::json!(request.request_id),
-        );
-        unit.payload
-            .insert("dispatchState".to_owned(), serde_json::json!("prepared"));
-        mark_detection_unit(state, unit, JobUnitState::Running, None).await?;
-        let attempt_offset = durable_attempt_offset(state, unit.id).await?;
-        let request_estimate = detection_unit_estimate(unit)?;
-        let dispatch_estimate = crate::accounting::rate_usage_estimate(
-            state,
-            ProviderProfileId::from_uuid(config.provider_profile_id),
-            UsageWorkload::CharacterDetection,
-            Some(config.model.clone()),
-            request_estimate.clone(),
-        )
-        .await?;
-        let journal = SqliteRetryJournal {
-            state: Arc::clone(state),
-            unit_id: unit.id,
-            attempt_offset,
-            usage_context: DetectionUsageContext {
-                project_id,
-                job_id: unit.job_id,
-                profile: profile.clone(),
-                request_estimate,
-                provider_request_id: request.request_id,
-                rate_card_id: detection_unit_rate_card(unit)?,
-            },
-        };
-        let durable_job_id = unit.job_id;
-        let dispatch_consent_lock = state.dispatch_consent_lifecycle_lock(project_id).await;
-        let execution = execute_with_retry(policy, &journal, |attempt| {
-            let state = Arc::clone(state);
-            let provider = Arc::clone(provider);
-            let request = request.clone();
-            let config = config.clone();
-            let journal = journal.clone();
-            let dispatch_estimate = dispatch_estimate.clone();
-            let dispatch_consent_lock = Arc::clone(&dispatch_consent_lock);
-            async move {
-                let _dispatch_consent_guard = dispatch_consent_lock.read().await;
-                detection_dispatch_guard(&state, &config, durable_job_id, &dispatch_estimate)
-                    .await?;
-                journal
-                    .record_dispatch_started(attempt, request.request_id)
-                    .await
-                    .map_err(|error| ProviderError::Process(error.to_string()))?;
-                provider.detect_characters(request).await
-            }
-        })
-        .await;
-        unit.attempt_count = durable_attempt_offset(state, unit.id).await?;
-        match execution {
-            Ok(execution) => return Ok(Some(execution.value)),
-            Err(crate::runtime::RetryExecutionError::Provider {
-                source: ProviderError::InvalidResponse(_),
-                ..
-            }) if !repair => {
-                repair = true;
-                unit.payload
-                    .insert("needsRepair".to_owned(), serde_json::json!(true));
-                unit.payload.remove("requestId");
-                unit.payload
-                    .insert("dispatchState".to_owned(), serde_json::json!("prepared"));
-                mark_detection_unit(state, unit, JobUnitState::Running, None).await?;
-            }
-            Err(crate::runtime::RetryExecutionError::Provider {
-                source: ProviderError::Cancelled,
-                ..
-            }) => {
-                let job = state
-                    .database
-                    .repositories()
-                    .jobs
-                    .get(unit.job_id)
-                    .await
-                    .map_err(storage_error)?
-                    .ok_or(ServiceError::NotFound)?;
-                if matches!(
-                    job.state,
-                    JobState::Pausing
-                        | JobState::Paused
-                        | JobState::Cancelling
-                        | JobState::Cancelled
-                ) {
-                    return Ok(None);
+    let mut pending = VecDeque::from([(batch.clone(), initial_repair)]);
+    let mut context_fallbacks = unit
+        .payload
+        .get("contextFallbackCount")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or_default();
+    let mut combined = CharacterDetectionResult {
+        characters: Vec::new(),
+        dialogue: Vec::new(),
+        usage: ProviderUsage::default(),
+    };
+    let mut completed_requests = 0_usize;
+    while let Some((current_batch, mut repair)) = pending.pop_front() {
+        loop {
+            if repair {
+                let mut run = load_detection_run(state, config.detection_run_id).await?;
+                if !run.repair_attempted {
+                    run.repair_attempted = true;
+                    update_detection_run(state, &run).await?;
                 }
-                return Err(ServiceError::Conflict(
-                    "character-detection provider cancelled the request".to_owned(),
-                ));
             }
-            Err(error) => return Err(ServiceError::Conflict(error.to_string())),
+            let request_paragraphs = current_batch.request_paragraphs();
+            let request = detection_request(
+                &config.model,
+                &request_paragraphs,
+                current_batch.max_output_tokens,
+                repair,
+                config.temperature,
+                config.reasoning.clone(),
+            );
+            unit.payload.insert(
+                "requestId".to_owned(),
+                serde_json::json!(request.request_id),
+            );
+            unit.payload
+                .insert("dispatchState".to_owned(), serde_json::json!("prepared"));
+            mark_detection_unit(state, unit, JobUnitState::Running, None).await?;
+            let attempt_offset = durable_attempt_offset(state, unit.id).await?;
+            let request_estimate = detection_request_estimate(&current_batch, &config.reasoning);
+            let dispatch_estimate = crate::accounting::rate_usage_estimate(
+                state,
+                ProviderProfileId::from_uuid(config.provider_profile_id),
+                UsageWorkload::CharacterDetection,
+                Some(config.model.clone()),
+                request_estimate.clone(),
+            )
+            .await?;
+            let journal = SqliteRetryJournal {
+                state: Arc::clone(state),
+                unit_id: unit.id,
+                attempt_offset,
+                usage_context: DetectionUsageContext {
+                    project_id,
+                    job_id: unit.job_id,
+                    profile: profile.clone(),
+                    request_estimate,
+                    provider_request_id: request.request_id,
+                    rate_card_id: detection_unit_rate_card(unit)?,
+                },
+            };
+            let durable_job_id = unit.job_id;
+            let dispatch_consent_lock = state.dispatch_consent_lifecycle_lock(project_id).await;
+            let execution = execute_with_retry(policy, &journal, |attempt| {
+                let state = Arc::clone(state);
+                let provider = Arc::clone(provider);
+                let request = request.clone();
+                let config = config.clone();
+                let journal = journal.clone();
+                let dispatch_estimate = dispatch_estimate.clone();
+                let dispatch_consent_lock = Arc::clone(&dispatch_consent_lock);
+                async move {
+                    let _dispatch_consent_guard = dispatch_consent_lock.read().await;
+                    detection_dispatch_guard(&state, &config, durable_job_id, &dispatch_estimate)
+                        .await?;
+                    journal
+                        .record_dispatch_started(attempt, request.request_id)
+                        .await
+                        .map_err(|error| ProviderError::Process(error.to_string()))?;
+                    provider.detect_characters(request).await
+                }
+            })
+            .await;
+            unit.attempt_count = durable_attempt_offset(state, unit.id).await?;
+            match execution {
+                Ok(execution) => {
+                    let result = rebase_detection_result(execution.value, &current_batch)?;
+                    append_detection_result(&mut combined, result, completed_requests > 0);
+                    completed_requests = completed_requests.saturating_add(1);
+                    break;
+                }
+                Err(crate::runtime::RetryExecutionError::Provider {
+                    source: ProviderError::ContextWindowExceeded,
+                    ..
+                }) => {
+                    context_fallbacks = context_fallbacks.saturating_add(1);
+                    if context_fallbacks > DETECTION_CONTEXT_FALLBACK_LIMIT {
+                        return Err(ServiceError::Conflict(
+                            "the provider context window remains too small after adaptive batching"
+                                .to_owned(),
+                        ));
+                    }
+                    let children = current_batch.split_for_context_retry()?;
+                    unit.payload.insert(
+                        "contextFallbackCount".to_owned(),
+                        serde_json::json!(context_fallbacks),
+                    );
+                    unit.payload.remove("requestId");
+                    unit.payload.insert(
+                        "dispatchState".to_owned(),
+                        serde_json::json!("context_rebatch"),
+                    );
+                    mark_detection_unit(state, unit, JobUnitState::Running, None).await?;
+                    for child in children.into_iter().rev() {
+                        pending.push_front((child, repair));
+                    }
+                    break;
+                }
+                Err(crate::runtime::RetryExecutionError::Provider {
+                    source: ProviderError::InvalidResponse(_),
+                    ..
+                }) if !repair => {
+                    repair = true;
+                    unit.payload
+                        .insert("needsRepair".to_owned(), serde_json::json!(true));
+                    unit.payload.remove("requestId");
+                    unit.payload
+                        .insert("dispatchState".to_owned(), serde_json::json!("prepared"));
+                    mark_detection_unit(state, unit, JobUnitState::Running, None).await?;
+                }
+                Err(crate::runtime::RetryExecutionError::Provider {
+                    source: ProviderError::Cancelled,
+                    ..
+                }) => {
+                    let job = state
+                        .database
+                        .repositories()
+                        .jobs
+                        .get(unit.job_id)
+                        .await
+                        .map_err(storage_error)?
+                        .ok_or(ServiceError::NotFound)?;
+                    if matches!(
+                        job.state,
+                        JobState::Pausing
+                            | JobState::Paused
+                            | JobState::Cancelling
+                            | JobState::Cancelled
+                    ) {
+                        return Ok(None);
+                    }
+                    return Err(ServiceError::Conflict(
+                        "character-detection provider cancelled the request".to_owned(),
+                    ));
+                }
+                Err(error) => return Err(ServiceError::Conflict(error.to_string())),
+            }
         }
     }
+    Ok(Some(combined))
+}
+
+fn rebase_detection_result(
+    mut result: CharacterDetectionResult,
+    batch: &DetectionBatch,
+) -> Result<CharacterDetectionResult, ServiceError> {
+    let paragraphs = batch
+        .paragraphs
+        .iter()
+        .map(|paragraph| (paragraph.fragment.request_id.as_str(), paragraph))
+        .collect::<BTreeMap<_, _>>();
+    let mut dialogue = Vec::with_capacity(result.dialogue.len());
+    for mut span in result.dialogue {
+        let paragraph = paragraphs.get(span.paragraph_id.as_str()).ok_or_else(|| {
+            ServiceError::Conflict(
+                "provider returned dialogue for an unknown paragraph fragment".to_owned(),
+            )
+        })?;
+        if paragraph.context_only {
+            continue;
+        }
+        let source_start = u32::try_from(paragraph.fragment.source_byte_start).map_err(|_| {
+            ServiceError::Conflict("paragraph byte offset exceeds the supported range".to_owned())
+        })?;
+        span.start = span.start.checked_add(source_start).ok_or_else(|| {
+            ServiceError::Conflict("dialogue byte offset exceeds the supported range".to_owned())
+        })?;
+        span.end = span.end.checked_add(source_start).ok_or_else(|| {
+            ServiceError::Conflict("dialogue byte offset exceeds the supported range".to_owned())
+        })?;
+        span.paragraph_id.clone_from(&paragraph.fragment.source_id);
+        dialogue.push(span);
+    }
+    result.dialogue = dialogue;
+    Ok(result)
+}
+
+fn append_detection_result(
+    combined: &mut CharacterDetectionResult,
+    mut result: CharacterDetectionResult,
+    has_prior_usage: bool,
+) {
+    combined.characters.append(&mut result.characters);
+    combined.dialogue.append(&mut result.dialogue);
+    append_provider_usage(&mut combined.usage, result.usage, has_prior_usage);
+}
+
+fn append_provider_usage(combined: &mut ProviderUsage, next: ProviderUsage, has_prior_usage: bool) {
+    if !has_prior_usage {
+        *combined = next;
+        return;
+    }
+    let sum = |left: Option<u64>, right: Option<u64>| {
+        left.zip(right)
+            .map(|(left, right)| left.saturating_add(right))
+    };
+    combined.characters = sum(combined.characters, next.characters);
+    combined.audio_milliseconds = sum(combined.audio_milliseconds, next.audio_milliseconds);
+    combined.input_tokens = sum(combined.input_tokens, next.input_tokens);
+    combined.output_tokens = sum(combined.output_tokens, next.output_tokens);
+    combined.cached_tokens = sum(combined.cached_tokens, next.cached_tokens);
+    combined.reasoning_tokens = sum(combined.reasoning_tokens, next.reasoning_tokens);
+    combined.credits_micros = combined
+        .credits_micros
+        .zip(next.credits_micros)
+        .map(|(left, right)| left.saturating_add(right));
+    combined.source = match (combined.source, next.source) {
+        (UsageSource::Reported, UsageSource::Reported) => UsageSource::Reported,
+        (UsageSource::Estimated, UsageSource::Estimated) => UsageSource::Estimated,
+        _ => UsageSource::Unknown,
+    };
+    combined.request_id = None;
+    combined.raw_redacted = None;
 }
 
 async fn detection_dispatch_guard(
@@ -3054,8 +3608,20 @@ mod tests {
             provider_snapshot_id: Some(Uuid::new_v4()),
             temperature: Temperature::Default,
             reasoning: ReasoningControl::Inherit,
+            context_window_tokens: Some(4_096),
+            max_output_tokens: Some(1_024),
             detection_run_id: DetectionRunId::new(),
             base_character_revision: 0,
+        }
+    }
+
+    fn source_paragraph(text: impl Into<String>) -> DetectionSourceParagraph {
+        DetectionSourceParagraph {
+            id: ParagraphId::new(),
+            text: text.into(),
+            hash: "hash".to_owned(),
+            chapter_title: "Chapter".to_owned(),
+            chapter_id: audiobookai_core::ChapterId::new(),
         }
     }
 
@@ -3100,6 +3666,7 @@ mod tests {
         let request = detection_request(
             "model",
             &[],
+            1_024,
             false,
             Temperature::Null,
             ReasoningControl::Effort {
@@ -3121,6 +3688,124 @@ mod tests {
         assert!(progress_fraction(0, 0).abs() < f32::EPSILON);
         assert!((progress_fraction(1, 2) - 50.0).abs() < f32::EPSILON);
         assert!((progress_fraction(2, 1) - 100.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn four_thousand_token_context_builds_only_batches_that_fit() {
+        let budget = DetectionContextBudget::new(4_096).expect("4K context budget");
+        assert_eq!(budget.max_output, 1_024);
+        let paragraphs = (0..30)
+            .map(|index| source_paragraph(format!("Paragraph {index}: {}", "dialogue ".repeat(50))))
+            .collect::<Vec<_>>();
+        let batches = paragraph_batches(&paragraphs, budget).expect("token-aware batches");
+
+        assert!(batches.len() > 1);
+        let mut core_sources = BTreeSet::new();
+        for batch in &batches {
+            let estimate = detection_request_estimate(batch, &ReasoningControl::Inherit);
+            assert!(
+                estimate.input_tokens.unwrap()
+                    + estimate.output_tokens.unwrap()
+                    + budget.safety_margin
+                    <= budget.context_window
+            );
+            assert!(batch.core_paragraphs().len() <= DETECTION_BATCH_PARAGRAPHS);
+            for fragment in batch.core_paragraphs() {
+                assert!(core_sources.insert(fragment.source_id));
+            }
+        }
+        assert_eq!(core_sources.len(), paragraphs.len());
+    }
+
+    #[test]
+    fn oversized_paragraphs_are_split_and_dialogue_offsets_are_rebased() {
+        let budget = DetectionContextBudget::new(4_096).expect("4K context budget");
+        let source = source_paragraph("Ärger und Dialog. ".repeat(700));
+        let source_id = source.id.to_string();
+        let batches = paragraph_batches(std::slice::from_ref(&source), budget)
+            .expect("split paragraph batches");
+        let batch = batches
+            .iter()
+            .find(|batch| {
+                batch
+                    .core_paragraphs()
+                    .iter()
+                    .any(|fragment| fragment.source_byte_start > 0)
+            })
+            .expect("a later paragraph fragment");
+        let fragment = batch
+            .core_paragraphs()
+            .into_iter()
+            .find(|fragment| fragment.source_byte_start > 0)
+            .expect("later fragment");
+        let first_character_bytes = fragment
+            .text
+            .chars()
+            .next()
+            .expect("fragment text")
+            .len_utf8();
+        let result = rebase_detection_result(
+            CharacterDetectionResult {
+                characters: Vec::new(),
+                dialogue: vec![DetectedDialogue {
+                    paragraph_id: fragment.request_id,
+                    character: "Speaker".to_owned(),
+                    start: 0,
+                    end: u32::try_from(first_character_bytes).unwrap(),
+                    confidence: 0.9,
+                }],
+                usage: ProviderUsage::default(),
+            },
+            batch,
+        )
+        .expect("rebase dialogue");
+
+        assert!(batches.len() > 1);
+        assert_eq!(result.dialogue[0].paragraph_id, source_id);
+        assert_eq!(
+            result.dialogue[0].start,
+            u32::try_from(fragment.source_byte_start).unwrap()
+        );
+        assert_eq!(
+            result.dialogue[0].end,
+            u32::try_from(fragment.source_byte_start + first_character_bytes).unwrap()
+        );
+    }
+
+    #[test]
+    fn context_error_fallback_halves_the_core_batch_and_drops_overlap() {
+        let fragments = (0..4)
+            .map(|index| DetectionBatchParagraph {
+                fragment: DetectionFragment {
+                    request_id: format!("p{index}"),
+                    source_id: format!("p{index}"),
+                    source_byte_start: 0,
+                    text: "dialogue".to_owned(),
+                },
+                context_only: index == 0,
+            })
+            .collect();
+        let batch = DetectionBatch {
+            paragraphs: fragments,
+            max_output_tokens: 1_024,
+        };
+        let children = batch.split_for_context_retry().expect("context split");
+
+        assert_eq!(children.len(), 2);
+        assert_eq!(
+            children
+                .iter()
+                .map(|child| child.paragraphs.len())
+                .sum::<usize>(),
+            3
+        );
+        assert!(
+            children
+                .iter()
+                .flat_map(|child| &child.paragraphs)
+                .all(|paragraph| !paragraph.context_only)
+        );
+        assert!(children.iter().all(|child| child.max_output_tokens == 512));
     }
 
     #[test]
@@ -3173,8 +3858,20 @@ mod tests {
             text: "Grüße from the narrator".to_owned(),
             context_only: false,
         }];
+        let batch = DetectionBatch {
+            paragraphs: vec![DetectionBatchParagraph {
+                fragment: DetectionFragment {
+                    request_id: paragraphs[0].id.clone(),
+                    source_id: paragraphs[0].id.clone(),
+                    source_byte_start: 0,
+                    text: paragraphs[0].text.clone(),
+                },
+                context_only: false,
+            }],
+            max_output_tokens: 4_096,
+        };
         let estimate = detection_request_estimate(
-            &paragraphs,
+            &batch,
             &ReasoningControl::Effort {
                 effort: ReasoningEffort::High,
             },
@@ -3260,6 +3957,7 @@ mod tests {
             arguments: Vec::new(),
             status: ProviderStatusView::Online,
             model: Some(config.model.clone()),
+            context_window_tokens: None,
             credential_configured: true,
             capabilities: None,
             capability_source: None,
@@ -3279,6 +3977,46 @@ mod tests {
         let mut changed_mode = profile;
         changed_mode.mode = ProviderModeView::CloudRemote;
         assert!(validate_detection_profile(&changed_mode, &config).is_err());
+    }
+
+    #[test]
+    fn lm_studio_uses_loaded_context_then_configured_or_safe_default() {
+        let config = config();
+        let mut profile = ProviderProfileView {
+            id: config.provider_profile_id,
+            name: "LM Studio".to_owned(),
+            kind: crate::models::ProviderKindView::LmStudio,
+            role: crate::models::ProviderRoleView::Llm,
+            mode: ProviderModeView::ExternalEndpoint,
+            endpoint: config.provider_endpoint,
+            executable_path: None,
+            working_directory: None,
+            arguments: Vec::new(),
+            status: ProviderStatusView::Online,
+            model: Some(config.model),
+            context_window_tokens: Some(32_768),
+            credential_configured: false,
+            capabilities: None,
+            capability_source: None,
+            capability_updated_at: Some(Utc::now()),
+            last_error: None,
+        };
+        let loaded = audiobookai_providers::ModelContextWindow {
+            loaded_tokens: Some(4_096),
+            maximum_tokens: Some(262_144),
+        };
+        assert_eq!(select_effective_context_window(&profile, loaded), 4_096);
+
+        let unloaded = audiobookai_providers::ModelContextWindow {
+            loaded_tokens: None,
+            maximum_tokens: Some(262_144),
+        };
+        assert_eq!(select_effective_context_window(&profile, unloaded), 32_768);
+        profile.context_window_tokens = None;
+        assert_eq!(
+            select_effective_context_window(&profile, unloaded),
+            LM_STUDIO_DEFAULT_CONTEXT_TOKENS
+        );
     }
 
     #[test]

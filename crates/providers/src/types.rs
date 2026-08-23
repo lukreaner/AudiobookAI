@@ -614,6 +614,16 @@ pub struct Model {
     pub metadata: BTreeMap<String, String>,
 }
 
+/// Context-window information for one exact model binding.
+///
+/// `loaded_tokens` is the effective runtime limit when the provider exposes it. `maximum_tokens`
+/// is only the model's architectural ceiling and must never be mistaken for the loaded limit.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ModelContextWindow {
+    pub loaded_tokens: Option<u64>,
+    pub maximum_tokens: Option<u64>,
+}
+
 /// Sanitized model-library metadata exposed by a provider control adapter.
 ///
 /// Provider response bodies and free-form status text deliberately do not cross this boundary.

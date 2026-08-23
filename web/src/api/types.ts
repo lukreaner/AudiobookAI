@@ -266,6 +266,7 @@ export interface ProviderProfile {
   arguments: string[];
   status: "online" | "offline" | "starting" | "stopping" | "error" | "unconfigured";
   model?: string;
+  contextWindowTokens?: number | null;
   credentialConfigured: boolean;
   capabilities?: ProviderCapabilities;
   capabilitySource?: string;
@@ -323,6 +324,7 @@ export interface ProviderProfilePatchInput {
   workingDirectory?: string | null;
   arguments?: string[];
   model?: string | null;
+  contextWindowTokens?: number | null;
   credential?: string;
 }
 

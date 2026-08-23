@@ -158,7 +158,7 @@ impl HttpTransport for ReqwestTransport {
         let response = builder
             .send()
             .await
-            .map_err(|error| safe_request_error(&error))?;
+            .map_err(|error| safe_request_error(&error, request_method))?;
         let status = response.status().as_u16();
         let headers = response
             .headers()
@@ -182,7 +182,8 @@ impl HttpTransport for ReqwestTransport {
     }
 
     async fn execute_stream(&self, request: HttpRequest) -> Result<HttpStreamResponse> {
-        let method = match request.method {
+        let request_method = request.method;
+        let method = match request_method {
             HttpMethod::Get => reqwest::Method::GET,
             HttpMethod::Post => reqwest::Method::POST,
             HttpMethod::Put => reqwest::Method::PUT,
@@ -199,7 +200,7 @@ impl HttpTransport for ReqwestTransport {
         let response = builder
             .send()
             .await
-            .map_err(|error| safe_request_error(&error))?;
+            .map_err(|error| safe_request_error(&error, request_method))?;
         let status = response.status().as_u16();
         let headers = response
             .headers()
@@ -231,13 +232,21 @@ impl HttpTransport for ReqwestTransport {
     }
 }
 
-fn safe_request_error(error: &reqwest::Error) -> ProviderError {
+fn safe_request_error(error: &reqwest::Error, method: HttpMethod) -> ProviderError {
     if error.is_timeout() {
-        ProviderError::UncertainCharge
+        request_timeout_error(method)
     } else if error.is_connect() {
         ProviderError::Transport("provider connection failed".to_owned())
     } else {
         ProviderError::Transport("provider request failed".to_owned())
+    }
+}
+
+fn request_timeout_error(method: HttpMethod) -> ProviderError {
+    if matches!(method, HttpMethod::Get) {
+        ProviderError::Transport("provider request timed out".to_owned())
+    } else {
+        ProviderError::UncertainCharge
     }
 }
 
@@ -257,6 +266,22 @@ fn response_body_read_error(method: HttpMethod, status: u16) -> ProviderError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_only_timeout_is_not_reported_as_an_uncertain_charge() {
+        let error = request_timeout_error(HttpMethod::Get);
+        assert!(matches!(error, ProviderError::Transport(_)));
+    }
+
+    #[test]
+    fn state_changing_timeout_remains_billing_safe() {
+        for method in [HttpMethod::Post, HttpMethod::Put, HttpMethod::Delete] {
+            assert!(matches!(
+                request_timeout_error(method),
+                ProviderError::UncertainCharge
+            ));
+        }
+    }
 
     #[test]
     fn http_debug_output_never_contains_payloads_or_header_values() {

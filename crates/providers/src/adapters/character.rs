@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, sync::Arc};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
@@ -6,13 +6,19 @@ use serde_json::{Map, Value, json};
 use super::{HttpAdapter, json_body};
 use crate::{
     Authentication, CharacterDetectionRequest, CharacterDetectionResult, CharacterProvider,
-    EndpointConfig, HttpMethod, HttpRequest, HttpTransport, Model, ParameterSupport,
-    ProviderCapabilities, ProviderDescriptor, ProviderError, ProviderHealth, ProviderId,
-    ProviderUsage, ReasoningControl, ReasoningEffort, ReasoningMode, Result, Temperature,
-    UsageSource,
+    EndpointConfig, HttpMethod, HttpRequest, HttpTransport, Model, ModelContextWindow,
+    ParameterSupport, ProviderCapabilities, ProviderDescriptor, ProviderError, ProviderHealth,
+    ProviderId, ProviderUsage, ReasoningControl, ReasoningEffort, ReasoningMode, Result,
+    Temperature, UsageSource,
 };
 
 const DETECTION_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"properties":{"characters":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{"canonical_name":{"type":"string"},"aliases":{"type":"array","items":{"type":"string"}},"confidence":{"type":"number","minimum":0,"maximum":1}},"required":["canonical_name","aliases","confidence"]}},"dialogue":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{"paragraph_id":{"type":"string"},"character":{"type":"string"},"start":{"type":"integer","minimum":0},"end":{"type":"integer","minimum":1},"confidence":{"type":"number","minimum":0,"maximum":1}},"required":["paragraph_id","character","start","end","confidence"]}}},"required":["characters","dialogue"]}"#;
+
+// Local model startup plus schema-constrained generation can take several minutes, especially on
+// the first request after LM Studio has unloaded a model. Cloud requests retain the conservative
+// two-minute default from `HttpRequest::json`.
+const LM_STUDIO_DETECTION_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const LM_STUDIO_HEALTH_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CharacterFlavor {
@@ -177,14 +183,25 @@ impl JsonCharacterProvider {
         };
         apply_temperature(&mut body, request.temperature, self.flavor)?;
         apply_reasoning(&mut body, &request.reasoning, self.flavor)?;
-        Ok(self.decorate_request(self.http.json_request(HttpMethod::Post, &path, &body)?))
+        self.detection_http_request(&path, &body)
     }
 
     async fn detect(&self, request: CharacterDetectionRequest) -> Result<CharacterDetectionResult> {
-        let response = self
+        let response = match self
             .http
             .execute(self.build_detection_request(&request)?)
-            .await?;
+            .await
+        {
+            // Reqwest cannot know whether a timed-out POST was billable. LM Studio is a local
+            // runtime, so retain the transient timeout semantics without claiming an uncertain
+            // provider charge or requiring the duplicate-billing override.
+            Err(ProviderError::UncertainCharge) if self.is_lm_studio() => {
+                return Err(ProviderError::Transport(
+                    "LM Studio character detection timed out".to_owned(),
+                ));
+            }
+            result => result?,
+        };
         let envelope = json_body(&response)?;
         let content = extract_content(&envelope, self.flavor)?;
         let mut result: CharacterDetectionResult = serde_json::from_str(strip_json_fence(&content))
@@ -201,10 +218,11 @@ impl JsonCharacterProvider {
             CharacterFlavor::Gemini => "v1beta/models",
             CharacterFlavor::Ollama => "api/tags",
         };
-        let response = self
-            .http
-            .execute(self.decorate_request(self.http.empty_request(HttpMethod::Get, path)?))
-            .await?;
+        let mut request = self.decorate_request(self.http.empty_request(HttpMethod::Get, path)?);
+        if self.is_lm_studio() {
+            request.timeout = LM_STUDIO_HEALTH_TIMEOUT;
+        }
+        let response = self.http.execute(request).await?;
         let value = serde_json::from_slice::<Value>(&response.body).ok();
         Ok(ProviderHealth {
             available: true,
@@ -232,6 +250,17 @@ impl JsonCharacterProvider {
         parse_models(&json_body(&response)?, self.flavor)
     }
 
+    async fn model_context_window(&self, model: &str) -> Result<ModelContextWindow> {
+        if !self.is_lm_studio() {
+            return Ok(ModelContextWindow::default());
+        }
+        let mut request =
+            self.decorate_request(self.http.empty_request(HttpMethod::Get, "api/v1/models")?);
+        request.timeout = LM_STUDIO_HEALTH_TIMEOUT;
+        let response = self.http.execute(request).await?;
+        parse_lm_studio_context_window(&json_body(&response)?, model)
+    }
+
     fn decorate_request(&self, mut request: HttpRequest) -> HttpRequest {
         if matches!(self.flavor, CharacterFlavor::Anthropic) {
             request
@@ -239,6 +268,22 @@ impl JsonCharacterProvider {
                 .insert("anthropic-version".to_owned(), "2023-06-01".to_owned());
         }
         request
+    }
+
+    fn detection_http_request(&self, path: &str, body: &Value) -> Result<HttpRequest> {
+        let mut request =
+            self.decorate_request(self.http.json_request(HttpMethod::Post, path, body)?);
+        if self.is_lm_studio() {
+            request.timeout = LM_STUDIO_DETECTION_TIMEOUT;
+        }
+        Ok(request)
+    }
+
+    const fn is_lm_studio(&self) -> bool {
+        matches!(
+            self.flavor,
+            CharacterFlavor::OpenAiChat(OpenAiChatPreset::LmStudio)
+        )
     }
 }
 
@@ -291,6 +336,9 @@ macro_rules! provider_wrapper {
             }
             async fn discover_models(&self) -> Result<Vec<Model>> {
                 self.0.models().await
+            }
+            async fn model_context_window(&self, model: &str) -> Result<ModelContextWindow> {
+                self.0.model_context_window(model).await
             }
             async fn detect_characters(
                 &self,
@@ -689,6 +737,66 @@ fn parse_models(value: &Value, flavor: CharacterFlavor) -> Result<Vec<Model>> {
         .collect())
 }
 
+fn parse_lm_studio_context_window(value: &Value, requested: &str) -> Result<ModelContextWindow> {
+    let models = value
+        .get("models")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ProviderError::InvalidResponse("missing LM Studio model list".to_owned()))?;
+    let Some(model) = models.iter().find(|model| {
+        model.get("type").and_then(Value::as_str) == Some("llm")
+            && (model.get("key").and_then(Value::as_str) == Some(requested)
+                || model.get("selected_variant").and_then(Value::as_str) == Some(requested)
+                || model
+                    .get("variants")
+                    .and_then(Value::as_array)
+                    .is_some_and(|variants| {
+                        variants
+                            .iter()
+                            .any(|variant| variant.as_str() == Some(requested))
+                    })
+                || model
+                    .get("loaded_instances")
+                    .and_then(Value::as_array)
+                    .is_some_and(|instances| {
+                        instances.iter().any(|instance| {
+                            instance.get("id").and_then(Value::as_str) == Some(requested)
+                        })
+                    }))
+    }) else {
+        return Ok(ModelContextWindow::default());
+    };
+    let instances = model
+        .get("loaded_instances")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let exact_loaded = instances
+        .iter()
+        .find(|instance| instance.get("id").and_then(Value::as_str) == Some(requested));
+    let loaded_tokens = exact_loaded
+        .and_then(|instance| instance.pointer("/config/context_length"))
+        .and_then(Value::as_u64)
+        .filter(|tokens| *tokens > 0)
+        .or_else(|| {
+            instances
+                .iter()
+                .filter_map(|instance| {
+                    instance
+                        .pointer("/config/context_length")
+                        .and_then(Value::as_u64)
+                        .filter(|tokens| *tokens > 0)
+                })
+                .min()
+        });
+    Ok(ModelContextWindow {
+        loaded_tokens,
+        maximum_tokens: model
+            .get("max_context_length")
+            .and_then(Value::as_u64)
+            .filter(|tokens| *tokens > 0),
+    })
+}
+
 /// `OpenAI`'s model-list response has no endpoint/capability metadata. Character detection requires
 /// the Responses API plus structured text output, so discovery must positively recognize a text
 /// generation family and reject specialized audio, image, search, realtime, and Codex models.
@@ -741,6 +849,16 @@ mod tests {
     impl HttpTransport for NeverTransport {
         async fn execute(&self, _request: HttpRequest) -> Result<crate::HttpResponse> {
             panic!("serialization tests must not make HTTP calls")
+        }
+    }
+
+    #[derive(Debug)]
+    struct TimeoutTransport;
+
+    #[async_trait]
+    impl HttpTransport for TimeoutTransport {
+        async fn execute(&self, _request: HttpRequest) -> Result<crate::HttpResponse> {
+            Err(ProviderError::UncertainCharge)
         }
     }
 
@@ -867,6 +985,56 @@ mod tests {
     }
 
     #[test]
+    fn lm_studio_context_discovery_prefers_the_exact_loaded_instance() {
+        let catalog = json!({
+            "models": [{
+                "type": "llm",
+                "key": "owner/model",
+                "selected_variant": "owner/model@q4",
+                "variants": ["owner/model@q4"],
+                "max_context_length": 131072,
+                "loaded_instances": [
+                    {"id": "model-small", "config": {"context_length": 4096}},
+                    {"id": "model-large", "config": {"context_length": 32768}}
+                ]
+            }]
+        });
+
+        assert_eq!(
+            parse_lm_studio_context_window(&catalog, "model-large").unwrap(),
+            ModelContextWindow {
+                loaded_tokens: Some(32_768),
+                maximum_tokens: Some(131_072),
+            }
+        );
+        assert_eq!(
+            parse_lm_studio_context_window(&catalog, "owner/model").unwrap(),
+            ModelContextWindow {
+                // Routing by the model key can select either instance, so use the safe minimum.
+                loaded_tokens: Some(4_096),
+                maximum_tokens: Some(131_072),
+            }
+        );
+    }
+
+    #[test]
+    fn unloaded_lm_studio_model_reports_only_its_architectural_maximum() {
+        let window = parse_lm_studio_context_window(
+            &json!({"models": [{
+                "type": "llm",
+                "key": "owner/model",
+                "max_context_length": 262144,
+                "loaded_instances": []
+            }]}),
+            "owner/model",
+        )
+        .unwrap();
+
+        assert_eq!(window.loaded_tokens, None);
+        assert_eq!(window.maximum_tokens, Some(262_144));
+    }
+
+    #[test]
     fn openai_model_discovery_keeps_only_responses_text_models() {
         let models = parse_models(
             &json!({
@@ -905,6 +1073,57 @@ mod tests {
             ReasoningControl::TokenBudget { tokens: 4096 },
         ));
         assert!(matches!(result, Err(ProviderError::Unsupported { .. })));
+    }
+
+    #[test]
+    fn lm_studio_detection_allows_slow_local_generation() {
+        let provider = OpenAiCompatibleProvider::new(
+            OpenAiChatPreset::LmStudio,
+            local_endpoint(),
+            Arc::new(NeverTransport),
+        )
+        .unwrap();
+
+        let request = provider
+            .build_detection_request(&request(Temperature::Default, ReasoningControl::Inherit))
+            .unwrap();
+
+        assert_eq!(request.timeout, LM_STUDIO_DETECTION_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn lm_studio_timeout_does_not_claim_an_uncertain_charge() {
+        let provider = OpenAiCompatibleProvider::new(
+            OpenAiChatPreset::LmStudio,
+            local_endpoint(),
+            Arc::new(TimeoutTransport),
+        )
+        .unwrap();
+
+        let error = provider
+            .detect_characters(request(Temperature::Default, ReasoningControl::Inherit))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(&error, ProviderError::Transport(_)));
+        assert!(!error.to_string().contains("billing"));
+    }
+
+    #[tokio::test]
+    async fn generic_timeout_retains_the_billing_safe_classification() {
+        let provider = OpenAiCompatibleProvider::new(
+            OpenAiChatPreset::Generic,
+            local_endpoint(),
+            Arc::new(TimeoutTransport),
+        )
+        .unwrap();
+
+        let error = provider
+            .detect_characters(request(Temperature::Default, ReasoningControl::Inherit))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ProviderError::UncertainCharge));
     }
 
     #[test]

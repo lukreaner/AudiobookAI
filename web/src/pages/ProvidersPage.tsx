@@ -34,6 +34,7 @@ type ProviderForm = {
   argumentsText: string;
   credential: string;
   model: string;
+  contextWindowTokens: string;
 };
 
 function providerFormFor(kind: ProviderKind, preferredRole?: ProviderRole, nativeProviderName?: string): ProviderForm {
@@ -56,6 +57,7 @@ function providerFormFor(kind: ProviderKind, preferredRole?: ProviderRole, nativ
     argumentsText: "",
     credential: "",
     model: roleDefaults.defaultModel,
+    contextWindowTokens: "",
   };
 }
 
@@ -87,7 +89,13 @@ const installerStatusKeys: Record<MlxManagement["installerStatus"], string> = {
 export function ProvidersPage() {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
-  const providers = useQuery({ queryKey: ["providers"], queryFn: api.providers });
+  const providers = useQuery({
+    queryKey: ["providers"],
+    queryFn: api.providers,
+    refetchInterval: (query) => query.state.data?.items.some((provider) =>
+      provider.kind === "lm_studio" && provider.mode === "external_endpoint" && ["offline", "error"].includes(provider.status)
+    ) ? 5_000 : false,
+  });
   const nativeAvailability = useQuery({
     queryKey: ["native-provider-availability"],
     queryFn: api.nativeProviderAvailability,
@@ -160,6 +168,9 @@ export function ProvidersPage() {
         }),
         arguments: managed ? argumentLines(form.argumentsText) : [],
         model: form.model.trim() || null,
+        contextWindowTokens: form.role === "llm" && form.contextWindowTokens.trim()
+          ? Number(form.contextWindowTokens)
+          : null,
         credential: form.credential || undefined,
       };
       return editing
@@ -306,7 +317,7 @@ export function ProvidersPage() {
     });
     setAddOpen(true);
   };
-  const openEdit = (provider: ProviderProfile) => { setEditing(provider); setForm({ name: provider.name, kind: provider.kind === "openai_tts" ? "openai" : provider.kind, role: provider.role, mode: provider.mode, endpoint: provider.endpoint ?? "", executablePath: provider.executablePath ?? "", workingDirectory: provider.workingDirectory ?? "", argumentsText: provider.arguments.join("\n"), credential: "", model: provider.model ?? "" }); };
+  const openEdit = (provider: ProviderProfile) => { setEditing(provider); setForm({ name: provider.name, kind: provider.kind === "openai_tts" ? "openai" : provider.kind, role: provider.role, mode: provider.mode, endpoint: provider.endpoint ?? "", executablePath: provider.executablePath ?? "", workingDirectory: provider.workingDirectory ?? "", argumentsText: provider.arguments.join("\n"), credential: "", model: provider.model ?? "", contextWindowTokens: provider.contextWindowTokens?.toString() ?? "" }); };
   const requestDelete = (provider: ProviderProfile) => {
     closeDialog();
     remove.reset();
@@ -338,6 +349,9 @@ export function ProvidersPage() {
   const hasEndpoint = form.mode !== "native";
   const managedProcessMayBeOwned = (provider?: ProviderProfile) => provider?.mode === "managed_child" && !["offline", "unconfigured"].includes(provider.status);
   const editBlockedByOwnedProcess = managedProcessMayBeOwned(editing);
+  const contextWindowValue = Number(form.contextWindowTokens);
+  const contextWindowInvalid = form.role === "llm" && Boolean(form.contextWindowTokens.trim())
+    && (!Number.isInteger(contextWindowValue) || contextWindowValue < 2_048 || contextWindowValue > 2_097_152);
   const deleteBlockedByOwnedProcess = managedProcessMayBeOwned(deleting);
   const managedMlxProfiles = providers.data?.items.filter((provider) => provider.kind === "mlx_audio" && provider.mode === "managed_child") ?? [];
   const managedMlxProfile = managedMlxProfiles.length === 1 ? managedMlxProfiles[0] : undefined;
@@ -477,7 +491,7 @@ export function ProvidersPage() {
       )}
       {control.isError ? <ErrorState error={control.error} onRetry={() => control.reset()} /> : null}
 
-      <Dialog open={addOpen || Boolean(editing)} onOpenChange={(open) => !open && closeDialog()} title={editing ? t("providers.configure", { name: editing.name }) : t("providers.add")} description={t("providers.subtitle")} size="lg" footer={<>{editing ? <Button variant="danger" onClick={() => requestDelete(editing)}><Trash2 size={16} />{t("providers.delete")}</Button> : null}<Button variant="secondary" onClick={closeDialog}>{t("common.cancel")}</Button><Button disabled={!form.name.trim() || (managed && !form.executablePath.trim()) || (form.kind === "piper" && !form.model.trim()) || (form.kind === "native_os" && !nativeProviderAvailable && (!editing || editing.status === "unconfigured")) || editBlockedByOwnedProcess || save.isPending} onClick={() => save.mutate()}>{save.isPending ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}{t("providers.saveAndCheck")}</Button></>}>
+      <Dialog open={addOpen || Boolean(editing)} onOpenChange={(open) => !open && closeDialog()} title={editing ? t("providers.configure", { name: editing.name }) : t("providers.add")} description={t("providers.subtitle")} size="lg" footer={<>{editing ? <Button variant="danger" onClick={() => requestDelete(editing)}><Trash2 size={16} />{t("providers.delete")}</Button> : null}<Button variant="secondary" onClick={closeDialog}>{t("common.cancel")}</Button><Button disabled={!form.name.trim() || contextWindowInvalid || (managed && !form.executablePath.trim()) || (form.kind === "piper" && !form.model.trim()) || (form.kind === "native_os" && !nativeProviderAvailable && (!editing || editing.status === "unconfigured")) || editBlockedByOwnedProcess || save.isPending} onClick={() => save.mutate()}>{save.isPending ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}{t("providers.saveAndCheck")}</Button></>}>
         <div className="provider-form stack">
           {editBlockedByOwnedProcess ? <p className="provider-form-warning">{t("providers.stopBeforeConfigure")}</p> : null}
           <div className={`provider-role-summary provider-role-${form.role}`}>
@@ -512,6 +526,7 @@ export function ProvidersPage() {
             {form.mode !== "native" ? <Field label={t("providers.apiKey")} hint={editing?.credentialConfigured ? t("providers.apiKeyConfigured") : t("providers.apiKeyPlaceholder")}><Input type="password" autoComplete="new-password" value={form.credential} onChange={(event) => setForm({ ...form, credential: event.target.value })} placeholder="••••••••••••" /></Field> : null}
             <ProviderModelField role={form.role} source={selectedRoleDefaults.modelSource} value={form.model} models={availableModels.models} status={availableModels.status} strict={availableModels.strict} onChange={(model) => setForm((current) => ({ ...current, model }))} />
           </div>
+          {form.role === "llm" ? <Field label={t("providers.contextWindow")} hint={t(form.kind === "lm_studio" ? "providers.contextWindowLmStudioHint" : "providers.contextWindowHint")} error={contextWindowInvalid ? t("providers.contextWindowInvalid") : undefined}><Input type="number" min={2_048} max={2_097_152} step={1} value={form.contextWindowTokens} onChange={(event) => setForm({ ...form, contextWindowTokens: event.target.value })} placeholder={form.kind === "lm_studio" ? "4096" : "16384"} /></Field> : null}
           {save.isError ? <ErrorState error={save.error} /> : null}
         </div>
       </Dialog>

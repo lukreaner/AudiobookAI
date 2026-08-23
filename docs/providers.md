@@ -95,6 +95,23 @@ HTTP, schema, or identifier error; AudiobookAI never deletes LocalAI files
 directly. Providers without a stable documented model-management API expose no
 controls.
 
+An external LM Studio connection observed as offline or errored is health-reprobed while its
+provider list is visible, so a server started after AudiobookAI can recover without a manual
+refresh. LM Studio character detection allows up to 15 minutes for local model loading and
+schema-constrained generation. A local timeout remains a transient transport failure and never
+claims that provider billing is uncertain; other potentially billable POST requests retain the
+fail-closed uncertain-charge classification.
+
+Character detection persists the effective total context window in every durable job. For LM
+Studio, AudiobookAI reads `loaded_instances[].config.context_length` from the native
+`/api/v1/models` response and caps it by the model maximum. If no instance is loaded, an optional
+provider-profile override is used; without one, the safe LM Studio default is 4,096 tokens. Other
+providers use their configured value or a conservative 16,384-token fallback. The workflow
+reserves prompt, schema, output, and safety capacity, batches source text by a tokenizer-independent
+byte upper bound, splits oversized paragraphs at UTF-8 boundaries, and rebases dialogue offsets to
+the original paragraph. A recognized provider context-overflow response is retried with smaller
+core batches and a smaller output allowance instead of entering the generic transient retry loop.
+
 Provider-native download progress is visible and cancellable for the current app
 session, but its operation journal is not yet durable across a service restart.
 Restart recovery for these provider-native downloads and model-specific reasoning
