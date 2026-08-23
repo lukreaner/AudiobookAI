@@ -100,7 +100,10 @@ provider list is visible, so a server started after AudiobookAI can recover with
 refresh. LM Studio character detection allows up to 15 minutes for local model loading and
 schema-constrained generation. A local timeout remains a transient transport failure and never
 claims that provider billing is uncertain; other potentially billable POST requests retain the
-fail-closed uncertain-charge classification.
+fail-closed uncertain-charge classification. If AudiobookAI itself restarts while a built-in local
+LM Studio or Ollama request is in flight, recovery closes that attempt as an interrupted local
+transport operation and safely redispatches the durable batch. Retry validation uses the concrete
+registered connection identity rather than the adapter-family label.
 
 Character detection persists the effective total context window in every durable job. For LM
 Studio, AudiobookAI reads `loaded_instances[].config.context_length` from the native

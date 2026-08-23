@@ -1417,6 +1417,12 @@ pub async fn validate_detection_retry(state: &AppState, job_id: JobId) -> Result
     }
     let runtime_id = audiobookai_providers::ProviderId::new(config.provider_profile_id.to_string())
         .map_err(|error| ServiceError::Internal(error.to_string()))?;
+    let registered_runtime = state.providers.profile(&runtime_id).await.map_err(|_| {
+        ServiceError::Conflict(
+            "the durable detection provider runtime is unavailable; start a new detection job"
+                .to_owned(),
+        )
+    })?;
     let runtime = state.providers.character(&runtime_id).await.map_err(|_| {
         ServiceError::Conflict(
             "the durable detection provider runtime is unavailable; start a new detection job"
@@ -1431,11 +1437,10 @@ pub async fn validate_detection_retry(state: &AppState, job_id: JobId) -> Result
                 "the detection provider capabilities changed; start a new detection job".to_owned(),
             )
         })?;
-    if runtime.descriptor().id != runtime_id
-        || config
-            .provider_mode
-            .is_none_or(|mode| !detection_runtime_mode_matches(mode, runtime.descriptor().kind))
-    {
+    // Adapter descriptors identify a provider family (for example `lmstudio`), while the
+    // registered runtime profile identifies the concrete durable connection. Retry validation
+    // must compare the latter with the persisted profile UUID.
+    if !detection_runtime_profile_matches(&runtime_id, config.provider_mode, &registered_runtime) {
         return Err(ServiceError::Conflict(
             "the detection provider runtime identity changed; start a new detection job".to_owned(),
         ));
@@ -1469,15 +1474,31 @@ pub async fn validate_detection_retry(state: &AppState, job_id: JobId) -> Result
 
 async fn recover_detection_job(state: &AppState, job: &Job) -> Result<bool, ServiceError> {
     let units = detection_units(state, job.id).await?;
-    if let Err(error) = consistent_detection_config(&units) {
-        fail_job(state, job.id.as_uuid(), &error.to_string()).await;
-        return Ok(false);
-    }
+    let config = match consistent_detection_config(&units) {
+        Ok(config) => config,
+        Err(error) => {
+            fail_job(state, job.id.as_uuid(), &error.to_string()).await;
+            return Ok(false);
+        }
+    };
+    let non_billable_local = state
+        .catalog
+        .read()
+        .await
+        .providers
+        .get(&config.provider_profile_id)
+        .is_some_and(|profile| {
+            detection_profile_matches_dispatch_contract(profile, &config)
+                && detection_provider_is_non_billable_local(profile)
+        });
     for mut unit in units {
         let latest = latest_detection_attempt(state, unit.id).await?;
-        match recovery_decision(&unit, latest.as_ref())? {
+        match recovery_decision(&unit, latest.as_ref(), non_billable_local)? {
             RecoveryDecision::Keep | RecoveryDecision::FinalizePersistedResult => {}
             RecoveryDecision::RedispatchSafe => {
+                if non_billable_local && let Some(attempt) = latest.as_ref() {
+                    reconcile_interrupted_non_billable_attempt(state, attempt).await?;
+                }
                 unit.payload.remove("requestId");
                 unit.payload.insert(
                     "dispatchState".to_owned(),
@@ -1555,6 +1576,7 @@ async fn append_recovered_uncertain_detection_usage(
 fn recovery_decision(
     unit: &JobUnit,
     latest_attempt: Option<&JobAttempt>,
+    in_flight_redispatch_is_non_billable: bool,
 ) -> Result<RecoveryDecision, ServiceError> {
     if persisted_detection_result(unit)?.is_some() {
         return Ok(if unit.state == JobUnitState::Completed {
@@ -1581,20 +1603,28 @@ fn recovery_decision(
         .and_then(serde_json::Value::as_str)
         .unwrap_or("unknown");
     let Some(attempt) = latest_attempt else {
-        return Ok(if matches!(dispatch_state, "prepared" | "recovered_safe") {
-            RecoveryDecision::RedispatchSafe
-        } else {
-            RecoveryDecision::FailUncertain
-        });
+        return Ok(
+            if matches!(dispatch_state, "prepared" | "recovered_safe")
+                || (in_flight_redispatch_is_non_billable && dispatch_state == "dispatched")
+            {
+                RecoveryDecision::RedispatchSafe
+            } else {
+                RecoveryDecision::FailUncertain
+            },
+        );
     };
-    if attempt.finished_at.is_none()
+    let dispatch_outcome_is_ambiguous = attempt.finished_at.is_none()
         || attempt.uncertain_charge
         || attempt.failure_class.is_none()
         || attempt
             .failure_class
-            .is_some_and(CoreFailureClass::may_have_charged)
-    {
-        return Ok(RecoveryDecision::FailUncertain);
+            .is_some_and(CoreFailureClass::may_have_charged);
+    if dispatch_outcome_is_ambiguous {
+        return Ok(if in_flight_redispatch_is_non_billable {
+            RecoveryDecision::RedispatchSafe
+        } else {
+            RecoveryDecision::FailUncertain
+        });
     }
     if attempt.failure_class == Some(CoreFailureClass::Cancelled)
         && dispatch_state == "cancelled_before_dispatch"
@@ -1611,6 +1641,43 @@ fn recovery_decision(
             RecoveryDecision::FailTerminal
         },
     )
+}
+
+async fn reconcile_interrupted_non_billable_attempt(
+    state: &AppState,
+    attempt: &JobAttempt,
+) -> Result<(), ServiceError> {
+    if attempt.finished_at.is_some() && !attempt.uncertain_charge {
+        return Ok(());
+    }
+    let mut repaired = attempt.clone();
+    repaired.finished_at = Some(repaired.finished_at.unwrap_or_else(Utc::now));
+    repaired.failure_class = Some(CoreFailureClass::Transport);
+    repaired.error_code = Some("local_response_interrupted".to_owned());
+    repaired.redacted_error =
+        Some("local provider response was interrupted before it could be persisted".to_owned());
+    repaired.uncertain_charge = false;
+    let result = sqlx::query(
+        "UPDATE job_attempts SET finished_at = ?, failure_class = ?, uncertain_charge = 0, payload = ? \
+         WHERE id = ? AND job_unit_id = ?",
+    )
+    .bind(repaired.finished_at.map(|value| value.to_rfc3339()))
+    .bind(core_failure_class_name(CoreFailureClass::Transport))
+    .bind(
+        serde_json::to_string(&repaired)
+            .map_err(|error| ServiceError::Internal(error.to_string()))?,
+    )
+    .bind(repaired.id.to_string())
+    .bind(repaired.job_unit_id.to_string())
+    .execute(state.database.pool())
+    .await
+    .map_err(storage_error)?;
+    if result.rows_affected() != 1 {
+        return Err(ServiceError::Conflict(
+            "the interrupted local detection attempt changed during recovery".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 async fn latest_detection_attempt(
@@ -2058,12 +2125,7 @@ fn validate_detection_profile(
     profile: &ProviderProfileView,
     config: &DetectionJobConfig,
 ) -> Result<(), ServiceError> {
-    if profile.id != config.provider_profile_id
-        || !matches!(profile.role, crate::models::ProviderRoleView::Llm)
-        || profile.model.as_deref() != Some(config.model.as_str())
-        || profile.endpoint != config.provider_endpoint
-        || Some(profile.mode) != config.provider_mode
-    {
+    if !detection_profile_matches_dispatch_contract(profile, config) {
         return Err(ServiceError::Conflict(
             "the detection provider endpoint or model changed; start a new detection run"
                 .to_owned(),
@@ -2080,6 +2142,27 @@ fn validate_detection_profile(
         ));
     }
     Ok(())
+}
+
+fn detection_profile_matches_dispatch_contract(
+    profile: &ProviderProfileView,
+    config: &DetectionJobConfig,
+) -> bool {
+    profile.id == config.provider_profile_id
+        && matches!(profile.role, crate::models::ProviderRoleView::Llm)
+        && profile.model.as_deref() == Some(config.model.as_str())
+        && profile.endpoint == config.provider_endpoint
+        && Some(profile.mode) == config.provider_mode
+}
+
+fn detection_provider_is_non_billable_local(profile: &ProviderProfileView) -> bool {
+    matches!(
+        &profile.kind,
+        crate::models::ProviderKindView::LmStudio | crate::models::ProviderKindView::Ollama
+    ) && matches!(
+        profile.mode,
+        ProviderModeView::ExternalEndpoint | ProviderModeView::ManagedChild
+    )
 }
 
 fn detection_runtime_mode_matches(
@@ -2102,6 +2185,15 @@ fn detection_runtime_mode_matches(
             audiobookai_providers::ProviderKind::Native
         )
     )
+}
+
+fn detection_runtime_profile_matches(
+    expected_id: &audiobookai_providers::ProviderId,
+    expected_mode: Option<ProviderModeView>,
+    runtime: &crate::runtime::RuntimeProfile,
+) -> bool {
+    runtime.id == *expected_id
+        && expected_mode.is_some_and(|mode| detection_runtime_mode_matches(mode, runtime.mode))
 }
 
 async fn detection_units(state: &AppState, job_id: JobId) -> Result<Vec<JobUnit>, ServiceError> {
@@ -2750,8 +2842,11 @@ impl SqliteRetryJournal {
                 error_code: None,
                 redacted_error: None,
                 provider_request_id: Some(request_id.to_string()),
-                // Conservatively true until a response is durably classified.
-                uncertain_charge: true,
+                // Paid/unknown providers remain uncertain until a response is durably
+                // classified. Built-in local LLM runtimes cannot create a provider charge.
+                uncertain_charge: !detection_provider_is_non_billable_local(
+                    &self.usage_context.profile,
+                ),
             })
             .await
             .map_err(|error| RetryJournalError::new(error.to_string()))?;
@@ -4153,13 +4248,13 @@ mod tests {
     }
 
     #[test]
-    fn restart_never_redispatches_an_unfinished_or_lost_successful_request() {
+    fn restart_never_redispatches_an_unfinished_or_lost_successful_billable_request() {
         let mut unit = unit(JobUnitState::Running);
         unit.payload
             .insert("dispatchState".to_owned(), serde_json::json!("dispatched"));
         let unfinished = attempt(unit.id, false, None, true);
         assert_eq!(
-            recovery_decision(&unit, Some(&unfinished)).expect("decision"),
+            recovery_decision(&unit, Some(&unfinished), false).expect("decision"),
             RecoveryDecision::FailUncertain
         );
 
@@ -4169,8 +4264,34 @@ mod tests {
             serde_json::json!("response_received"),
         );
         assert_eq!(
-            recovery_decision(&unit, Some(&returned_but_not_persisted)).expect("decision"),
+            recovery_decision(&unit, Some(&returned_but_not_persisted), false).expect("decision"),
             RecoveryDecision::FailUncertain
+        );
+    }
+
+    #[test]
+    fn restart_redispatches_an_interrupted_non_billable_local_request() {
+        let mut unit = unit(JobUnitState::Running);
+        unit.payload
+            .insert("dispatchState".to_owned(), serde_json::json!("dispatched"));
+        assert_eq!(
+            recovery_decision(&unit, None, true).expect("decision"),
+            RecoveryDecision::RedispatchSafe
+        );
+        let unfinished = attempt(unit.id, false, None, true);
+        assert_eq!(
+            recovery_decision(&unit, Some(&unfinished), true).expect("decision"),
+            RecoveryDecision::RedispatchSafe
+        );
+
+        let returned_but_not_persisted = attempt(unit.id, true, None, false);
+        unit.payload.insert(
+            "dispatchState".to_owned(),
+            serde_json::json!("response_received"),
+        );
+        assert_eq!(
+            recovery_decision(&unit, Some(&returned_but_not_persisted), true).expect("decision"),
+            RecoveryDecision::RedispatchSafe
         );
     }
 
@@ -4187,7 +4308,7 @@ mod tests {
             false,
         );
         assert_eq!(
-            recovery_decision(&transient_unit, Some(&transient)).expect("decision"),
+            recovery_decision(&transient_unit, Some(&transient), false).expect("decision"),
             RecoveryDecision::RedispatchSafe
         );
 
@@ -4203,7 +4324,7 @@ mod tests {
             false,
         );
         assert_eq!(
-            recovery_decision(&paused_before_dispatch, Some(&cancelled)).expect("decision"),
+            recovery_decision(&paused_before_dispatch, Some(&cancelled), false).expect("decision"),
             RecoveryDecision::RedispatchSafe
         );
 
@@ -4218,9 +4339,44 @@ mod tests {
             .expect("result"),
         );
         assert_eq!(
-            recovery_decision(&durable, None).expect("decision"),
+            recovery_decision(&durable, None, false).expect("decision"),
             RecoveryDecision::FinalizePersistedResult
         );
+    }
+
+    #[tokio::test]
+    async fn detection_retry_uses_the_registered_runtime_profile_identity() {
+        let runtime_id =
+            audiobookai_providers::ProviderId::new(Uuid::new_v4().to_string()).expect("runtime id");
+        let mut runtime = crate::runtime::RuntimeProfile::new(
+            runtime_id.clone(),
+            "LM Studio",
+            crate::runtime::RuntimeAdapterKind::LmStudio,
+            audiobookai_providers::ProviderKind::ExternalEndpoint,
+        );
+        runtime.endpoint = Some(url::Url::parse("http://127.0.0.1:1234").expect("endpoint"));
+        let registry =
+            crate::runtime::ProviderRuntime::new(crate::runtime::ProviderAdapterFactory::default());
+        registry
+            .register(runtime, None)
+            .await
+            .expect("register runtime");
+        let adapter = registry
+            .character(&runtime_id)
+            .await
+            .expect("character adapter");
+        let registered = registry
+            .profile(&runtime_id)
+            .await
+            .expect("registered profile");
+
+        assert_eq!(adapter.descriptor().id.to_string(), "lmstudio");
+        assert_ne!(adapter.descriptor().id, runtime_id);
+        assert!(detection_runtime_profile_matches(
+            &runtime_id,
+            Some(ProviderModeView::ExternalEndpoint),
+            &registered,
+        ));
     }
 
     #[test]
