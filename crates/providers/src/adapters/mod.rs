@@ -1,6 +1,8 @@
 //! Built-in HTTP provider adapters.
 
 mod character;
+mod dialogue;
+mod gemini_tts;
 mod native;
 mod piper;
 mod tts;
@@ -8,6 +10,10 @@ mod tts;
 pub use character::{
     AnthropicProvider, GeminiProvider, OllamaProvider, OpenAiChatPreset, OpenAiCompatibleProvider,
     OpenAiResponsesProvider, is_openai_responses_model_id,
+};
+pub use gemini_tts::{
+    GEMINI_FLASH_LITE_TTS_MODEL, GEMINI_FLASH_TTS_MODEL, GEMINI_PREBUILT_VOICES, GeminiTtsProvider,
+    gemini_tts_model_performance_capabilities, is_gemini_tts_model_id,
 };
 pub use native::{
     NativeCapture, NativeCommand, NativeCommandArgument, NativeCommandOutput, NativeCommandRunner,

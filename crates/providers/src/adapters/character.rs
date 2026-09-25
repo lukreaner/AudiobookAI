@@ -3,7 +3,11 @@ use std::{collections::BTreeSet, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
 
-use super::{HttpAdapter, json_body};
+use super::{
+    HttpAdapter,
+    dialogue::{DETECTION_SCHEMA, parse_and_resolve, wire_input},
+    json_body,
+};
 use crate::{
     Authentication, CharacterDetectionRequest, CharacterDetectionResult, CharacterProvider,
     EndpointConfig, HttpMethod, HttpRequest, HttpTransport, Model, ModelContextWindow,
@@ -12,12 +16,10 @@ use crate::{
     Temperature, UsageSource,
 };
 
-const DETECTION_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"properties":{"characters":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{"canonical_name":{"type":"string"},"aliases":{"type":"array","items":{"type":"string"}},"confidence":{"type":"number","minimum":0,"maximum":1}},"required":["canonical_name","aliases","confidence"]}},"dialogue":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{"paragraph_id":{"type":"string"},"character":{"type":"string"},"start":{"type":"integer","minimum":0},"end":{"type":"integer","minimum":1},"confidence":{"type":"number","minimum":0,"maximum":1}},"required":["paragraph_id","character","start","end","confidence"]}}},"required":["characters","dialogue"]}"#;
-
 // Local model startup plus schema-constrained generation can take several minutes, especially on
-// the first request after LM Studio has unloaded a model. Cloud requests retain the conservative
-// two-minute default from `HttpRequest::json`.
-const LM_STUDIO_DETECTION_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+// the first request after LM Studio or Ollama has unloaded a model. Cloud requests retain the
+// conservative two-minute default from `HttpRequest::json`.
+const LOCAL_DETECTION_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const LM_STUDIO_HEALTH_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -94,12 +96,10 @@ impl JsonCharacterProvider {
                 "detection needs paragraphs and a non-zero output token limit".to_owned(),
             ));
         }
-        let input = serde_json::to_string(&request.paragraphs)
-            .map_err(|error| ProviderError::Configuration(error.to_string()))?;
+        let input = wire_input(request)?;
         let (path, mut body) = match self.flavor {
             CharacterFlavor::OpenAiResponses => {
-                let schema: Value = serde_json::from_str(DETECTION_SCHEMA)
-                    .map_err(|error| ProviderError::Configuration(error.to_string()))?;
+                let schema = schema_placeholder();
                 (
                     "v1/responses".to_owned(),
                     json!({
@@ -117,8 +117,7 @@ impl JsonCharacterProvider {
                 )
             }
             CharacterFlavor::OpenAiChat(_) => {
-                let schema: Value = serde_json::from_str(DETECTION_SCHEMA)
-                    .map_err(|error| ProviderError::Configuration(error.to_string()))?;
+                let schema = schema_placeholder();
                 (
                     "v1/chat/completions".to_owned(),
                     json!({
@@ -161,8 +160,7 @@ impl JsonCharacterProvider {
                     "generationConfig": {
                         "maxOutputTokens": request.max_output_tokens,
                         "responseMimeType": "application/json",
-                        "responseJsonSchema": serde_json::from_str::<Value>(DETECTION_SCHEMA)
-                            .map_err(|error| ProviderError::Configuration(error.to_string()))?
+                        "responseJsonSchema": schema_placeholder()
                     }
                 }),
             ),
@@ -175,8 +173,7 @@ impl JsonCharacterProvider {
                         { "role": "user", "content": input }
                     ],
                     "stream": false,
-                    "format": serde_json::from_str::<Value>(DETECTION_SCHEMA)
-                        .map_err(|error| ProviderError::Configuration(error.to_string()))?,
+                    "format": schema_placeholder(),
                     "options": { "num_predict": request.max_output_tokens }
                 }),
             ),
@@ -192,13 +189,15 @@ impl JsonCharacterProvider {
             .execute(self.build_detection_request(&request)?)
             .await
         {
-            // Reqwest cannot know whether a timed-out POST was billable. LM Studio is a local
-            // runtime, so retain the transient timeout semantics without claiming an uncertain
-            // provider charge or requiring the duplicate-billing override.
-            Err(ProviderError::UncertainCharge) if self.is_lm_studio() => {
-                return Err(ProviderError::Transport(
-                    "LM Studio character detection timed out".to_owned(),
-                ));
+            // Reqwest cannot know whether a timed-out POST was billable. LM Studio and a
+            // non-cloud Ollama are local runtimes, so retain the transient timeout semantics
+            // without claiming an uncertain provider charge or requiring the duplicate-billing
+            // override.
+            Err(ProviderError::UncertainCharge) if self.is_local_runtime() => {
+                return Err(ProviderError::Transport(format!(
+                    "{} character detection timed out",
+                    self.descriptor.display_name
+                )));
             }
             result => result?,
         };
@@ -207,7 +206,7 @@ impl JsonCharacterProvider {
             return Err(ProviderError::OutputTruncated);
         }
         let content = extract_content(&envelope, self.flavor)?;
-        let mut result = parse_detection_content(&content)?;
+        let mut result = parse_and_resolve(&content, &request)?;
         result.usage = extract_usage(&envelope, self.flavor);
         result.validate(&request)
     }
@@ -275,8 +274,9 @@ impl JsonCharacterProvider {
     fn detection_http_request(&self, path: &str, body: &Value) -> Result<HttpRequest> {
         let mut request =
             self.decorate_request(self.http.json_request(HttpMethod::Post, path, body)?);
-        if self.is_lm_studio() {
-            request.timeout = LM_STUDIO_DETECTION_TIMEOUT;
+        request.body = with_ordered_schema(&request.body)?;
+        if self.is_local_runtime() {
+            request.timeout = LOCAL_DETECTION_TIMEOUT;
         }
         Ok(request)
     }
@@ -287,6 +287,32 @@ impl JsonCharacterProvider {
             CharacterFlavor::OpenAiChat(OpenAiChatPreset::LmStudio)
         )
     }
+
+    fn is_local_runtime(&self) -> bool {
+        self.is_lm_studio()
+            || (matches!(self.flavor, CharacterFlavor::Ollama)
+                && !matches!(self.http.endpoint.kind, crate::ProviderKind::CloudRemote))
+    }
+}
+
+const SCHEMA_PLACEHOLDER: &str = "__audiobookai_detection_schema__";
+
+fn schema_placeholder() -> Value {
+    Value::String(SCHEMA_PLACEHOLDER.to_owned())
+}
+
+/// Splices the detection schema into a serialized body without re-sorting its properties.
+///
+/// `serde_json::Value` orders object keys alphabetically. Grammar-constrained decoders (LM Studio,
+/// llama.cpp, Ollama, and `OpenAI` structured outputs) generate properties in schema order, and
+/// the model should copy the quoted passage before it commits to a speaker.
+fn with_ordered_schema(body: &bytes::Bytes) -> Result<bytes::Bytes> {
+    let serialized = std::str::from_utf8(body)
+        .map_err(|error| ProviderError::Configuration(error.to_string()))?;
+    Ok(serialized
+        .replacen(&format!("\"{SCHEMA_PLACEHOLDER}\""), DETECTION_SCHEMA, 1)
+        .into_bytes()
+        .into())
 }
 
 fn base_capabilities(temperature: ParameterSupport) -> ProviderCapabilities {
@@ -621,6 +647,7 @@ fn extract_content(envelope: &Value, flavor: CharacterFlavor) -> Result<String> 
             .and_then(|parts| {
                 parts
                     .iter()
+                    .filter(|part| part.get("thought").and_then(Value::as_bool) != Some(true))
                     .find_map(|part| part.get("text").and_then(Value::as_str))
             })
             .map(ToOwned::to_owned),
@@ -663,25 +690,6 @@ fn output_was_truncated(envelope: &Value, flavor: CharacterFlavor) -> bool {
             envelope.get("done_reason").and_then(Value::as_str) == Some("length")
         }
     }
-}
-
-fn parse_detection_content(content: &str) -> Result<CharacterDetectionResult> {
-    serde_json::from_str(strip_json_fence(content)).map_err(|error| {
-        if error.is_eof() {
-            ProviderError::OutputTruncated
-        } else {
-            ProviderError::InvalidResponse(error.to_string())
-        }
-    })
-}
-
-fn strip_json_fence(content: &str) -> &str {
-    let trimmed = content.trim();
-    trimmed
-        .strip_prefix("```json")
-        .or_else(|| trimmed.strip_prefix("```"))
-        .and_then(|value| value.strip_suffix("```"))
-        .map_or(trimmed, str::trim)
 }
 
 fn extract_usage(envelope: &Value, flavor: CharacterFlavor) -> ProviderUsage {
@@ -954,6 +962,31 @@ mod tests {
     }
 
     #[test]
+    fn structured_output_schema_keeps_quote_before_speaker_order() {
+        let provider = OpenAiCompatibleProvider::new(
+            OpenAiChatPreset::LmStudio,
+            local_endpoint(),
+            Arc::new(NeverTransport),
+        )
+        .unwrap();
+        let request = provider
+            .build_detection_request(&request(Temperature::Default, ReasoningControl::Inherit))
+            .unwrap();
+        let body = std::str::from_utf8(&request.body).unwrap();
+
+        assert!(!body.contains(SCHEMA_PLACEHOLDER));
+        let position = |needle: &str| body.find(needle).unwrap();
+        assert!(position("\"paragraph_id\":{") < position("\"quote_start\""));
+        assert!(position("\"quote_start\"") < position("\"quote_end\""));
+        assert!(position("\"quote_end\"") < position("\"character\":{"));
+        let value: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(
+            value["response_format"]["json_schema"]["schema"]["required"],
+            json!(["characters", "dialogue"])
+        );
+    }
+
+    #[test]
     fn gemini_model_discovery_keeps_generation_models() {
         let models = parse_models(
             &json!({
@@ -1037,7 +1070,7 @@ mod tests {
                 "key": "owner/model",
                 "selected_variant": "owner/model@q4",
                 "variants": ["owner/model@q4"],
-                "max_context_length": 131072,
+                "max_context_length": 131_072,
                 "loaded_instances": [
                     {"id": "model-small", "config": {"context_length": 4096}},
                     {"id": "model-large", "config": {"context_length": 32768}}
@@ -1068,7 +1101,7 @@ mod tests {
             &json!({"models": [{
                 "type": "llm",
                 "key": "owner/model",
-                "max_context_length": 262144,
+                "max_context_length": 262_144,
                 "loaded_instances": []
             }]}),
             "owner/model",
@@ -1108,16 +1141,6 @@ mod tests {
             &json!({"choices": [{"finish_reason": "stop"}]}),
             CharacterFlavor::OpenAiChat(OpenAiChatPreset::LmStudio),
         ));
-    }
-
-    #[test]
-    fn json_eof_is_classified_without_retaining_model_content() {
-        let error =
-            parse_detection_content(r#"{"characters":[{"canonical_name":"private source text"#)
-                .unwrap_err();
-
-        assert!(matches!(error, ProviderError::OutputTruncated));
-        assert!(!error.to_string().contains("private source text"));
     }
 
     #[test]
@@ -1174,7 +1197,7 @@ mod tests {
             .build_detection_request(&request(Temperature::Default, ReasoningControl::Inherit))
             .unwrap();
 
-        assert_eq!(request.timeout, LM_STUDIO_DETECTION_TIMEOUT);
+        assert_eq!(request.timeout, LOCAL_DETECTION_TIMEOUT);
     }
 
     #[tokio::test]
@@ -1193,6 +1216,33 @@ mod tests {
 
         assert!(matches!(&error, ProviderError::Transport(_)));
         assert!(!error.to_string().contains("billing"));
+    }
+
+    #[tokio::test]
+    async fn local_ollama_timeout_is_transient_and_allows_slow_generation() {
+        let provider = OllamaProvider::new(local_endpoint(), Arc::new(TimeoutTransport)).unwrap();
+        let prepared = provider
+            .build_detection_request(&request(Temperature::Default, ReasoningControl::Inherit))
+            .unwrap();
+        assert_eq!(prepared.timeout, LOCAL_DETECTION_TIMEOUT);
+
+        let error = provider
+            .detect_characters(request(Temperature::Default, ReasoningControl::Inherit))
+            .await
+            .unwrap_err();
+        assert!(matches!(&error, ProviderError::Transport(_)));
+    }
+
+    #[test]
+    fn gemini_thought_summaries_are_not_parsed_as_output() {
+        let envelope = json!({"candidates": [{"content": {"parts": [
+            {"text": "thinking about speakers", "thought": true},
+            {"text": "{\"characters\":[],\"dialogue\":[]}"}
+        ]}}]});
+        assert_eq!(
+            extract_content(&envelope, CharacterFlavor::Gemini).unwrap(),
+            "{\"characters\":[],\"dialogue\":[]}"
+        );
     }
 
     #[tokio::test]
