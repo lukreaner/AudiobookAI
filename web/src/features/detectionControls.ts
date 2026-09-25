@@ -102,3 +102,11 @@ export function writeDetectionSettings(projectId: string, settings: StoredDetect
     // Remembering the selection is a convenience; detection works without it.
   }
 }
+
+export function forgetDetectionSettings(projectId: string): void {
+  try {
+    localStorage.removeItem(storageKey(projectId));
+  } catch {
+    // Nothing to clean up when storage is unavailable.
+  }
+}

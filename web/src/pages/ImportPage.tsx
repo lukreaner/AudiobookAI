@@ -1,4 +1,5 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { isTauri } from "@tauri-apps/api/core";
 import { AlertTriangle, ArrowLeft, BookOpen, Check, FileUp, LoaderCircle, ShieldCheck } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -29,10 +30,6 @@ export function ImportPage() {
       setMetadata({ title: value.title, author: value.author ?? "", language: value.language ?? "", series: "", seriesPosition: "", outputName: value.title });
     },
   });
-  useEffect(() => {
-    const sourcePath = (location.state as { sourcePath?: string } | null)?.sourcePath;
-    if (sourcePath && !inspect.isPending && !inspect.data) inspect.mutate(sourcePath);
-  }, [location.state]);
   const commit = useMutation({
     mutationFn: async () => {
       if (!draft) throw new Error("Missing import draft");
@@ -53,6 +50,17 @@ export function ImportPage() {
       navigate(`/projects/${project.id}/chapters`);
     },
   });
+
+  // Each opened or dropped file is inspected once, replacing a draft that was not added yet.
+  const handledNavigation = useRef<string>(undefined);
+  useEffect(() => {
+    const sourcePath = (location.state as { sourcePath?: string } | null)?.sourcePath;
+    if (!sourcePath || handledNavigation.current === location.key || commit.isPending) return;
+    handledNavigation.current = location.key;
+    setDraft(undefined);
+    inspect.reset();
+    inspect.mutate(sourcePath);
+  }, [location.key, location.state]);
 
   const chooseFile = (file?: File) => {
     if (!file) return;
@@ -75,7 +83,12 @@ export function ImportPage() {
             onDragEnter={(event) => { event.preventDefault(); setDragging(true); }}
             onDragOver={(event) => event.preventDefault()}
             onDragLeave={() => setDragging(false)}
-            onDrop={(event) => { event.preventDefault(); setDragging(false); chooseFile(event.dataTransfer.files[0]); }}
+            onDrop={(event) => {
+              event.preventDefault();
+              setDragging(false);
+              // The desktop host delivers dropped files as paths through its own drop event.
+              if (!isTauri()) chooseFile(event.dataTransfer.files[0]);
+            }}
           >
             <span className="drop-icon"><FileUp size={27} /></span>
             <strong>{t("import.dropTitle")}</strong>

@@ -1,8 +1,8 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { invoke, isTauri } from "@tauri-apps/api/core";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { api } from "../api/client";
 import i18n from "../i18n";
@@ -17,6 +17,22 @@ vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn().mockResolvedValue(() => undefined),
 }));
 
+type DragDropHandler = (event: { payload: { type: string; paths?: string[] } }) => void;
+const dragDrop = vi.hoisted(() => ({ handler: undefined as DragDropHandler | undefined }));
+vi.mock("@tauri-apps/api/webview", () => ({
+  getCurrentWebview: () => ({
+    onDragDropEvent: async (handler: DragDropHandler) => {
+      dragDrop.handler = handler;
+      return () => { dragDrop.handler = undefined; };
+    },
+  }),
+}));
+
+function ImportProbe() {
+  const location = useLocation();
+  return <p>Import opened {(location.state as { sourcePath?: string } | null)?.sourcePath ?? "without file"}</p>;
+}
+
 function renderShell() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
@@ -25,6 +41,7 @@ function renderShell() {
         <Routes>
           <Route element={<AppShell />}>
             <Route path="/library" element={<p>Library content</p>} />
+            <Route path="/import" element={<ImportProbe />} />
           </Route>
         </Routes>
       </MemoryRouter>
@@ -73,5 +90,42 @@ describe("desktop quit control", () => {
 
     expect(await within(dialog).findByRole("alert")).toHaveTextContent("could not begin a clean shutdown");
     expect(within(dialog).getByRole("button", { name: "Quit AudiobookAI" })).toBeEnabled();
+  });
+});
+
+describe("shell conveniences", () => {
+  it("remembers the collapsed navigation", async () => {
+    const user = userEvent.setup();
+    const first = renderShell();
+    await user.click((await screen.findAllByRole("button", { name: "Collapse navigation" }))[0]);
+    first.unmount();
+
+    renderShell();
+    expect((await screen.findAllByRole("button", { name: "Expand navigation" }))[0]).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("opens the import page with Ctrl+O", async () => {
+    renderShell();
+    await screen.findByText("Library content");
+
+    fireEvent.keyDown(window, { key: "o", ctrlKey: true });
+    expect(await screen.findByText("Import opened without file")).toBeInTheDocument();
+  });
+
+  it("imports an EPUB dropped anywhere on the desktop window", async () => {
+    renderShell();
+    await waitFor(() => expect(dragDrop.handler).toBeDefined());
+
+    act(() => dragDrop.handler?.({ payload: { type: "enter", paths: ["/books/notes.txt"] } }));
+    expect(screen.getByText("Only EPUB files can be imported")).toBeInTheDocument();
+    act(() => dragDrop.handler?.({ payload: { type: "leave" } }));
+    expect(screen.queryByText("Only EPUB files can be imported")).not.toBeInTheDocument();
+
+    act(() => dragDrop.handler?.({ payload: { type: "enter", paths: ["/books/Story.EPUB"] } }));
+    expect(screen.getByText("Drop to import this EPUB")).toBeInTheDocument();
+    act(() => dragDrop.handler?.({ payload: { type: "drop", paths: ["/books/notes.txt", "/books/Story.EPUB"] } }));
+
+    expect(await screen.findByText("Import opened /books/Story.EPUB")).toBeInTheDocument();
+    expect(screen.queryByText("Drop to import this EPUB")).not.toBeInTheDocument();
   });
 });

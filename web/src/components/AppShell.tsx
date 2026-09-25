@@ -10,6 +10,7 @@ import {
   CircleDollarSign,
   Download,
   FileSearch,
+  FileUp,
   Menu,
   Plus,
   Power,
@@ -31,11 +32,26 @@ const navigation = [
   { to: "/usage", label: "nav.usage", icon: CircleDollarSign },
 ] as const;
 
+const COLLAPSED_KEY = "audiobookai.sidebarCollapsed";
+
+function readCollapsed(): boolean {
+  try {
+    return localStorage.getItem(COLLAPSED_KEY) === "true";
+  } catch {
+    return false;
+  }
+}
+
+export function isEpubPath(path: string): boolean {
+  return path.toLowerCase().endsWith(".epub");
+}
+
 export function AppShell() {
   const { t } = useTranslation();
   const location = useLocation();
   const navigate = useNavigate();
-  const [collapsed, setCollapsed] = useState(false);
+  const [collapsed, setCollapsed] = useState(readCollapsed);
+  const [fileDrag, setFileDrag] = useState<"epub" | "other">();
   const [mobileOpen, setMobileOpen] = useState(false);
   const [quitOpen, setQuitOpen] = useState(false);
   const [quitting, setQuitting] = useState(false);
@@ -62,6 +78,46 @@ export function AppShell() {
     delete window.__AUDIOBOOKAI_OPEN_EPUB__;
     if (initialEpub) navigate("/import", { state: { sourcePath: initialEpub } });
     return () => { unlistenImport?.(); unlistenEpub?.(); };
+  }, [navigate]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(COLLAPSED_KEY, String(collapsed));
+    } catch {
+      // Remembering the layout is a convenience only.
+    }
+  }, [collapsed]);
+
+  // The desktop webview hands dropped files to the host, so an EPUB dropped anywhere on the window
+  // arrives as a local path and is imported without an upload.
+  useEffect(() => {
+    if (!desktop) return;
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void import("@tauri-apps/api/webview").then(({ getCurrentWebview }) => getCurrentWebview().onDragDropEvent(({ payload }) => {
+      if (payload.type === "enter") setFileDrag(payload.paths.some(isEpubPath) ? "epub" : "other");
+      else if (payload.type === "leave") setFileDrag(undefined);
+      else if (payload.type === "drop") {
+        setFileDrag(undefined);
+        const sourcePath = payload.paths.find(isEpubPath);
+        if (sourcePath) navigate("/import", { state: { sourcePath } });
+      }
+    })).then((stop) => {
+      if (disposed) stop();
+      else unlisten = stop;
+    }).catch(() => undefined);
+    return () => { disposed = true; unlisten?.(); };
+  }, [desktop, navigate]);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && !event.altKey && !event.shiftKey && event.key.toLowerCase() === "o") {
+        event.preventDefault();
+        navigate("/import");
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
   }, [navigate]);
 
   const quitApplication = async () => {
@@ -128,7 +184,7 @@ export function AppShell() {
           <span className="service-dot" />
           {!collapsed ? <span>{statusLabel}</span> : null}
         </div>
-        <button className="collapse-button" type="button" onClick={() => setCollapsed((value) => !value)}>
+        <button className="collapse-button" type="button" aria-expanded={!collapsed} onClick={() => setCollapsed((value) => !value)}>
           {collapsed ? <ChevronRight size={17} /> : <ChevronLeft size={17} />}
           {!collapsed ? t("nav.collapse") : <span className="sr-only">{t("nav.expand")}</span>}
         </button>
@@ -150,8 +206,8 @@ export function AppShell() {
             <span>{t("shell.localPrivate")}</span>
           </div>
           <div className="topbar-actions">
-            {location.pathname !== "/import" ? (
-              <Button size="sm" onClick={() => navigate("/import")}><Plus size={16} />{t("shell.quickImport")}</Button>
+            {!["/import", "/library"].includes(location.pathname) ? (
+              <Button size="sm" title={t("shell.quickImportShortcut", { shortcut: shortcutLabel() })} onClick={() => navigate("/import")}><Plus size={16} />{t("shell.quickImport")}</Button>
             ) : null}
             <Badge tone={status === "ready" ? "positive" : status === "degraded" ? "warning" : "neutral"}>
               <span className="service-dot" />{statusLabel}
@@ -163,6 +219,11 @@ export function AppShell() {
           <Outlet />
         </main>
       </div>
+      {fileDrag ? (
+        <div className={clsx("file-drop-overlay", fileDrag === "other" && "rejected")} role="status" aria-live="polite">
+          <div><FileUp size={30} /><strong>{fileDrag === "epub" ? t("shell.dropEpub") : t("shell.dropNotEpub")}</strong></div>
+        </div>
+      ) : null}
       {desktop ? <Dialog
         open={quitOpen}
         onOpenChange={(open) => { if (!quitting) { setQuitOpen(open); setQuitError(false); } }}
@@ -179,4 +240,8 @@ export function AppShell() {
       </Dialog> : null}
     </div>
   );
+}
+
+function shortcutLabel(): string {
+  return /Mac|iPhone|iPad/.test(navigator.platform) ? "⌘O" : "Ctrl+O";
 }

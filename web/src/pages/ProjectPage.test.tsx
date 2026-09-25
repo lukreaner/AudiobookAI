@@ -1,9 +1,9 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { api } from "../api/client";
+import { ApiError, api } from "../api/client";
 import type { Character, Job, ProjectDetail, PronunciationRule, ProviderProfile, Voice } from "../api/types";
 import i18n from "../i18n";
 import { AUTO_SPEAKER, NARRATOR_SPEAKER, parseAliases } from "../features/characterReview";
@@ -124,7 +124,7 @@ const pronunciationRule: PronunciationRule = {
   order: 0,
 };
 
-function renderProjectTab(tab: "characters" | "preflight" | "pronunciation") {
+function renderProjectTab(tab: "chapters" | "characters" | "preflight" | "pronunciation") {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
@@ -134,6 +134,8 @@ function renderProjectTab(tab: "characters" | "preflight" | "pronunciation") {
         <Routes>
           <Route path={`/projects/:id/${tab}`} element={<ProjectPage tab={tab} />} />
           <Route path="/jobs/:id" element={<div>Job opened</div>} />
+          <Route path="/library" element={<div>Library opened</div>} />
+          {tab !== "characters" ? <Route path="/projects/:id/characters" element={<div>Characters opened</div>} /> : null}
         </Routes>
       </MemoryRouter>
     </QueryClientProvider>,
@@ -679,5 +681,108 @@ describe("preflight export settings", () => {
         ducking: false,
       },
     }));
+  });
+});
+
+describe("project management", () => {
+  const twoChapterProject: ProjectDetail = {
+    ...project,
+    chapterCount: 2,
+    chapters: [...project.chapters, { ...project.chapters[0], id: "chapter-2", index: 1, title: "Chapter Two", selected: false }],
+  };
+
+  it("saves a changed chapter selection before continuing", async () => {
+    vi.mocked(api.project).mockResolvedValue(twoChapterProject);
+    const user = userEvent.setup();
+    renderProjectTab("chapters");
+
+    expect(await screen.findByRole("button", { name: /^Continue/ })).toBeEnabled();
+    await user.click(screen.getByRole("button", { name: "Select none" }));
+    expect(screen.getByText("Unsaved changes")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Save and continue/ })).toBeDisabled();
+
+    await user.click(screen.getByRole("button", { name: "Select all" }));
+    await user.click(screen.getByRole("button", { name: /Save and continue/ }));
+
+    await waitFor(() => expect(api.updateProject).toHaveBeenCalledWith("project-1", {
+      chapters: [
+        expect.objectContaining({ id: "chapter-1", selected: true }),
+        expect.objectContaining({ id: "chapter-2", selected: true }),
+      ],
+    }));
+    expect(await screen.findByText("Characters opened")).toBeInTheDocument();
+  });
+
+  it("edits book details and clears emptied optional fields", async () => {
+    const user = userEvent.setup();
+    renderProjectTab("chapters");
+
+    await user.click(await screen.findByRole("button", { name: "Edit details" }));
+    const dialog = screen.getByRole("dialog", { name: "Book details" });
+    await user.clear(within(dialog).getByRole("textbox", { name: "Author" }));
+    await user.type(within(dialog).getByRole("textbox", { name: "Narrator" }), "Jane Reader");
+    await user.click(within(dialog).getByRole("button", { name: "Save changes" }));
+
+    await waitFor(() => expect(api.updateProject).toHaveBeenCalledWith("project-1", {
+      title: "The Example Book",
+      author: null,
+      narrator: "Jane Reader",
+      language: null,
+      series: null,
+      seriesPosition: null,
+      outputName: null,
+      description: null,
+    }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  });
+
+  it("requires explicit confirmation before deleting a project", async () => {
+    const deleteProject = vi.spyOn(api, "deleteProject").mockResolvedValue(undefined);
+    localStorage.setItem("audiobookai.exportSettings.project-1", JSON.stringify({ format: "mp3" }));
+    const user = userEvent.setup();
+    renderProjectTab("chapters");
+
+    await user.click(await screen.findByRole("button", { name: "Delete" }));
+    const dialog = screen.getByRole("dialog", { name: "Delete “The Example Book”?" });
+    const confirm = within(dialog).getByRole("button", { name: "Delete project" });
+    expect(confirm).toBeDisabled();
+    await user.click(within(dialog).getByRole("switch", { name: "I want to delete this project" }));
+    await user.click(confirm);
+
+    await waitFor(() => expect(deleteProject).toHaveBeenCalledWith("project-1"));
+    expect(await screen.findByText("Library opened")).toBeInTheDocument();
+    expect(localStorage.getItem("audiobookai.exportSettings.project-1")).toBeNull();
+  });
+
+  it("explains why a project with an active job cannot be deleted", async () => {
+    vi.spyOn(api, "deleteProject").mockRejectedValue(new ApiError({
+      type: "urn:audiobookai:problem:conflict",
+      title: "Conflict",
+      status: 409,
+      code: "active_conversion",
+    }));
+    const user = userEvent.setup();
+    renderProjectTab("chapters");
+
+    await user.click(await screen.findByRole("button", { name: "Delete" }));
+    const dialog = screen.getByRole("dialog", { name: "Delete “The Example Book”?" });
+    await user.click(within(dialog).getByRole("switch", { name: "I want to delete this project" }));
+    await user.click(within(dialog).getByRole("button", { name: "Delete project" }));
+
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent("A job is still working on this project");
+  });
+
+  it("remembers export settings but not the music ownership confirmation", async () => {
+    const user = userEvent.setup();
+    const first = renderProjectTab("preflight");
+    await user.selectOptions(await screen.findByRole("combobox", { name: "Audio format" }), "mp3");
+    await user.type(screen.getByRole("textbox", { name: "Background audio path" }), "/music/owned.wav");
+    await user.click(screen.getByRole("switch", { name: "I own this audio or have permission to use it" }));
+    first.unmount();
+
+    renderProjectTab("preflight");
+    expect(await screen.findByRole("combobox", { name: "Audio format" })).toHaveValue("mp3");
+    expect(screen.getByRole("textbox", { name: "Background audio path" })).toHaveValue("/music/owned.wav");
+    expect(screen.getByRole("switch", { name: "I own this audio or have permission to use it" })).not.toBeChecked();
   });
 });

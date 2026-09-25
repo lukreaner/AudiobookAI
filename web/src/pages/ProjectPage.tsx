@@ -34,13 +34,14 @@ import { ApiError, api, jobEventsUrl } from "../api/client";
 import type { Character, CharacterDetectionInput, DetectionReasoning, DetectionTemperature, DialogueEvidence, ExportFormat, PronunciationRule, ProviderProfile, Voice, VoiceAssignment } from "../api/types";
 import { ErrorState, EmptyState, LoadingState } from "../components/StateViews";
 import { Badge, Button, Card, Dialog, Field, Input, PageHeading, ProgressBar, Select, Stat, SwitchField, Textarea } from "../components/ui";
-import { DEFAULT_EXPORT_SETTINGS, requiresMusicOwnership, toJobExportSettings, type ExportFormState } from "../features/exportSettings";
+import { readExportSettings, requiresMusicOwnership, toJobExportSettings, writeExportSettings, type ExportFormState } from "../features/exportSettings";
 import { formatBytes, formatCount, formatDuration, formatMoney } from "../lib/format";
 import { AUTO_SPEAKER, NARRATOR_SPEAKER, paragraphIdFor, parseAliases, speakerOverrideInput, storedSpeakerSelection } from "../features/characterReview";
 import { CloudConsentCard, CloudTextConsentNotice } from "../features/CloudConsent";
 import { allowedOr, defaultEffort, detectionControls, readDetectionSettings, writeDetectionSettings } from "../features/detectionControls";
 import { DistributionPanel } from "../features/DistributionPanel";
 import { localizeJobStage } from "../features/jobStage";
+import { ProjectActions } from "../features/ProjectActions";
 import { ProofingWorkbench } from "../features/ProofingWorkbench";
 import { VoiceAuditionPanel } from "../features/VoiceAuditionPanel";
 
@@ -88,11 +89,13 @@ export function ProjectPage({ tab }: { tab: ProjectTab }) {
           <h1>{project.data.title}</h1>
           <p>{project.data.author || t("common.unknown")} · {t("library.chapters", { count: project.data.chapterCount })}</p>
         </div>
+        <ProjectActions project={project.data} />
       </div>
       <nav className="project-tabs" aria-label={project.data.title}>
         {tabs.map((item) => {
           const Icon = item.icon;
-          return <Link key={item.id} className={clsx("project-tab", tab === item.id && "active")} aria-current={tab === item.id ? "page" : undefined} to={`/projects/${id}/${item.id}`}><Icon size={16} />{t(item.label)}</Link>;
+          const approved = item.id === "characters" && project.data.characterReviewStatus === "approved";
+          return <Link key={item.id} className={clsx("project-tab", tab === item.id && "active")} aria-current={tab === item.id ? "page" : undefined} to={`/projects/${id}/${item.id}`}><Icon size={16} />{t(item.label)}{approved ? <CheckCircle2 className="project-tab-done" size={14} aria-label={t("characters.approved")} /> : null}</Link>;
         })}
       </nav>
 
@@ -111,6 +114,7 @@ export function ProjectPage({ tab }: { tab: ProjectTab }) {
 
 function ChaptersPanel({ projectId }: { projectId: string }) {
   const { t } = useTranslation();
+  const navigate = useNavigate();
   const queryClient = useQueryClient();
   const project = useQuery({ queryKey: ["project", projectId], queryFn: () => api.project(projectId) });
   const [selection, setSelection] = useState<Record<string, boolean>>();
@@ -126,12 +130,20 @@ function ChaptersPanel({ projectId }: { projectId: string }) {
   if (project.isError) return <ErrorState error={project.error} onRetry={() => void project.refetch()} />;
   if (!project.data?.chapters.length) return <EmptyState title={t("project.noChapters")} detail={t("project.selectHint")} />;
   const selectedCount = Object.values(values).filter(Boolean).length;
+  const dirty = project.data.chapters.some((chapter) => Boolean(values[chapter.id]) !== chapter.selected);
+  const selectAll = (selected: boolean) =>
+    setSelection(Object.fromEntries(project.data!.chapters.map((chapter) => [chapter.id, selected])));
+  // Continuing must not silently drop a changed chapter selection.
+  const continueToCharacters = async () => {
+    if (dirty) await save.mutateAsync();
+    navigate(`/projects/${projectId}/characters`);
+  };
 
   return (
     <div>
       <div className="section-heading chapter-heading">
-        <div><h2>{t("project.chapters")}</h2><p>{t("project.selectHint")}</p></div>
-        <div className="cluster"><Badge tone="accent">{t("import.selectedCount", { selected: selectedCount, total: project.data.chapters.length })}</Badge><Button onClick={() => save.mutate()} disabled={save.isPending || !selection}><Save size={16} />{save.isPending ? t("state.saving") : t("project.saveSelection")}</Button></div>
+        <div><div className="cluster"><h2>{t("project.chapters")}</h2><Badge tone="accent">{t("import.selectedCount", { selected: selectedCount, total: project.data.chapters.length })}</Badge>{dirty ? <Badge tone="warning">{t("project.unsavedSelection")}</Badge> : null}</div><p>{t("project.selectHint")}</p></div>
+        <div className="cluster"><Button size="sm" variant="ghost" onClick={() => selectAll(true)}>{t("import.selectAll")}</Button><Button size="sm" variant="ghost" onClick={() => selectAll(false)}>{t("import.selectNone")}</Button><Button onClick={() => save.mutate()} disabled={save.isPending || !dirty}><Save size={16} />{save.isPending ? t("state.saving") : t("project.saveSelection")}</Button></div>
       </div>
       {save.isError ? <ErrorState error={save.error} onRetry={() => save.mutate()} /> : null}
       <div className="chapter-list">
@@ -146,7 +158,7 @@ function ChaptersPanel({ projectId }: { projectId: string }) {
         ))}
       </div>
       <CloudConsentCard project={project.data} />
-      <div className="panel-footer"><Link className="button button-primary button-md" to={`/projects/${projectId}/characters`}>{t("common.continue")}<UserRound size={16} /></Link></div>
+      <div className="panel-footer"><Button disabled={save.isPending || selectedCount === 0} onClick={() => void continueToCharacters().catch(() => undefined)}>{dirty ? t("project.saveAndContinue") : t("common.continue")}<UserRound size={16} /></Button></div>
     </div>
   );
 }
@@ -810,7 +822,8 @@ function PreflightPanel({ projectId }: { projectId: string }) {
   const { t, i18n } = useTranslation();
   const navigate = useNavigate();
   const [previewText, setPreviewText] = useState("");
-  const [exportSettings, setExportSettings] = useState<ExportFormState>(() => ({ ...DEFAULT_EXPORT_SETTINGS }));
+  // The export settings last used for this project are restored when returning to the tab.
+  const [exportSettings, setExportSettings] = useState<ExportFormState>(() => readExportSettings(projectId));
   const musicOwnershipRequired = requiresMusicOwnership(exportSettings);
   const hasBackgroundMusic = Boolean(exportSettings.backgroundMusicPath.trim());
   const estimate = useMutation({ mutationFn: () => api.estimate(projectId) });
@@ -826,7 +839,8 @@ function PreflightPanel({ projectId }: { projectId: string }) {
   });
   useEffect(() => {
     dryRun.reset();
-  }, [exportSettings]);
+    writeExportSettings(projectId, exportSettings);
+  }, [exportSettings, projectId]);
   const statusIcon = { pass: CheckCircle2, warning: CircleAlert, fail: XCircle, pending: Clock3 } as const;
 
   return (
@@ -853,7 +867,7 @@ function PreflightPanel({ projectId }: { projectId: string }) {
         <div><h2>{t("preflight.preview")}</h2><p>{t("preflight.previewBillable")}</p></div>
         <Field label={t("preflight.previewText")}><Textarea value={previewText} onChange={(event) => setPreviewText(event.target.value)} /></Field>
         {preview.isError ? <ErrorState error={preview.error} /> : null}
-        {preview.data ? <div className="audio-result"><button type="button" className="audio-play" aria-label={t("preflight.preview")}><Play size={18} fill="currentColor" /></button><audio controls src={preview.data.audioUrl} preload="metadata" /><div><span>{formatDuration(preview.data.durationSeconds, i18n.language)}</span>{preview.data.cached ? <Badge tone="positive">{t("preflight.cached")}</Badge> : null}</div></div> : null}
+        {preview.data ? <div className="audio-result"><span className="audio-result-icon" aria-hidden="true"><Headphones size={17} /></span><audio controls src={preview.data.audioUrl} preload="metadata" /><div><span>{formatDuration(preview.data.durationSeconds, i18n.language)}</span>{preview.data.cached ? <Badge tone="positive">{t("preflight.cached")}</Badge> : null}</div></div> : null}
       </Card>
 
       <Card className="export-settings-card">

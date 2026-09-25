@@ -1,13 +1,13 @@
 import { localizeJobStage } from "../features/jobStage";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, ArrowLeft, Box, Check, ChevronRight, CircleStop, Clock3, Headphones, LoaderCircle, Pause, Play, RefreshCw, RotateCcw, Volume2 } from "lucide-react";
+import { AlertTriangle, ArrowLeft, Box, Check, CheckCircle2, ChevronRight, CircleStop, Clock3, Download, LoaderCircle, Pause, Play, RotateCcw, Volume2 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link, useParams } from "react-router-dom";
 import { api, jobEventsUrl, playbackSocketUrl } from "../api/client";
 import type { Job } from "../api/types";
 import { EmptyState, ErrorState, LoadingState } from "../components/StateViews";
-import { Badge, Button, Card, PageHeading, ProgressBar } from "../components/ui";
+import { Badge, Button, Card, Dialog, PageHeading, ProgressBar } from "../components/ui";
 import { formatDuration, formatRelative } from "../lib/format";
 
 function jobTone(status: Job["status"]): "neutral" | "accent" | "positive" | "warning" | "danger" {
@@ -66,9 +66,14 @@ function JobDetail({ jobId }: { jobId: string }) {
   const { t, i18n } = useTranslation();
   const queryClient = useQueryClient();
   const job = useQuery({ queryKey: ["job", jobId], queryFn: () => api.job(jobId), refetchInterval: 15_000 });
+  const [confirmingCancel, setConfirmingCancel] = useState(false);
   const action = useMutation({
     mutationFn: (value: "pause" | "resume" | "cancel" | "retry") => api.jobAction(jobId, value),
-    onSuccess: (value) => queryClient.setQueryData(["job", jobId], value),
+    onSuccess: (value) => {
+      queryClient.setQueryData(["job", jobId], value);
+      setConfirmingCancel(false);
+      void queryClient.invalidateQueries({ queryKey: ["jobs"] });
+    },
   });
   useEffect(() => {
     const source = new EventSource(jobEventsUrl(jobId), { withCredentials: true });
@@ -80,6 +85,7 @@ function JobDetail({ jobId }: { jobId: string }) {
       "job.unit.updated",
       "job.completed",
       "job.failed",
+      "job.cancelled",
     ]) {
       source.addEventListener(eventType, refresh);
     }
@@ -92,9 +98,22 @@ function JobDetail({ jobId }: { jobId: string }) {
   const value = job.data;
   return (
     <div className="page job-detail-page">
-      <Link className="back-link" to="/jobs"><ArrowLeft size={16} />{t("jobs.title")}</Link>
-      <PageHeading title={value.projectTitle} subtitle={value.currentStage ? t("jobs.now", { stage: localizeJobStage(value.currentStage, t) }) : t(`jobs.${value.status}`)} actions={<div className="cluster">{["queued", "running"].includes(value.status) ? <Button variant="secondary" onClick={() => action.mutate("pause")} disabled={action.isPending}><Pause size={16} />{t("jobs.pause")}</Button> : null}{value.status === "paused" ? <Button onClick={() => action.mutate("resume")} disabled={action.isPending}><Play size={16} />{t("jobs.resume")}</Button> : null}{value.status === "failed" ? <Button onClick={() => action.mutate("retry")} disabled={action.isPending}><RotateCcw size={16} />{t("jobs.retry")}</Button> : null}{!["complete", "cancelled"].includes(value.status) ? <Button variant="ghost" onClick={() => action.mutate("cancel")} disabled={action.isPending}><CircleStop size={16} />{t("jobs.cancel")}</Button> : null}</div>} />
-      {action.isError ? <ErrorState error={action.error} /> : null}
+      <div className="space-between job-detail-links">
+        <Link className="back-link" to="/jobs"><ArrowLeft size={16} />{t("jobs.title")}</Link>
+        <Link className="back-link" to={`/projects/${value.projectId}/chapters`}>{t("jobs.openProject")}<ChevronRight size={16} /></Link>
+      </div>
+      <PageHeading title={value.projectTitle} subtitle={value.currentStage ? t("jobs.now", { stage: localizeJobStage(value.currentStage, t) }) : t(`jobs.${value.status}`)} actions={<div className="cluster">{["queued", "running"].includes(value.status) ? <Button variant="secondary" onClick={() => action.mutate("pause")} disabled={action.isPending}><Pause size={16} />{t("jobs.pause")}</Button> : null}{value.status === "paused" ? <Button onClick={() => action.mutate("resume")} disabled={action.isPending}><Play size={16} />{t("jobs.resume")}</Button> : null}{value.status === "failed" ? <Button onClick={() => action.mutate("retry")} disabled={action.isPending}><RotateCcw size={16} />{t("jobs.retry")}</Button> : null}{!["complete", "cancelled", "cancelling"].includes(value.status) ? <Button variant="ghost" onClick={() => { action.reset(); setConfirmingCancel(true); }} disabled={action.isPending}><CircleStop size={16} />{t("jobs.cancel")}</Button> : null}</div>} />
+      {action.isError && !confirmingCancel ? <ErrorState error={action.error} /> : null}
+      {value.status === "complete" ? (
+        <Card className="job-complete" role="status">
+          <CheckCircle2 size={22} />
+          <div><strong>{t("jobs.completeTitle")}</strong><p>{value.kind === "conversion" || value.kind === "export" ? t("jobs.completeExportDetail") : t("jobs.completeDetail")}</p></div>
+          <div className="cluster">
+            {value.kind === "conversion" || value.kind === "export" ? <Link className="button button-primary button-sm" to="/exports"><Download size={15} />{t("jobs.openExports")}</Link> : null}
+            <Link className="button button-secondary button-sm" to={`/projects/${value.projectId}/${value.kind === "character_detection" ? "characters" : "chapters"}`}>{t("jobs.openProject")}</Link>
+          </div>
+        </Card>
+      ) : null}
       {value.uncertainCharge ? <Card className="uncertain-charge" role="alert"><AlertTriangle size={20} /><p>{t("jobs.uncertainCharge")}</p></Card> : null}
       <Card className="job-overview">
         <div className="job-overview-top"><div><Badge tone={jobTone(value.status)}>{t(`jobs.${value.status}`)}</Badge><strong>{t("jobs.progress", { value: Math.round(value.progress) })}</strong></div><span>{value.estimatedRemainingSeconds ? t("jobs.remaining", { value: formatDuration(value.estimatedRemainingSeconds, i18n.language) }) : t("jobs.updated", { value: formatRelative(value.updatedAt, i18n.language) })}</span></div>
@@ -112,6 +131,19 @@ function JobDetail({ jobId }: { jobId: string }) {
           </Card>
         ))}
       </div>
+      <Dialog
+        open={confirmingCancel}
+        onOpenChange={(open) => { if (!action.isPending) setConfirmingCancel(open); }}
+        title={t("jobs.cancelTitle")}
+        description={t("jobs.cancelDetail")}
+        size="sm"
+        footer={<>
+          <Button variant="secondary" disabled={action.isPending} onClick={() => setConfirmingCancel(false)}>{t("jobs.keepRunning")}</Button>
+          <Button variant="danger" disabled={action.isPending} onClick={() => action.mutate("cancel")}>{action.isPending ? <LoaderCircle className="spin" size={16} /> : <CircleStop size={16} />}{t("jobs.cancelConfirm")}</Button>
+        </>}
+      >
+        {action.isError ? <ErrorState error={action.error} /> : <p className="muted-copy">{t("jobs.cancelSafety")}</p>}
+      </Dialog>
     </div>
   );
 }

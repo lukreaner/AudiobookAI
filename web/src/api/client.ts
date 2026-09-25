@@ -223,7 +223,8 @@ export const api = {
   books: () => request<PageResponse<BookSummary>>("/api/v1/projects"),
   project: (id: string) => request<ProjectDetail>(`/api/v1/projects/${id}`),
   deleteProject: (id: string) => request<void>(`/api/v1/projects/${id}`, { method: "DELETE" }),
-  updateProject: (id: string, patch: Partial<ProjectDetail>) =>
+  /** `null` clears an optional field; omitted fields stay unchanged. */
+  updateProject: (id: string, patch: { [Key in keyof ProjectDetail]?: ProjectDetail[Key] | null }) =>
     request<ProjectDetail>(`/api/v1/projects/${id}`, { method: "PATCH", body: json(patch) }),
   createImportDraft: (file: File) => {
     const data = new FormData();
