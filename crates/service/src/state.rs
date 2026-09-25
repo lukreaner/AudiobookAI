@@ -379,6 +379,7 @@ pub(crate) fn runtime_profile_from_view(
         }
         (ProviderKindView::Anthropic, ProviderRoleView::Llm) => RuntimeAdapterKind::Anthropic,
         (ProviderKindView::Gemini, ProviderRoleView::Llm) => RuntimeAdapterKind::Gemini,
+        (ProviderKindView::Gemini, ProviderRoleView::Tts) => RuntimeAdapterKind::GeminiTts,
         (ProviderKindView::Qwen, ProviderRoleView::Llm) => RuntimeAdapterKind::Qwen,
         (ProviderKindView::Kimi, ProviderRoleView::Llm) => RuntimeAdapterKind::Kimi,
         (ProviderKindView::Moonshot, ProviderRoleView::Llm) => RuntimeAdapterKind::Moonshot,
@@ -2246,8 +2247,14 @@ async fn hydrate_jobs(
         );
     }
 
+    // Only audiobook production reflects a book's progress. A completed character detection or
+    // preview must not make a draft book look finished.
     let mut latest_project_jobs = HashMap::<Uuid, JobView>::new();
-    for job in catalog.jobs.values() {
+    for job in catalog
+        .jobs
+        .values()
+        .filter(|job| job_reflects_book_progress(job.kind))
+    {
         let replace = latest_project_jobs
             .get(&job.project_id)
             .is_none_or(|stored| stored.updated_at < job.updated_at);
@@ -2272,6 +2279,13 @@ async fn hydrate_jobs(
         };
     }
     Ok(())
+}
+
+const fn job_reflects_book_progress(kind: crate::models::JobKindView) -> bool {
+    matches!(
+        kind,
+        crate::models::JobKindView::Conversion | crate::models::JobKindView::Export
+    )
 }
 
 async fn hydrate_usage(
@@ -3953,6 +3967,23 @@ mod tests {
         assert_eq!(catalog.usage_rows[0].voice.as_deref(), Some("Alice Voice"));
         assert_eq!(catalog.usage_rows[0].cost_micros, Some(123));
         assert_eq!(catalog.usage_rows[0].provenance, "reported");
+    }
+
+    #[test]
+    fn only_production_jobs_drive_book_progress() {
+        use crate::models::JobKindView;
+
+        assert!(job_reflects_book_progress(JobKindView::Conversion));
+        assert!(job_reflects_book_progress(JobKindView::Export));
+        for kind in [
+            JobKindView::CharacterDetection,
+            JobKindView::Preview,
+            JobKindView::SegmentRegeneration,
+            JobKindView::QualityControl,
+            JobKindView::CacheCleanup,
+        ] {
+            assert!(!job_reflects_book_progress(kind), "{kind:?}");
+        }
     }
 
     #[tokio::test]

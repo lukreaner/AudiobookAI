@@ -97,26 +97,54 @@ controls.
 
 An external LM Studio connection observed as offline or errored is health-reprobed while its
 provider list is visible, so a server started after AudiobookAI can recover without a manual
-refresh. LM Studio character detection allows up to 15 minutes for local model loading and
-schema-constrained generation. A local timeout remains a transient transport failure and never
-claims that provider billing is uncertain; other potentially billable POST requests retain the
-fail-closed uncertain-charge classification. If AudiobookAI itself restarts while a built-in local
-LM Studio or Ollama request is in flight, recovery closes that attempt as an interrupted local
-transport operation and safely redispatches the durable batch. Retry validation uses the concrete
-registered connection identity rather than the adapter-family label.
+refresh. LM Studio and non-cloud Ollama character detection allow up to 15 minutes for local model
+loading and schema-constrained generation. A local timeout remains a transient transport failure
+and never claims that provider billing is uncertain; other potentially billable POST requests
+retain the fail-closed uncertain-charge classification. If AudiobookAI itself restarts while a
+built-in local LM Studio or Ollama request is in flight, recovery closes that attempt as an
+interrupted local transport operation and safely redispatches the durable batch. Retry validation
+uses the concrete registered connection identity rather than the adapter-family label.
+
+Language models cannot count UTF-8 bytes reliably, particularly around multi-byte characters such
+as umlauts and typographic quotation marks. Detection therefore never asks for offsets. Each
+paragraph is sent with a short request-local alias (`p1`, `p2`, ...), and the model returns the
+verbatim opening and closing words of every spoken passage (`quote_start`, `quote_end`). The
+adapter locates each passage deterministically with quotation-mark, apostrophe, dash, ellipsis,
+whitespace, and case folding, maps repeated identical lines to successive occurrences, and widens
+the span over directly adjacent quotation marks. A passage that cannot be located is dropped and
+stays narrated, instead of failing the whole batch. A schema-repair request repeats the complete
+task instructions. Detected characters are merged across batches when one entry's canonical name
+is a name of the other; a merely shared alias such as "Dad" never merges two people. Speakers the
+model forgot to declare are added, and characters without attributed dialogue are dropped.
 
 Character detection persists the effective total context window in every durable job. For LM
 Studio, AudiobookAI reads `loaded_instances[].config.context_length` from the native
 `/api/v1/models` response and caps it by the model maximum. If no instance is loaded, an optional
 provider-profile override is used; without one, the safe LM Studio default is 4,096 tokens. Other
 providers use their configured value or a conservative 16,384-token fallback. The workflow
-reserves prompt, schema, output, and safety capacity, batches source text by a tokenizer-independent
-byte upper bound, splits oversized paragraphs at UTF-8 boundaries, and rebases dialogue offsets to
-the original paragraph. A recognized provider context-overflow response is retried with smaller
-core batches and a smaller output allowance instead of entering the generic transient retry loop.
-If a provider reaches its completion-token limit, or the returned JSON ends at EOF, the workflow
-instead splits only the source batch and preserves the full output allowance. This prevents a
-truncated structured result from being resent unchanged as a generic JSON-repair attempt.
+reserves prompt, schema, output, and safety capacity, packs source text at a conservative two
+UTF-8 bytes per token (schema 6; schema-5 jobs keep their original byte-per-token packing on
+resume), splits oversized paragraphs at UTF-8 boundaries, and rebases dialogue offsets to the
+original paragraph. Budget reservations keep the byte-per-token upper bound. A recognized provider
+context-overflow response is retried with smaller core batches and a smaller output allowance
+instead of entering the generic transient retry loop. If a provider reaches its completion-token
+limit, or the returned JSON ends at EOF, the workflow instead splits only the source batch and
+preserves the full output allowance. This prevents a truncated structured result from being resent
+unchanged as a generic JSON-repair attempt.
+
+Conversion never sends a segment without letters or digits, such as a lone quotation mark left
+between two dialogue spans, to a TTS provider. Such ranges are removed after neighbouring context
+is assigned, so the cache and proofing identities of all other segments are unchanged.
+
+Google Gemini connections can serve either role. The TTS role supports the Gemini 3.8 speech
+models `gemini-3.8-flash-tts` (default) and `gemini-3.8-flash-lite-tts` through the Interactions
+API (`POST v1beta/interactions`) on the official endpoint only. Older `gemini-3.1-flash-tts-preview`
+and 2.5 preview TTS models use an incompatible schema and are rejected. The 30 prebuilt voices are
+always offered; entries from the optional Extended Voice Library (`GET v1beta/voices`) are added
+when the key can list them. Because 3.8 TTS reads its input as a verbatim transcript, typed
+delivery cues are sent as `speech_metadata` style annotations instead of text. Unary synthesis
+requests WAV; streaming requests pinned 24 kHz mono L16 PCM, which the adapter prefixes with a
+streaming WAV header so normalization and progressive playback need no format-specific path.
 
 Provider-native download progress is visible and cancellable for the current app
 session, but its operation journal is not yet durable across a service restart.

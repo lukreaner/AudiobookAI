@@ -18,6 +18,7 @@ pub enum RuntimeAdapterKind {
     Piper,
     NativeOs,
     OpenAiTts,
+    GeminiTts,
     OpenAi,
     OpenAiCompatible,
     Anthropic,
@@ -59,6 +60,7 @@ impl RuntimeAdapterKind {
                 | Self::Piper
                 | Self::NativeOs
                 | Self::OpenAiTts
+                | Self::GeminiTts
         )
     }
 }

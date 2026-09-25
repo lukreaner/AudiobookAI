@@ -5,10 +5,10 @@ use audiobookai_providers::{
     ManagedProcessSupervisor, ModelControlProtocol, ProviderControl, ProviderDescriptor,
     ProviderError, ProviderId, ProviderKind, ReqwestTransport, TtsProvider, VoiceCloneProvider,
     adapters::{
-        AllTalkProvider, AnthropicProvider, ElevenLabsProvider, GeminiProvider, LocalAiProvider,
-        MlxAudioProvider, NativeCommandRunner, NativeTtsConfig, NativeTtsProvider, OllamaProvider,
-        OpenAiChatPreset, OpenAiCompatibleProvider, OpenAiResponsesProvider, OpenAiTtsProvider,
-        PiperTtsConfig, PiperTtsProvider, TokioNativeCommandRunner,
+        AllTalkProvider, AnthropicProvider, ElevenLabsProvider, GeminiProvider, GeminiTtsProvider,
+        LocalAiProvider, MlxAudioProvider, NativeCommandRunner, NativeTtsConfig, NativeTtsProvider,
+        OllamaProvider, OpenAiChatPreset, OpenAiCompatibleProvider, OpenAiResponsesProvider,
+        OpenAiTtsProvider, PiperTtsConfig, PiperTtsProvider, TokioNativeCommandRunner,
     },
 };
 use url::Url;
@@ -153,6 +153,13 @@ impl ProviderAdapterFactory {
                     Arc::clone(&self.transport),
                 )?));
             }
+            RuntimeAdapterKind::GeminiTts => {
+                reject_custom_cloud_endpoint(profile, "Gemini")?;
+                bundle.tts = Some(Arc::new(GeminiTtsProvider::new(
+                    required_credential(credential)?.to_provider_credential()?,
+                    Arc::clone(&self.transport),
+                )?));
+            }
             RuntimeAdapterKind::OpenAi => {
                 bundle.character = Some(Arc::new(OpenAiResponsesProvider::with_endpoint(
                     required_endpoint(control_endpoint.as_ref())?.clone(),
@@ -279,10 +286,12 @@ fn authentication_for(
             name: "xi-api-key".to_owned(),
             value,
         },
-        (RuntimeAdapterKind::Gemini, Some(value)) => Authentication::Header {
-            name: "x-goog-api-key".to_owned(),
-            value,
-        },
+        (RuntimeAdapterKind::Gemini | RuntimeAdapterKind::GeminiTts, Some(value)) => {
+            Authentication::Header {
+                name: "x-goog-api-key".to_owned(),
+                value,
+            }
+        }
         (RuntimeAdapterKind::Anthropic, Some(value)) => Authentication::Header {
             name: "x-api-key".to_owned(),
             value,
@@ -297,7 +306,9 @@ fn default_endpoint(adapter: RuntimeAdapterKind) -> Option<Url> {
         RuntimeAdapterKind::ElevenLabs => "https://api.elevenlabs.io/",
         RuntimeAdapterKind::OpenAi | RuntimeAdapterKind::OpenAiTts => "https://api.openai.com/",
         RuntimeAdapterKind::Anthropic => "https://api.anthropic.com/",
-        RuntimeAdapterKind::Gemini => "https://generativelanguage.googleapis.com/",
+        RuntimeAdapterKind::Gemini | RuntimeAdapterKind::GeminiTts => {
+            "https://generativelanguage.googleapis.com/"
+        }
         _ => return None,
     };
     Url::parse(value).ok()
@@ -372,6 +383,25 @@ mod tests {
     }
 
     #[test]
+    fn constructs_gemini_speech_as_tts_without_an_llm_adapter() {
+        let factory = ProviderAdapterFactory::default();
+        let credential = CredentialMaterial::new(b"not-a-real-key".to_vec());
+        let profile = RuntimeProfile::new(
+            ProviderId::new("gemini-speech").unwrap(),
+            "Gemini Speech",
+            RuntimeAdapterKind::GeminiTts,
+            ProviderKind::CloudRemote,
+        );
+
+        let bundle = factory.build(&profile, Some(&credential)).unwrap();
+
+        assert!(bundle.tts.is_some());
+        assert!(bundle.character.is_none());
+        assert!(bundle.voice_cloner.is_none());
+        assert!(!format!("{bundle:?}").contains("not-a-real-key"));
+    }
+
+    #[test]
     fn cloud_profiles_require_credentials() {
         let factory = ProviderAdapterFactory::default();
         let profile = RuntimeProfile::new(
@@ -390,7 +420,11 @@ mod tests {
     fn fixed_cloud_adapters_accept_only_their_official_endpoint() {
         let factory = ProviderAdapterFactory::default();
         let credential = CredentialMaterial::new(b"test-only".to_vec());
-        for adapter in [RuntimeAdapterKind::Anthropic, RuntimeAdapterKind::Gemini] {
+        for adapter in [
+            RuntimeAdapterKind::Anthropic,
+            RuntimeAdapterKind::Gemini,
+            RuntimeAdapterKind::GeminiTts,
+        ] {
             let mut profile = RuntimeProfile::new(
                 ProviderId::new(format!("{adapter:?}").to_lowercase()).unwrap(),
                 format!("{adapter:?}"),
