@@ -53,7 +53,9 @@ export function ErrorState({ error, onRetry }: { error: unknown; onRetry?: () =>
       ? t("errors.forbiddenDetail")
       : notFound
         ? t("errors.notFoundDetail")
-        : apiError?.problem.detail || errorDetail(error, t("common.unknown"));
+        : apiError?.problem.code
+          ? t(`errors.code_${apiError.problem.code}`, { defaultValue: apiError.problem.detail || errorDetail(error, t("common.unknown")) })
+          : apiError?.problem.detail || errorDetail(error, t("common.unknown"));
   return (
     <Card className="error-state" role="alert">
       <div className="error-icon"><AlertCircle size={22} /></div>
@@ -62,7 +64,7 @@ export function ErrorState({ error, onRetry }: { error: unknown; onRetry?: () =>
         <p>{detail}</p>
         {apiError?.problem.code ? <code>{t("errors.technical", { code: apiError.problem.code })}</code> : null}
       </div>
-      {onRetry ? <Button variant="secondary" onClick={onRetry}><RotateCw size={16} />{t("errors.retry")}</Button> : null}
+      {onRetry ? <Button variant="secondary" onClick={onRetry}><RotateCw size={16} />{offline ? t("errors.retry") : t("common.retry")}</Button> : null}
     </Card>
   );
 }

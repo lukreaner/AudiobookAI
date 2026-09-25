@@ -86,6 +86,18 @@ use self::{
 };
 pub(crate) use self::{projects::*, pronunciation::*, provider_config::*, providers::*, voices::*};
 
+/// Sending book text to a cloud provider needs the project's explicit consent. The stable code
+/// lets the dashboard offer that consent directly instead of only showing the message.
+pub(crate) fn cloud_text_consent_required(provider_name: &str) -> ServiceError {
+    ServiceError::ConflictDetails {
+        code: "cloud_text_consent_required",
+        detail: format!(
+            "grant this project permission to send book text to the cloud provider {provider_name}"
+        ),
+        meta: serde_json::json!({ "providerName": provider_name }),
+    }
+}
+
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct HealthResponse {

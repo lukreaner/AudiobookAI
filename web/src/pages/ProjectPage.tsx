@@ -37,7 +37,8 @@ import { Badge, Button, Card, Dialog, Field, Input, PageHeading, ProgressBar, Se
 import { DEFAULT_EXPORT_SETTINGS, requiresMusicOwnership, toJobExportSettings, type ExportFormState } from "../features/exportSettings";
 import { formatBytes, formatCount, formatDuration, formatMoney } from "../lib/format";
 import { AUTO_SPEAKER, NARRATOR_SPEAKER, paragraphIdFor, parseAliases, speakerOverrideInput, storedSpeakerSelection } from "../features/characterReview";
-import { allowedOr, defaultEffort, detectionControls } from "../features/detectionControls";
+import { CloudConsentCard, CloudTextConsentNotice } from "../features/CloudConsent";
+import { allowedOr, defaultEffort, detectionControls, readDetectionSettings, writeDetectionSettings } from "../features/detectionControls";
 import { DistributionPanel } from "../features/DistributionPanel";
 import { localizeJobStage } from "../features/jobStage";
 import { ProofingWorkbench } from "../features/ProofingWorkbench";
@@ -97,7 +98,7 @@ export function ProjectPage({ tab }: { tab: ProjectTab }) {
 
       <div className="project-tab-content">
         {tab === "chapters" ? <ChaptersPanel projectId={id} /> : null}
-        {tab === "characters" ? <CharactersPanel projectId={id} reviewStatus={project.data.characterReviewStatus} consentCloudAudio={project.data.consentCloudAudio} /> : null}
+        {tab === "characters" ? <CharactersPanel projectId={id} reviewStatus={project.data.characterReviewStatus} consentCloudAudio={project.data.consentCloudAudio} consentCloudText={project.data.consentCloudText} /> : null}
         {tab === "auditions" ? <VoiceAuditionPanel projectId={id} /> : null}
         {tab === "pronunciation" ? <PronunciationPanel projectId={id} defaultLanguage={project.data.language ?? ""} /> : null}
         {tab === "preflight" ? <PreflightPanel projectId={id} /> : null}
@@ -144,6 +145,7 @@ function ChaptersPanel({ projectId }: { projectId: string }) {
           </label>
         ))}
       </div>
+      <CloudConsentCard project={project.data} />
       <div className="panel-footer"><Link className="button button-primary button-md" to={`/projects/${projectId}/characters`}>{t("common.continue")}<UserRound size={16} /></Link></div>
     </div>
   );
@@ -168,7 +170,7 @@ export function characterDetectionInput(
   return { providerProfileId, temperature, reasoning, expectedCharacterRevision };
 }
 
-function CharactersPanel({ projectId, reviewStatus, consentCloudAudio }: { projectId: string; reviewStatus: string; consentCloudAudio: boolean }) {
+function CharactersPanel({ projectId, reviewStatus, consentCloudAudio, consentCloudText }: { projectId: string; reviewStatus: string; consentCloudAudio: boolean; consentCloudText: boolean }) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const characters = useQuery({ queryKey: ["characters", projectId], queryFn: () => api.characters(projectId) });
@@ -186,12 +188,24 @@ function CharactersPanel({ projectId, reviewStatus, consentCloudAudio }: { proje
   });
   const voices = useQuery({ queryKey: ["voices"], queryFn: () => api.voices() });
   const aiProviders = providers.data?.items.filter((provider) => provider.role === "llm" && provider.capabilities?.characterDetection) ?? [];
-  const [detectionProvider, setDetectionProvider] = useState("");
-  const [temperatureMode, setTemperatureMode] = useState<DetectionTemperature["mode"]>("default");
-  const [temperatureValue, setTemperatureValue] = useState(0.2);
-  const [reasoningMode, setReasoningMode] = useState<DetectionReasoning["mode"]>("inherit");
-  const [reasoningEffort, setReasoningEffort] = useState("medium");
-  const [reasoningTokens, setReasoningTokens] = useState(4096);
+  // The last detection settings of this project are restored when returning to the tab.
+  const [storedDetection] = useState(() => readDetectionSettings(projectId));
+  const [detectionProvider, setDetectionProvider] = useState(storedDetection.provider ?? "");
+  const [temperatureMode, setTemperatureMode] = useState<DetectionTemperature["mode"]>(storedDetection.temperatureMode ?? "default");
+  const [temperatureValue, setTemperatureValue] = useState(storedDetection.temperatureValue ?? 0.2);
+  const [reasoningMode, setReasoningMode] = useState<DetectionReasoning["mode"]>(storedDetection.reasoningMode ?? "inherit");
+  const [reasoningEffort, setReasoningEffort] = useState(storedDetection.reasoningEffort ?? "medium");
+  const [reasoningTokens, setReasoningTokens] = useState(storedDetection.reasoningTokens ?? 4096);
+  useEffect(() => {
+    writeDetectionSettings(projectId, {
+      provider: detectionProvider,
+      temperatureMode,
+      temperatureValue,
+      reasoningMode,
+      reasoningEffort,
+      reasoningTokens,
+    });
+  }, [projectId, detectionProvider, temperatureMode, temperatureValue, reasoningMode, reasoningEffort, reasoningTokens]);
   const [assigning, setAssigning] = useState<Character>();
   const [editingIdentity, setEditingIdentity] = useState<Character>();
   const [identityName, setIdentityName] = useState("");
@@ -213,7 +227,7 @@ function CharactersPanel({ projectId, reviewStatus, consentCloudAudio }: { proje
   const latestDetection = detectionStatus.data?.latestJob;
   const detection = useMutation({
     mutationFn: (idempotencyKey: string) => api.detectCharacters(projectId, characterDetectionInput(
-      detectionProvider,
+      activeDetectionProvider,
       activeTemperatureMode,
       temperatureValue,
       activeReasoningMode,
@@ -348,9 +362,12 @@ function CharactersPanel({ projectId, reviewStatus, consentCloudAudio }: { proje
   const filteredVoices = voices.data?.items.filter((voice) => !voiceProvider || voice.providerProfileId === voiceProvider) ?? [];
   const cloneProviders = providers.data?.items.filter((provider) => provider.role === "tts" && provider.capabilities?.voiceCloning) ?? [];
   const selectedDetectionProvider = aiProviders.find((provider) => provider.id === detectionProvider);
+  // A remembered provider that was removed in the meantime counts as not selected.
+  const activeDetectionProvider = selectedDetectionProvider?.id ?? "";
+  const cloudTextConsentMissing = selectedDetectionProvider?.mode === "cloud_remote" && !consentCloudText;
   // Only options the selected model accepts are offered; a selection made for another model or
   // provider falls back to an allowed one instead of being sent.
-  const controls = detectionControls(selectedDetectionProvider?.capabilities);
+  const controls = detectionControls(selectedDetectionProvider);
   const activeTemperatureMode = allowedOr(temperatureMode, controls.temperatureModes, "default");
   const activeReasoningMode = allowedOr(reasoningMode, controls.reasoningModes, "inherit");
   const activeEffort = allowedOr(reasoningEffort, controls.efforts, defaultEffort(controls.efforts));
@@ -360,8 +377,8 @@ function CharactersPanel({ projectId, reviewStatus, consentCloudAudio }: { proje
   // With exactly one detection-capable connection there is nothing to choose.
   const onlyDetectionProviderId = aiProviders.length === 1 ? aiProviders[0].id : undefined;
   useEffect(() => {
-    if (!detectionProvider && onlyDetectionProviderId) setDetectionProvider(onlyDetectionProviderId);
-  }, [detectionProvider, onlyDetectionProviderId]);
+    if (!activeDetectionProvider && onlyDetectionProviderId) setDetectionProvider(onlyDetectionProviderId);
+  }, [activeDetectionProvider, onlyDetectionProviderId]);
   const characterMutationPending = detection.isPending || approve.isPending || assignment.isPending || identity.isPending
     || speakerOverride.isPending || createIdentity.isPending || mergeIdentity.isPending || deleteIdentity.isPending;
 
@@ -404,7 +421,7 @@ function CharactersPanel({ projectId, reviewStatus, consentCloudAudio }: { proje
         <div className="section-heading"><div><h2>{t("characters.detectionSettings")}</h2><p>{t("characters.detectionSettingsDetail")}</p></div></div>
         <div className="grid-2">
           <Field label={t("characters.detectionProvider")}>
-            <Select value={detectionProvider} disabled={characterMutationPending} onChange={(event) => { setDetectionProvider(event.target.value); setTemperatureMode("default"); setReasoningMode("inherit"); detection.reset(); }}>
+            <Select value={activeDetectionProvider} disabled={characterMutationPending} onChange={(event) => { setDetectionProvider(event.target.value); setTemperatureMode("default"); setReasoningMode("inherit"); detection.reset(); }}>
               <option value="">{t("common.select")}</option>
               {aiProviders.map((provider) => <option key={provider.id} value={provider.id}>{provider.name}</option>)}
             </Select>
@@ -437,7 +454,8 @@ function CharactersPanel({ projectId, reviewStatus, consentCloudAudio }: { proje
             <Input type="number" min={controls.minBudget} max={controls.maxBudget} step={256} disabled={characterMutationPending} value={reasoningTokens} onChange={(event) => { if (Number.isFinite(event.target.valueAsNumber)) setReasoningTokens(event.target.valueAsNumber); }} />
           </Field> : null}
         </div>
-        <div className="space-between"><span className="muted-copy">{t("characters.detectionBilling")}</span><Button disabled={!detectionProvider || characterMutationPending || Boolean(activeDetection) || temperatureInvalid || budgetInvalid} onClick={() => detection.mutate(crypto.randomUUID())}>{detection.isPending ? <LoaderCircle className="spin" size={16} /> : <Sparkles size={16} />}{noCharacters ? t("characters.detect") : t("characters.detectAgain")}</Button></div>
+        {cloudTextConsentMissing && selectedDetectionProvider ? <CloudTextConsentNotice projectId={projectId} providerName={selectedDetectionProvider.name} /> : null}
+        <div className="space-between"><span className="muted-copy">{t("characters.detectionBilling")}</span><Button disabled={!activeDetectionProvider || cloudTextConsentMissing || characterMutationPending || Boolean(activeDetection) || temperatureInvalid || budgetInvalid} onClick={() => detection.mutate(crypto.randomUUID())}>{detection.isPending ? <LoaderCircle className="spin" size={16} /> : <Sparkles size={16} />}{noCharacters ? t("characters.detect") : t("characters.detectAgain")}</Button></div>
       </Card> : null}
       {detection.isError ? <ErrorState error={detection.error} onRetry={() => detection.mutate(retryIdempotencyKey(detection.error, detection.variables))} /> : null}
       {speakerOverride.isError ? <ErrorState error={speakerOverride.error} onRetry={speakerOverride.variables ? () => speakerOverride.mutate(speakerOverride.variables!) : undefined} /> : null}

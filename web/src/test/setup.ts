@@ -2,7 +2,11 @@ import "@testing-library/jest-dom/vitest";
 import { cleanup } from "@testing-library/react";
 import { afterEach } from "vitest";
 
-afterEach(() => cleanup());
+afterEach(() => {
+  cleanup();
+  // Remembered UI selections must not leak between tests.
+  localStorage.clear();
+});
 
 const storage = new Map<string, string>();
 const localStorageStub: Storage = {

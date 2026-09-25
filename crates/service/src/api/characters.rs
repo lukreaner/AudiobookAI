@@ -170,6 +170,7 @@ pub(super) async fn start_character_detection(
         .get(&input.provider_profile_id)
         .ok_or_else(|| ServiceError::InvalidRequest("unknown provider profile".to_owned()))?;
     let provider_is_cloud = matches!(provider.mode, ProviderModeView::CloudRemote);
+    let provider_name = provider.name.clone();
     let supports_detection = provider
         .capabilities
         .as_ref()
@@ -213,10 +214,7 @@ pub(super) async fn start_character_detection(
         });
     }
     if provider_is_cloud && !project.consent_cloud_text {
-        return Err(ServiceError::InvalidRequest(
-            "grant this project permission to send book text to the selected cloud provider"
-                .to_owned(),
-        ));
+        return Err(super::cloud_text_consent_required(&provider_name));
     }
     if !supports_detection {
         return Err(ServiceError::InvalidRequest(

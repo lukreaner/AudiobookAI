@@ -177,10 +177,7 @@ pub(super) async fn voice_auditions(
                 if matches!(provider.mode, ProviderModeView::CloudRemote)
                     && !project.cloud_consent.book_text
                 {
-                    return Err(ServiceError::Conflict(format!(
-                        "grant project consent before sending audition text to {}",
-                        provider.name
-                    )));
+                    return Err(super::cloud_text_consent_required(&provider.name));
                 }
                 let voice = catalog
                     .voices

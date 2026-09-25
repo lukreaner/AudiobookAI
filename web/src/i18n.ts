@@ -136,6 +136,9 @@ const en = {
     chapterStatus: "Chapter status: {{status}}",
     selectHint: "Only selected chapters will be estimated and converted.",
     saveSelection: "Save chapter selection",
+    cloudConsentTitle: "Cloud permissions",
+    cloudConsentDetail: "Nothing from this project goes to a cloud provider unless you allow it here. Changes apply to future requests.",
+    cloudTextConsentDetail: "Needed for character detection and narration with cloud providers.",
     noChapters: "No chapters were found for this project.",
     startPreflight: "Review preflight",
     cloudConsentMissing: "Cloud consent is required for the selected provider.",
@@ -271,6 +274,8 @@ const en = {
     cloudAudioConsent: "Allow this project's reference audio to be sent to cloud providers",
     cloudAudioConsentDetail: "Stored per project and revocable before future uploads.",
     cloudAudioBlocked: "Cloud reference-audio consent is required before creating this clone.",
+    cloudTextRequiredTitle: "{{name}} is a cloud provider",
+    cloudTextRequiredDetail: "Character detection sends the text of the selected chapters to {{name}}. Allow this for the project to continue, or choose a local provider.",
   },
   pronunciation: {
     title: "Pronunciation studio",
@@ -961,6 +966,7 @@ const en = {
     notFoundDetail: "It may have been removed or the link is out of date.",
     retry: "Reconnect",
     technical: "Error code: {{code}}",
+    code_cloud_text_consent_required: "This project does not allow sending book text to cloud providers yet. Allow it under Cloud permissions on the Chapters tab, or choose a local provider.",
   },
   state: {
     loadingLibrary: "Loading your library",
@@ -1043,6 +1049,9 @@ const de: typeof en = {
     metadata: "Buchdetails", openMenu: "Projektaktionen", words: "{{count}} Wörter", charactersCount: "{{count}} Zeichen",
     chapterSelected: "{{title}} einschließen", chapterStatus: "Kapitelstatus: {{status}}",
     selectHint: "Nur ausgewählte Kapitel werden geschätzt und konvertiert.", saveSelection: "Kapitelauswahl speichern",
+    cloudConsentTitle: "Cloud-Freigaben",
+    cloudConsentDetail: "Ohne Freigabe gelangt nichts aus diesem Projekt zu einem Cloud-Anbieter. Änderungen gelten für künftige Anfragen.",
+    cloudTextConsentDetail: "Nötig für Figurenerkennung und Vertonung über Cloud-Anbieter.",
     noChapters: "Für dieses Projekt wurden keine Kapitel gefunden.", startPreflight: "Vorabprüfung ansehen",
     cloudConsentMissing: "Für den gewählten Anbieter ist eine Cloud-Einwilligung erforderlich.",
     pending: "Ausstehend", cached: "Im Cache", processing: "In Bearbeitung", complete: "Fertig", failed: "Fehlgeschlagen",
@@ -1137,6 +1146,8 @@ const de: typeof en = {
     cloudAudioConsent: "Referenzaudio dieses Projekts an Cloud-Anbieter senden dürfen",
     cloudAudioConsentDetail: "Wird je Projekt gespeichert und kann vor künftigen Uploads widerrufen werden.",
     cloudAudioBlocked: "Vor dem Erstellen dieses Klons ist die Cloud-Referenzaudio-Einwilligung erforderlich.",
+    cloudTextRequiredTitle: "{{name}} ist ein Cloud-Anbieter",
+    cloudTextRequiredDetail: "Die Figurenerkennung sendet den Text der ausgewählten Kapitel an {{name}}. Erlaube das für dieses Projekt oder wähle einen lokalen Anbieter.",
   },
   pronunciation: {
     title: "Aussprache-Studio", subtitle: "Lehre Namen, Orte und ungewöhnliche Wörter einmal und höre sie danach konsistent.",
@@ -1548,6 +1559,7 @@ const de: typeof en = {
     forbiddenTitle: "Diese Sitzung ist nicht mehr berechtigt", forbiddenDetail: "Öffne die Desktop-App erneut oder melde dich für den LAN-Zugriff wieder an.",
     notFoundTitle: "Dieser Eintrag wurde nicht gefunden", notFoundDetail: "Er wurde möglicherweise entfernt oder der Link ist veraltet.",
     retry: "Neu verbinden", technical: "Fehlercode: {{code}}",
+    code_cloud_text_consent_required: "Dieses Projekt erlaubt noch nicht, Buchtext an Cloud-Anbieter zu senden. Erlaube es unter „Cloud-Freigaben“ im Tab „Kapitel“ oder wähle einen lokalen Anbieter.",
   },
   state: {
     loadingLibrary: "Bibliothek wird geladen", loadingProject: "Projekt wird geöffnet", loadingProviders: "Anbieter werden geprüft",

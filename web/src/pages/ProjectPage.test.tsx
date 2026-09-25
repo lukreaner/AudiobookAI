@@ -338,8 +338,10 @@ describe("character review", () => {
       name: "Reasoning AI",
       kind: "openai",
       role: "llm",
+      model: "gpt-6-luna",
       capabilities: {
         ...cloneProvider.capabilities!,
+        generationControlsModel: "gpt-6-luna",
         tts: false,
         characterDetection: true,
         voiceCloning: false,
@@ -366,6 +368,61 @@ describe("character review", () => {
       reasoning: { mode: "effort", effort: "high" },
       expectedCharacterRevision: 3,
     }, expect.any(String)));
+  });
+
+  it("offers the missing cloud text permission where detection needs it", async () => {
+    const user = userEvent.setup();
+    const provider: ProviderProfile = {
+      ...cloneProvider,
+      id: "provider-cloud-ai",
+      name: "Cloud AI",
+      kind: "openai",
+      role: "llm",
+      capabilities: { ...cloneProvider.capabilities!, tts: false, characterDetection: true, voiceCloning: false },
+    };
+    vi.mocked(api.project).mockResolvedValue({ ...project, consentCloudText: false });
+    vi.mocked(api.providers).mockResolvedValue({ items: [provider], total: 1 });
+    vi.mocked(api.updateProject).mockResolvedValue({ ...project, consentCloudText: true });
+    renderCharacterReview();
+
+    expect(await screen.findByText("Cloud AI is a cloud provider")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Run detection again" })).toBeDisabled();
+    await user.click(screen.getByRole("switch", { name: /Allow selected book text/ }));
+    await waitFor(() => expect(api.updateProject).toHaveBeenCalledWith("project-1", { consentCloudText: true }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Run detection again" })).toBeEnabled());
+  });
+
+  it("remembers detection settings when returning to the tab", async () => {
+    const user = userEvent.setup();
+    const provider: ProviderProfile = {
+      ...cloneProvider,
+      id: "provider-ai",
+      name: "Reasoning AI",
+      kind: "openai",
+      role: "llm",
+      model: "gpt-6-luna",
+      capabilities: {
+        ...cloneProvider.capabilities!,
+        generationControlsModel: "gpt-6-luna",
+        tts: false,
+        characterDetection: true,
+        voiceCloning: false,
+        reasoning: ["effort"],
+        reasoningEfforts: ["low", "medium", "high"],
+      },
+    };
+    const other = { ...provider, id: "provider-other", name: "Other AI" };
+    vi.mocked(api.providers).mockResolvedValue({ items: [provider, other], total: 2 });
+    const first = renderCharacterReview();
+    await user.selectOptions(await screen.findByRole("combobox", { name: "Detection provider" }), provider.id);
+    await user.selectOptions(screen.getByRole("combobox", { name: /^Reasoning mode/ }), "effort");
+    await user.selectOptions(screen.getByRole("combobox", { name: "Effort level" }), "high");
+    first.unmount();
+
+    renderCharacterReview();
+    await waitFor(() => expect(screen.getByRole("combobox", { name: "Detection provider" })).toHaveValue(provider.id));
+    expect(screen.getByRole("combobox", { name: /^Reasoning mode/ })).toHaveValue("effort");
+    expect(screen.getByRole("combobox", { name: "Effort level" })).toHaveValue("high");
   });
 
   it("normalizes aliases without duplicates or the canonical name", () => {

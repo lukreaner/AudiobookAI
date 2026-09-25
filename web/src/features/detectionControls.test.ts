@@ -2,13 +2,13 @@ import { describe, expect, it } from "vitest";
 import type { ProviderCapabilities } from "../api/types";
 import { allowedOr, defaultEffort, detectionControls } from "./detectionControls";
 
-function capabilities(overrides: Partial<ProviderCapabilities>): ProviderCapabilities {
-  return {
+function capabilities(overrides: Partial<ProviderCapabilities>): { model: string; capabilities: ProviderCapabilities } {
+  return { model: "model-x", capabilities: {
     tts: false, characterDetection: true, streaming: false, voiceCloning: false, pronunciation: false,
     processControl: false, modelControl: false, modelList: false, modelDownload: false, modelDelete: false,
     modelLoad: false, modelUnload: false, modelSwitch: false, temperature: "unsupported", reasoning: [],
-    modelPerformance: [], ...overrides,
-  };
+    modelPerformance: [], generationControlsModel: "model-x", ...overrides,
+  } };
 }
 
 describe("detection controls", () => {
@@ -35,6 +35,12 @@ describe("detection controls", () => {
     expect(controls.temperatureModes).toEqual(["default", "value"]);
     expect(controls.maxTemperature).toBe(1);
     expect(controls.minBudget).toBe(2048);
+  });
+
+  it("ignores options determined for a different model", () => {
+    const provider = capabilities({ temperature: "number", reasoning: ["disabled"], generationControlsModel: "old-model" });
+    expect(detectionControls(provider).reasoningModes).toEqual(["inherit"]);
+    expect(detectionControls(provider).temperatureModes).toEqual(["default"]);
   });
 
   it("falls back to provider defaults when nothing is known", () => {

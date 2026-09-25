@@ -311,7 +311,7 @@ describe("proofing workbench", () => {
     await user.click(screen.getByRole("switch", { name: /I reviewed this estimate/ }));
     await user.click(screen.getByRole("button", { name: "Start regeneration" }));
     await screen.findByText("the regeneration estimate expired");
-    await user.click(screen.getByRole("button", { name: "Reconnect" }));
+    await user.click(screen.getByRole("button", { name: "Try again" }));
 
     await waitFor(() => expect(estimate).toHaveBeenCalledTimes(2));
     expect(regenerate).toHaveBeenCalledTimes(1);
