@@ -33,42 +33,75 @@ out of scope.
 - Detailed, rotating, privacy-sanitized diagnostics in the authenticated UI
 - Complete English and German desktop dashboard
 
+## Quick start
+
+Double-click **`Start AudiobookAI`** in this folder:
+
+| System  | File                         |
+|---------|------------------------------|
+| Linux   | `Start AudiobookAI.desktop` (shown as "Start AudiobookAI" in the file manager) |
+| macOS   | `Start AudiobookAI.command`  |
+| Windows | `Start AudiobookAI.cmd`      |
+
+The first start builds the app, which takes several minutes and shows its progress in a
+terminal window. Later starts open the app right away and rebuild only when the code has changed.
+On first use, KDE and GNOME may ask whether to trust the launcher, and macOS may require
+right-click → Open.
+
+Building needs Rust (the pinned toolchain installs itself through `rustup`), Node.js 26 with
+pnpm 11, Python 3, and FFmpeg/ffprobe on `PATH`. On Linux, Tauri additionally needs the
+WebKitGTK development packages; native speech needs eSpeak NG.
+
+From a terminal, the same and more is available through `make`:
+
+```bash
+make run          # build if needed and start the app (same as the double-click launcher)
+make dev          # start the desktop app with live reload while developing
+make dev-browser  # dashboard in a browser at http://127.0.0.1:1420 with throwaway data
+```
+
+`make` on its own lists every command. The launcher, `make run`, and `make dev` use the regular
+AudiobookAI application data; `make dev-browser` stores everything in a temporary directory.
+
 ## Repository layout
 
 ```text
-apps/desktop/       Tauri desktop host and native packaging
+apps/desktop/       Tauri desktop host (window, tray, first-run storage) and app icons
 crates/core/        Domain types and validation
+crates/epub/        EPUB parsing, DRM detection, chapters, and metadata
 crates/storage/     SQLite migrations and repositories
 crates/providers/   TTS, character-AI, voice, and lifecycle adapters
 crates/media/       FFmpeg discovery, cache, mixing, and export planning
 crates/service/     Axum API, job runtime, auth, and embedded dashboard
 web/                React/TypeScript dashboard
+docs/               Architecture, security, provider, sidecar, and release notes
+packaging/          Pinned sidecar lock (FFmpeg, eSpeak NG, uv, MLX-audio) for release builds
+scripts/launch/     Double-click launcher logic behind the `Start AudiobookAI` files
+scripts/packaging/  Local native build used by the launcher and `make native-local`
+scripts/release/    CI, snapshot, and signed-release pipeline steps (see .github/workflows)
+scripts/signing/    Code-signing identity checks used only by the release workflow
+scripts/security/   Secret scanner used by `make check`, CI, and the optional git hooks
+.githooks/          Optional pre-commit/pre-push secret scan (`make install-hooks`)
 ```
+
+Build output lands in the git-ignored `target/`, `web/dist/`, `node_modules/`, and
+`artifacts/local-native/` directories; they can be deleted at any time.
 
 ## Development
 
-Requirements are Rust 1.96, Node.js 26, and pnpm 11. FFmpeg/ffprobe are needed
-for media integration tests; production installers carry pinned native
-sidecars. No provider key is required for the normal unit or contract-test
-suite.
+FFmpeg/ffprobe are needed for media integration tests; production installers
+carry pinned native sidecars. No provider key is required for the normal unit or
+contract-test suite.
 
 ```bash
-pnpm --dir web install
-pnpm --dir web build
-cargo test --workspace
-pnpm --dir web tauri dev
+make check   # secret scan, formatting, clippy, type checks
+make test    # Rust, Python, and dashboard tests
 ```
 
-For dashboard work in a normal browser, run the development-only API against a disposable data
-directory and the Vite dev server, which proxies `/api` to it:
-
-```bash
-cargo run -p audiobookai-service --example dev_server -- /tmp/audiobookai-dev
-pnpm --dir web dev
-```
-
-The example is never packaged and binds to loopback without the desktop bootstrap, so use it only
-with test data and never with real provider credentials.
+`make dev-browser` runs the development-only API example
+(`cargo run -p audiobookai-service --example dev_server -- <data-dir>`) next to the Vite dev
+server, which proxies `/api` to it. The example is never packaged and binds to loopback without
+the desktop bootstrap, so use it only with test data and never with real provider credentials.
 
 To produce a fresh native executable and non-release-signed host package from the current
 checkout, run:

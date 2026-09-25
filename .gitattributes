@@ -1,2 +1,7 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Double-click launchers keep their platform line endings.
+*.cmd text eol=crlf
+*.command text eol=lf
+*.desktop text eol=lf

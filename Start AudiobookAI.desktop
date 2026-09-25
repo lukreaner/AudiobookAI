@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Start AudiobookAI
+Name[de]=AudiobookAI starten
+Comment=Start AudiobookAI from this folder, building it first when the code changed
+Comment[de]=AudiobookAI aus diesem Ordner starten und bei Bedarf vorher bauen
+Exec=bash -c "cd \\"\\$(dirname \\"\\$0\\")\\" && exec python3 scripts/launch/start_audiobookai.py" %k
+Icon=audio-headphones
+Terminal=true
+Categories=AudioVideo;Audio;
