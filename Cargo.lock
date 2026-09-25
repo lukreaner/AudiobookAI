@@ -319,28 +319,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "async-stream"
-version = "0.3.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b5a71a6f37880a80d1d7f19efd781e4b5de42c88f0722cc13bcb6cc2cfe8476"
-dependencies = [
- "async-stream-impl",
- "futures-core",
- "pin-project-lite",
-]
-
-[[package]]
-name = "async-stream-impl"
-version = "0.3.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7c24de15d275a1ecfd47a380fb4d5ec9bfe0933f309ed5e705b775596a3574d"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
 name = "async-task"
 version = "4.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -436,7 +414,6 @@ dependencies = [
  "rbook",
  "scraper",
  "serde",
- "tempfile",
  "thiserror 2.0.19",
  "zip 4.6.1",
 ]
@@ -447,13 +424,11 @@ version = "0.1.0"
 dependencies = [
  "audiobookai-core",
  "blake3",
- "chrono",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.19",
- "uuid",
 ]
 
 [[package]]
@@ -477,7 +452,6 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
- "zeroize",
 ]
 
 [[package]]
@@ -485,9 +459,7 @@ name = "audiobookai-service"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
- "anyhow",
  "argon2",
- "async-stream",
  "async-trait",
  "audiobookai-core",
  "audiobookai-epub",
@@ -514,7 +486,6 @@ dependencies = [
  "rust-embed",
  "rustix",
  "rustls",
- "secrecy",
  "serde",
  "serde_json",
  "sha2 0.10.9",

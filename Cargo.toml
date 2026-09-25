@@ -21,9 +21,7 @@ authors = ["AudiobookAI contributors"]
 [workspace.dependencies]
 aes-gcm = "0.10"
 ammonia = "4"
-anyhow = "1"
 argon2 = "0.5"
-async-stream = "0.3"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["http2", "json", "macros", "multipart", "tokio", "ws"] }
 axum-server = { version = "0.8", default-features = false, features = ["tls-rustls-no-provider"] }

@@ -11,10 +11,8 @@ embedded-dashboard = ["dep:rust-embed", "dep:mime_guess"]
 
 [dependencies]
 aes-gcm.workspace = true
-anyhow.workspace = true
 argon2.workspace = true
 async-trait.workspace = true
-async-stream.workspace = true
 axum.workspace = true
 axum-server.workspace = true
 base64.workspace = true
@@ -33,7 +31,6 @@ regex.workspace = true
 reqwest.workspace = true
 rust-embed = { workspace = true, optional = true }
 rustls.workspace = true
-secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

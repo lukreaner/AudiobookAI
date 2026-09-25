@@ -193,11 +193,3 @@ export function Stat({ label, value, detail }: { label: string; value: ReactNode
     </div>
   );
 }
-
-export function Divider() {
-  return <div className="divider" role="separator" />;
-}
-
-export function Skeleton({ className }: { className?: string }) {
-  return <span className={clsx("skeleton", className)} aria-hidden="true" />;
-}
