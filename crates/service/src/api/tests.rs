@@ -1216,6 +1216,153 @@ async fn openai_connections_persist_independent_roles_and_models() {
     );
 }
 
+fn gpt6_profile(model: &str) -> ProviderProfileView {
+    let mut profile = ProviderProfileView {
+        id: Uuid::new_v4(),
+        name: "OpenAI".to_owned(),
+        kind: ProviderKindView::Openai,
+        role: ProviderRoleView::Llm,
+        mode: ProviderModeView::CloudRemote,
+        endpoint: Some("https://api.openai.com/".to_owned()),
+        executable_path: None,
+        working_directory: None,
+        arguments: Vec::new(),
+        status: ProviderStatusView::Online,
+        model: Some(model.to_owned()),
+        context_window_tokens: None,
+        credential_configured: true,
+        capabilities: Some(default_capabilities(
+            &ProviderKindView::Openai,
+            ProviderRoleView::Llm,
+            ProviderModeView::CloudRemote,
+        )),
+        capability_source: Some("built_in_adapter_contract+health_probe".to_owned()),
+        capability_updated_at: Some(Utc::now()),
+        last_error: None,
+    };
+    let effort = |level: &str| audiobookai_providers::ReasoningEffort::new(level).unwrap();
+    apply_generation_controls(
+        &mut profile,
+        &audiobookai_providers::ModelGenerationControls {
+            temperature: audiobookai_providers::ParameterSupport::Unsupported,
+            max_temperature: None,
+            reasoning: [
+                audiobookai_providers::ReasoningMode::Disabled,
+                audiobookai_providers::ReasoningMode::Effort,
+            ]
+            .into(),
+            efforts: ["low", "medium", "high", "xhigh", "max"]
+                .map(effort)
+                .to_vec(),
+            min_token_budget: None,
+            max_token_budget: None,
+            source: audiobookai_providers::GenerationControlsSource::ValidationProbe,
+        },
+        Some(model.to_owned()),
+    );
+    profile
+}
+
+#[test]
+fn only_options_determined_for_the_selected_model_are_accepted() {
+    use audiobookai_providers::{ReasoningControl, ReasoningEffort, Temperature};
+
+    let profile = gpt6_profile("gpt-6-luna");
+    let capabilities = profile.capabilities.as_ref().unwrap();
+    assert_eq!(capabilities.reasoning, ["disabled", "effort"]);
+    assert_eq!(
+        capabilities.reasoning_efforts,
+        ["low", "medium", "high", "xhigh", "max"]
+    );
+    assert_eq!(capabilities.temperature, "unsupported");
+
+    let controls = model_generation_controls_for(&profile, "gpt-6-luna");
+    let effort = |level: &str| ReasoningControl::Effort {
+        effort: ReasoningEffort::new(level).unwrap(),
+    };
+    assert!(
+        controls
+            .validate(Temperature::Default, &effort("xhigh"))
+            .is_ok()
+    );
+    assert!(
+        controls
+            .validate(Temperature::Default, &ReasoningControl::Disabled)
+            .is_ok()
+    );
+    assert!(
+        controls
+            .validate(Temperature::Default, &effort("minimal"))
+            .is_err()
+    );
+    assert!(
+        controls
+            .validate(Temperature::Value(0.5), &ReasoningControl::Inherit)
+            .is_err()
+    );
+    assert!(
+        controls
+            .validate(Temperature::Default, &ReasoningControl::Inherit)
+            .is_ok()
+    );
+
+    // Options determined for another model never carry over.
+    let other = model_generation_controls_for(&profile, "gpt-5");
+    assert!(
+        other
+            .validate(Temperature::Default, &effort("low"))
+            .is_err()
+    );
+    assert!(
+        other
+            .validate(Temperature::Default, &ReasoningControl::Inherit)
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn model_generation_controls_survive_a_restart() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let config = crate::ServiceConfig {
+        bind: "127.0.0.1:0".parse().expect("address"),
+        data_dir: directory.path().to_path_buf(),
+        bundled_sidecar_dir: None,
+        tls: None,
+        lan_hostnames: Vec::new(),
+        allow_insecure_lan: false,
+        desktop_bootstrap: false,
+    };
+    let profile = gpt6_profile("gpt-6-luna");
+    {
+        let database = audiobookai_storage::Database::open_in(directory.path())
+            .await
+            .expect("database");
+        let state = AppState::new(config.clone(), database)
+            .await
+            .expect("state");
+        persist_provider(&state, &profile, None)
+            .await
+            .expect("persist provider");
+        state.database.close().await;
+    }
+    let database = audiobookai_storage::Database::open_in(directory.path())
+        .await
+        .expect("database");
+    let state = AppState::new(config, database).await.expect("state");
+    let restored = state.catalog.read().await.providers[&profile.id].clone();
+    let capabilities = restored.capabilities.expect("capabilities");
+    assert_eq!(capabilities.reasoning, ["disabled", "effort"]);
+    assert_eq!(
+        capabilities.reasoning_efforts,
+        ["low", "medium", "high", "xhigh", "max"]
+    );
+    assert_eq!(capabilities.temperature, "unsupported");
+    assert_eq!(
+        capabilities.generation_controls_model.as_deref(),
+        Some("gpt-6-luna")
+    );
+}
+
 #[tokio::test]
 async fn successful_llm_health_probe_replaces_the_hydrated_offline_status() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1289,7 +1436,12 @@ async fn successful_llm_health_probe_replaces_the_hydrated_offline_status() {
     assert!(matches!(refreshed.status, ProviderStatusView::Online));
     assert_eq!(
         refreshed.capability_source.as_deref(),
-        Some("built_in_adapter_contract+health_probe")
+        Some("built_in_adapter_contract+health_probe+generation_controls:adapter_contract")
+    );
+    let capabilities = refreshed.capabilities.as_ref().expect("capabilities");
+    assert_eq!(
+        capabilities.generation_controls_model.as_deref(),
+        Some("fixture-chat")
     );
     server.abort();
 }

@@ -3,6 +3,7 @@
 mod character;
 mod dialogue;
 mod gemini_tts;
+mod generation_controls;
 mod native;
 mod piper;
 mod tts;

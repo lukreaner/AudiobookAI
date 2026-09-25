@@ -37,6 +37,7 @@ import { Badge, Button, Card, Dialog, Field, Input, PageHeading, ProgressBar, Se
 import { DEFAULT_EXPORT_SETTINGS, requiresMusicOwnership, toJobExportSettings, type ExportFormState } from "../features/exportSettings";
 import { formatBytes, formatCount, formatDuration, formatMoney } from "../lib/format";
 import { AUTO_SPEAKER, NARRATOR_SPEAKER, paragraphIdFor, parseAliases, speakerOverrideInput, storedSpeakerSelection } from "../features/characterReview";
+import { allowedOr, defaultEffort, detectionControls } from "../features/detectionControls";
 import { DistributionPanel } from "../features/DistributionPanel";
 import { localizeJobStage } from "../features/jobStage";
 import { ProofingWorkbench } from "../features/ProofingWorkbench";
@@ -153,7 +154,7 @@ export function characterDetectionInput(
   temperatureMode: DetectionTemperature["mode"],
   temperatureValue: number,
   reasoningMode: DetectionReasoning["mode"],
-  reasoningEffort: "minimal" | "low" | "medium" | "high",
+  reasoningEffort: string,
   reasoningTokens: number,
   expectedCharacterRevision: number,
 ): CharacterDetectionInput {
@@ -189,7 +190,7 @@ function CharactersPanel({ projectId, reviewStatus, consentCloudAudio }: { proje
   const [temperatureMode, setTemperatureMode] = useState<DetectionTemperature["mode"]>("default");
   const [temperatureValue, setTemperatureValue] = useState(0.2);
   const [reasoningMode, setReasoningMode] = useState<DetectionReasoning["mode"]>("inherit");
-  const [reasoningEffort, setReasoningEffort] = useState<"minimal" | "low" | "medium" | "high">("medium");
+  const [reasoningEffort, setReasoningEffort] = useState("medium");
   const [reasoningTokens, setReasoningTokens] = useState(4096);
   const [assigning, setAssigning] = useState<Character>();
   const [editingIdentity, setEditingIdentity] = useState<Character>();
@@ -213,10 +214,10 @@ function CharactersPanel({ projectId, reviewStatus, consentCloudAudio }: { proje
   const detection = useMutation({
     mutationFn: (idempotencyKey: string) => api.detectCharacters(projectId, characterDetectionInput(
       detectionProvider,
-      temperatureMode,
+      activeTemperatureMode,
       temperatureValue,
-      reasoningMode,
-      reasoningEffort,
+      activeReasoningMode,
+      activeEffort,
       reasoningTokens,
       characterRevision,
     ), idempotencyKey),
@@ -347,6 +348,15 @@ function CharactersPanel({ projectId, reviewStatus, consentCloudAudio }: { proje
   const filteredVoices = voices.data?.items.filter((voice) => !voiceProvider || voice.providerProfileId === voiceProvider) ?? [];
   const cloneProviders = providers.data?.items.filter((provider) => provider.role === "tts" && provider.capabilities?.voiceCloning) ?? [];
   const selectedDetectionProvider = aiProviders.find((provider) => provider.id === detectionProvider);
+  // Only options the selected model accepts are offered; a selection made for another model or
+  // provider falls back to an allowed one instead of being sent.
+  const controls = detectionControls(selectedDetectionProvider?.capabilities);
+  const activeTemperatureMode = allowedOr(temperatureMode, controls.temperatureModes, "default");
+  const activeReasoningMode = allowedOr(reasoningMode, controls.reasoningModes, "inherit");
+  const activeEffort = allowedOr(reasoningEffort, controls.efforts, defaultEffort(controls.efforts));
+  const temperatureInvalid = activeTemperatureMode === "value" && !(temperatureValue >= 0 && temperatureValue <= controls.maxTemperature);
+  const budgetInvalid = activeReasoningMode === "token_budget"
+    && !(reasoningTokens >= controls.minBudget && (controls.maxBudget === undefined || reasoningTokens <= controls.maxBudget));
   // With exactly one detection-capable connection there is nothing to choose.
   const onlyDetectionProviderId = aiProviders.length === 1 ? aiProviders[0].id : undefined;
   useEffect(() => {
@@ -399,35 +409,35 @@ function CharactersPanel({ projectId, reviewStatus, consentCloudAudio }: { proje
               {aiProviders.map((provider) => <option key={provider.id} value={provider.id}>{provider.name}</option>)}
             </Select>
           </Field>
-          {selectedDetectionProvider?.capabilities?.temperature !== "unsupported" ? <Field label={t("characters.temperature")} hint={t("characters.temperatureHint")}>
-            <Select value={temperatureMode} disabled={characterMutationPending} onChange={(event) => setTemperatureMode(event.target.value as DetectionTemperature["mode"])}>
+          {controls.temperatureModes.length > 1 ? <Field label={t("characters.temperature")} hint={t("characters.temperatureHint")}>
+            <Select value={activeTemperatureMode} disabled={characterMutationPending} onChange={(event) => setTemperatureMode(event.target.value as DetectionTemperature["mode"])}>
               <option value="default">{t("characters.providerDefault")}</option>
-              {selectedDetectionProvider?.capabilities?.temperature === "nullable" ? <option value="null">{t("characters.explicitNull")}</option> : null}
-              <option value="value">{t("characters.customValue")}</option>
+              {controls.temperatureModes.includes("null") ? <option value="null">{t("characters.explicitNull")}</option> : null}
+              {controls.temperatureModes.includes("value") ? <option value="value">{t("characters.customValue")}</option> : null}
             </Select>
           </Field> : null}
-          {temperatureMode === "value" && selectedDetectionProvider?.capabilities?.temperature !== "unsupported" ? <Field label={t("characters.temperatureValue")}>
-            <Input type="number" min={0} max={2} step={0.1} disabled={characterMutationPending} value={temperatureValue} onChange={(event) => { if (Number.isFinite(event.target.valueAsNumber)) setTemperatureValue(event.target.valueAsNumber); }} />
+          {activeTemperatureMode === "value" ? <Field label={t("characters.temperatureValue")} hint={t("characters.temperatureRange", { max: controls.maxTemperature })}>
+            <Input type="number" min={0} max={controls.maxTemperature} step={0.1} disabled={characterMutationPending} value={temperatureValue} onChange={(event) => { if (Number.isFinite(event.target.valueAsNumber)) setTemperatureValue(event.target.valueAsNumber); }} />
           </Field> : null}
-          {selectedDetectionProvider?.capabilities?.reasoning.length ? <Field label={t("characters.reasoning")} hint={t("characters.reasoningHint")}>
-            <Select value={reasoningMode} disabled={characterMutationPending} onChange={(event) => setReasoningMode(event.target.value as DetectionReasoning["mode"])}>
+          {controls.reasoningModes.length > 1 ? <Field label={t("characters.reasoning")} hint={t("characters.reasoningHint")}>
+            <Select value={activeReasoningMode} disabled={characterMutationPending} onChange={(event) => setReasoningMode(event.target.value as DetectionReasoning["mode"])}>
               <option value="inherit">{t("characters.providerDefault")}</option>
-              {selectedDetectionProvider.capabilities.reasoning.includes("disabled") ? <option value="disabled">{t("characters.reasoningDisabled")}</option> : null}
-              {selectedDetectionProvider.capabilities.reasoning.includes("effort") ? <option value="effort">{t("characters.reasoningEffort")}</option> : null}
-              {selectedDetectionProvider.capabilities.reasoning.includes("adaptive") ? <option value="adaptive">{t("characters.reasoningAdaptive")}</option> : null}
-              {selectedDetectionProvider.capabilities.reasoning.includes("token_budget") ? <option value="token_budget">{t("characters.reasoningTokenBudget")}</option> : null}
+              {controls.reasoningModes.includes("disabled") ? <option value="disabled">{t("characters.reasoningDisabled")}</option> : null}
+              {controls.reasoningModes.includes("effort") ? <option value="effort">{t("characters.reasoningEffort")}</option> : null}
+              {controls.reasoningModes.includes("adaptive") ? <option value="adaptive">{t("characters.reasoningAdaptive")}</option> : null}
+              {controls.reasoningModes.includes("token_budget") ? <option value="token_budget">{t("characters.reasoningTokenBudget")}</option> : null}
             </Select>
           </Field> : null}
-          {reasoningMode === "effort" ? <Field label={t("characters.reasoningEffort")}>
-            <Select value={reasoningEffort} disabled={characterMutationPending} onChange={(event) => setReasoningEffort(event.target.value as typeof reasoningEffort)}>
-              {(["minimal", "low", "medium", "high"] as const).map((effort) => <option value={effort} key={effort}>{t(`characters.effort_${effort}`)}</option>)}
+          {activeReasoningMode === "effort" ? <Field label={t("characters.reasoningEffort")}>
+            <Select value={activeEffort} disabled={characterMutationPending} onChange={(event) => setReasoningEffort(event.target.value)}>
+              {controls.efforts.map((effort) => <option value={effort} key={effort}>{t(`characters.effort_${effort}`, { defaultValue: effort })}</option>)}
             </Select>
           </Field> : null}
-          {reasoningMode === "token_budget" ? <Field label={t("characters.reasoningTokens")}>
-            <Input type="number" min={1024} step={256} disabled={characterMutationPending} value={reasoningTokens} onChange={(event) => { if (Number.isFinite(event.target.valueAsNumber)) setReasoningTokens(event.target.valueAsNumber); }} />
+          {activeReasoningMode === "token_budget" ? <Field label={t("characters.reasoningTokens")} hint={controls.maxBudget ? t("characters.reasoningTokensRange", { min: controls.minBudget, max: controls.maxBudget }) : t("characters.reasoningTokensMin", { min: controls.minBudget })}>
+            <Input type="number" min={controls.minBudget} max={controls.maxBudget} step={256} disabled={characterMutationPending} value={reasoningTokens} onChange={(event) => { if (Number.isFinite(event.target.valueAsNumber)) setReasoningTokens(event.target.valueAsNumber); }} />
           </Field> : null}
         </div>
-        <div className="space-between"><span className="muted-copy">{t("characters.detectionBilling")}</span><Button disabled={!detectionProvider || characterMutationPending || Boolean(activeDetection) || (reasoningMode === "token_budget" && reasoningTokens < 1024)} onClick={() => detection.mutate(crypto.randomUUID())}>{detection.isPending ? <LoaderCircle className="spin" size={16} /> : <Sparkles size={16} />}{noCharacters ? t("characters.detect") : t("characters.detectAgain")}</Button></div>
+        <div className="space-between"><span className="muted-copy">{t("characters.detectionBilling")}</span><Button disabled={!detectionProvider || characterMutationPending || Boolean(activeDetection) || temperatureInvalid || budgetInvalid} onClick={() => detection.mutate(crypto.randomUUID())}>{detection.isPending ? <LoaderCircle className="spin" size={16} /> : <Sparkles size={16} />}{noCharacters ? t("characters.detect") : t("characters.detectAgain")}</Button></div>
       </Card> : null}
       {detection.isError ? <ErrorState error={detection.error} onRetry={() => detection.mutate(retryIdempotencyKey(detection.error, detection.variables))} /> : null}
       {speakerOverride.isError ? <ErrorState error={speakerOverride.error} onRetry={speakerOverride.variables ? () => speakerOverride.mutate(speakerOverride.variables!) : undefined} /> : null}

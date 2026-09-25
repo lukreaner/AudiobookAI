@@ -339,6 +339,21 @@ pub struct ProviderCapabilitiesView {
     /// Performance controls positively verified for exact model identifiers.
     #[serde(default)]
     pub model_performance: Vec<audiobookai_core::ModelPerformanceCapabilities>,
+    /// Effort levels the selected LLM accepts, in ascending order, when `reasoning` has `effort`.
+    #[serde(default)]
+    pub reasoning_efforts: Vec<String>,
+    #[serde(default)]
+    pub min_reasoning_budget: Option<u32>,
+    #[serde(default)]
+    pub max_reasoning_budget: Option<u32>,
+    /// Highest temperature the selected LLM accepts, when known.
+    #[serde(default)]
+    pub max_temperature: Option<f32>,
+    /// The model whose temperature and reasoning options were determined, and how.
+    #[serde(default)]
+    pub generation_controls_model: Option<String>,
+    #[serde(default)]
+    pub generation_controls_source: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

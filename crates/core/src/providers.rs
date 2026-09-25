@@ -316,6 +316,9 @@ pub struct CharacterDetectionCapabilities {
     pub temperature: TemperatureCapability,
     pub reasoning: ReasoningCapability,
     pub context_window_tokens: Option<u64>,
+    /// Highest temperature the selected model accepts, when the provider reports one.
+    #[serde(default)]
+    pub max_temperature: Option<f32>,
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -493,13 +496,51 @@ pub enum ReasoningControl {
     TokenBudget(u32),
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ReasoningEffort {
-    Minimal,
-    Low,
-    Medium,
-    High,
+/// A provider reasoning-effort level such as `low`, `high`, or `xhigh`.
+///
+/// Levels differ per provider and model and new ones appear with new models, so they are kept as
+/// validated identifiers and checked against the levels discovered for the selected model instead
+/// of a closed list.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct ReasoningEffort(String);
+
+impl ReasoningEffort {
+    /// Creates an effort level from a provider identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation issue unless the value is 1 to 24 lowercase ASCII letters, digits,
+    /// `_`, or `-`.
+    pub fn new(value: impl Into<String>) -> Result<Self, ValidationIssue> {
+        let value = value.into();
+        if !value.is_empty()
+            && value.len() <= 24
+            && value.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_' || byte == b'-'
+            })
+        {
+            Ok(Self(value))
+        } else {
+            Err(ValidationIssue::new(
+                "reasoning.effort",
+                "invalid",
+                "reasoning effort must be a short lowercase provider identifier",
+            ))
+        }
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for ReasoningEffort {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(|issue| de::Error::custom(issue.message))
+    }
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -511,6 +552,10 @@ pub struct ReasoningCapability {
     pub token_budget: bool,
     pub min_token_budget: Option<u32>,
     pub max_token_budget: Option<u32>,
+    /// Effort levels the selected model accepts. Empty only in snapshots recorded before levels
+    /// were discovered per model; those place no level restriction beyond `effort`.
+    #[serde(default)]
+    pub efforts: Vec<ReasoningEffort>,
 }
 
 impl ReasoningCapability {
@@ -523,7 +568,9 @@ impl ReasoningCapability {
         let supported = match control {
             ReasoningControl::Inherit => true,
             ReasoningControl::Disabled => self.disable,
-            ReasoningControl::Effort(_) => self.effort,
+            ReasoningControl::Effort(level) => {
+                self.effort && (self.efforts.is_empty() || self.efforts.contains(level))
+            }
             ReasoningControl::Adaptive => self.adaptive,
             ReasoningControl::TokenBudget(value) => {
                 self.token_budget
@@ -637,8 +684,47 @@ mod tests {
         let capability = ReasoningCapability::default();
         assert!(
             capability
-                .validate(&ReasoningControl::Effort(ReasoningEffort::High))
+                .validate(&ReasoningControl::Effort(
+                    ReasoningEffort::new("high").expect("effort")
+                ))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn effort_levels_are_open_identifiers_checked_per_model() {
+        for value in ["low", "xhigh", "max", "none", "ultra_2"] {
+            assert!(ReasoningEffort::new(value).is_ok(), "{value}");
+        }
+        for value in ["", "High", "very high", "x".repeat(25).as_str()] {
+            assert!(ReasoningEffort::new(value).is_err(), "{value}");
+        }
+        let effort = |value: &str| ReasoningEffort::new(value).expect("effort");
+        let capability = ReasoningCapability {
+            effort: true,
+            efforts: vec![effort("low"), effort("xhigh")],
+            ..ReasoningCapability::default()
+        };
+        assert!(
+            capability
+                .validate(&ReasoningControl::Effort(effort("xhigh")))
+                .is_ok()
+        );
+        assert!(
+            capability
+                .validate(&ReasoningControl::Effort(effort("minimal")))
+                .is_err()
+        );
+        let legacy: ReasoningCapability = serde_json::from_value(
+            serde_json::json!({"disable": false, "effort": true, "adaptive": false,
+                "token_budget": false, "min_token_budget": null, "max_token_budget": null}),
+        )
+        .expect("legacy snapshot");
+        assert!(legacy.efforts.is_empty());
+        assert!(
+            legacy
+                .validate(&ReasoningControl::Effort(effort("high")))
+                .is_ok()
         );
     }
 

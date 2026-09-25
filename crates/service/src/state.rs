@@ -928,6 +928,21 @@ async fn hydrate_providers(
                 model_performance: tts
                     .map(|value| value.model_performance.clone())
                     .unwrap_or_default(),
+                reasoning_efforts: character
+                    .map(|value| {
+                        value
+                            .reasoning
+                            .efforts
+                            .iter()
+                            .map(|level| level.as_str().to_owned())
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                min_reasoning_budget: character.and_then(|value| value.reasoning.min_token_budget),
+                max_reasoning_budget: character.and_then(|value| value.reasoning.max_token_budget),
+                max_temperature: character.and_then(|value| value.max_temperature),
+                generation_controls_model: character.and(snapshot.model.clone()),
+                generation_controls_source: character.map(|_| snapshot.provenance.source.clone()),
             }
         });
         if let Some(secret_id) = profile.credential_secret_id {
@@ -2631,6 +2646,12 @@ fn native_provider() -> ProviderProfileView {
             reasoning: Vec::new(),
             max_concurrency: Some(1),
             model_performance: Vec::new(),
+            reasoning_efforts: Vec::new(),
+            min_reasoning_budget: None,
+            max_reasoning_budget: None,
+            max_temperature: None,
+            generation_controls_model: None,
+            generation_controls_source: None,
         }),
         capability_source: Some("native_runtime".to_owned()),
         capability_updated_at: Some(Utc::now()),

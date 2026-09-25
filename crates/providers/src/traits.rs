@@ -4,10 +4,10 @@ use async_trait::async_trait;
 
 use crate::{
     AudioChunk, CancellationFlag, CharacterDetectionRequest, CharacterDetectionResult, Model,
-    ModelContextWindow, ModelDownloadRequest, ModelDownloadStatus, OwnedProcessHandle,
-    ProcessLogLine, ProcessSpec, ProcessStatus, ProviderCapabilities, ProviderDescriptor,
-    ProviderHealth, ProviderModelInfo, Result, StreamingSynthesisResponse, SynthesisRequest,
-    SynthesisResponse, Voice, VoiceClone, VoiceCloneRequest,
+    ModelContextWindow, ModelDownloadRequest, ModelDownloadStatus, ModelGenerationControls,
+    OwnedProcessHandle, ProcessLogLine, ProcessSpec, ProcessStatus, ProviderCapabilities,
+    ProviderDescriptor, ProviderHealth, ProviderModelInfo, Result, StreamingSynthesisResponse,
+    SynthesisRequest, SynthesisResponse, Voice, VoiceClone, VoiceCloneRequest,
 };
 
 #[async_trait]
@@ -60,6 +60,15 @@ pub trait CharacterProvider: fmt::Debug + Send + Sync {
     async fn discover_models(&self) -> Result<Vec<Model>>;
     async fn model_context_window(&self, _model: &str) -> Result<ModelContextWindow> {
         Ok(ModelContextWindow::default())
+    }
+    /// Temperature and reasoning options the exact model accepts.
+    ///
+    /// Adapters override this when their provider reports per-model support; the default is the
+    /// adapter-wide contract.
+    async fn model_generation_controls(&self, _model: &str) -> Result<ModelGenerationControls> {
+        Ok(ModelGenerationControls::from_adapter_contract(
+            self.capabilities(),
+        ))
     }
     async fn detect_characters(
         &self,

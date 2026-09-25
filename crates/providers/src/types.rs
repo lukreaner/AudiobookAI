@@ -17,7 +17,7 @@ use uuid::Uuid;
 use audiobookai_core::Validate as _;
 pub use audiobookai_core::{
     DeliveryCue, ModelPerformanceCapabilities, PerformanceCapabilities, PerformanceRange,
-    PerformanceSettings, TimingSettings,
+    PerformanceSettings, ReasoningEffort, TimingSettings,
 };
 
 use crate::{ProviderError, Result};
@@ -419,15 +419,6 @@ impl ReasoningControl {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ReasoningEffort {
-    Minimal,
-    Low,
-    Medium,
-    High,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum AudioFormat {
     PcmS16Le,
     PcmF32Le,
@@ -622,6 +613,97 @@ pub struct Model {
 pub struct ModelContextWindow {
     pub loaded_tokens: Option<u64>,
     pub maximum_tokens: Option<u64>,
+}
+
+/// Where a model's generation controls were learned from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GenerationControlsSource {
+    /// Reported for the exact model by the provider's model API.
+    ModelApi,
+    /// Read from the provider's validation of a deliberately invalid, unbilled request.
+    ValidationProbe,
+    /// The adapter's documented contract; the provider exposes nothing per model.
+    AdapterContract,
+    /// The provider did not reveal the model's controls, so only provider defaults are offered.
+    ProviderDefaultOnly,
+}
+
+/// Temperature and reasoning options that the selected model accepts.
+///
+/// Only these options may be offered or sent. An empty `reasoning` set still permits
+/// [`ReasoningControl::Inherit`], which omits every reasoning field.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ModelGenerationControls {
+    pub temperature: ParameterSupport,
+    pub max_temperature: Option<f32>,
+    pub reasoning: BTreeSet<ReasoningMode>,
+    /// Accepted effort levels, in the provider's order, when `reasoning` contains `Effort`.
+    pub efforts: Vec<ReasoningEffort>,
+    pub min_token_budget: Option<u32>,
+    pub max_token_budget: Option<u32>,
+    pub source: GenerationControlsSource,
+}
+
+impl ModelGenerationControls {
+    /// The adapter-wide contract, used when a provider exposes nothing per model.
+    pub fn from_adapter_contract(capabilities: &ProviderCapabilities) -> Self {
+        Self {
+            temperature: capabilities.temperature,
+            max_temperature: None,
+            reasoning: capabilities.reasoning.clone(),
+            efforts: Vec::new(),
+            min_token_budget: None,
+            max_token_budget: None,
+            source: GenerationControlsSource::AdapterContract,
+        }
+    }
+
+    /// Offers nothing beyond the provider's own defaults.
+    pub fn provider_default_only() -> Self {
+        Self {
+            temperature: ParameterSupport::Unsupported,
+            max_temperature: None,
+            reasoning: BTreeSet::new(),
+            efforts: Vec::new(),
+            min_token_budget: None,
+            max_token_budget: None,
+            source: GenerationControlsSource::ProviderDefaultOnly,
+        }
+    }
+
+    /// Checks requested controls against what the model accepts.
+    pub fn validate(&self, temperature: Temperature, reasoning: &ReasoningControl) -> Result<()> {
+        temperature.validate(self.temperature)?;
+        if let (Temperature::Value(value), Some(maximum)) = (temperature, self.max_temperature)
+            && value > maximum
+        {
+            return Err(ProviderError::Configuration(format!(
+                "the selected model accepts temperatures up to {maximum}"
+            )));
+        }
+        let allowed = match reasoning {
+            ReasoningControl::Inherit => true,
+            ReasoningControl::Disabled => self.reasoning.contains(&ReasoningMode::Disabled),
+            ReasoningControl::Adaptive => self.reasoning.contains(&ReasoningMode::Adaptive),
+            ReasoningControl::Effort { effort } => {
+                self.reasoning.contains(&ReasoningMode::Effort)
+                    && (self.efforts.is_empty() || self.efforts.contains(effort))
+            }
+            ReasoningControl::TokenBudget { tokens } => {
+                self.reasoning.contains(&ReasoningMode::TokenBudget)
+                    && self
+                        .min_token_budget
+                        .is_none_or(|minimum| *tokens >= minimum)
+                    && self
+                        .max_token_budget
+                        .is_none_or(|maximum| *tokens <= maximum)
+            }
+        };
+        allowed.then_some(()).ok_or(ProviderError::Unsupported {
+            feature: "the selected reasoning setting for this model",
+        })
+    }
 }
 
 /// Sanitized model-library metadata exposed by a provider control adapter.

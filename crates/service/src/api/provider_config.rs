@@ -115,8 +115,13 @@ pub(crate) async fn persist_provider(
                 .reasoning
                 .iter()
                 .any(|value| value == "token_budget"),
-            min_token_budget: None,
-            max_token_budget: None,
+            min_token_budget: capabilities.min_reasoning_budget,
+            max_token_budget: capabilities.max_reasoning_budget,
+            efforts: capabilities
+                .reasoning_efforts
+                .iter()
+                .filter_map(|level| audiobookai_core::ReasoningEffort::new(level.as_str()).ok())
+                .collect(),
         };
         let mut fingerprint = blake3::Hasher::new();
         fingerprint.update(profile.endpoint.as_deref().unwrap_or("native").as_bytes());
@@ -214,6 +219,7 @@ pub(crate) async fn persist_provider(
                         },
                         reasoning,
                         context_window_tokens: profile.context_window_tokens,
+                        max_temperature: capabilities.max_temperature,
                     }
                 }),
                 control: (capabilities.process_control || capabilities.model_control).then_some({
@@ -642,6 +648,12 @@ pub(super) fn default_capabilities(
         },
         max_concurrency: Some(1),
         model_performance: default_model_performance(kind, role),
+        reasoning_efforts: Vec::new(),
+        min_reasoning_budget: None,
+        max_reasoning_budget: None,
+        max_temperature: None,
+        generation_controls_model: None,
+        generation_controls_source: None,
     }
 }
 

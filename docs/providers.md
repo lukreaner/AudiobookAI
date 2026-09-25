@@ -25,6 +25,29 @@ provider adapter serializes only a state the selected model supports. Reasoning
 is likewise represented as inherit, disabled, effort, adaptive, or token budget;
 preflight rejects unsupported settings.
 
+Which of these options an LLM accepts is determined for the exact selected model whenever the
+connection is created, edited, or checked, and stored in its capability snapshot. Only those
+options are offered, and character detection rejects anything else, so new models and levels
+need no application update:
+
+- Anthropic: the Models API (`capabilities.thinking.types`, `capabilities.effort.<level>`).
+  Temperature is offered only while the model still accepts `enabled` thinking budgets, because
+  Anthropic removed sampling parameters together with budgets (Opus 4.7 and later).
+- `OpenAI`: the model list carries no metadata, so two deliberately invalid requests
+  (`reasoning.effort` and an out-of-range `temperature`) read the accepted values from the
+  validation error, for example `Supported values are: 'none', 'low', ...`. Invalid requests are
+  rejected before generation and are not billed. `none` becomes the "disabled" option.
+- Gemini: the model resource (`thinking`, `maxTemperature`). Thinking stays at the model default,
+  because the resource does not say which thinking controls `generateContent` accepts.
+- Ollama: `/api/show` (`capabilities` contains `thinking`); GPT-OSS takes `low`/`medium`/`high`
+  and cannot disable thinking, other thinking models accept `think: false`.
+- OpenAI-compatible, Qwen, Kimi/Moonshot, and LM Studio expose no per-model data and keep their
+  adapter contract.
+
+Effort levels are open identifiers (`low`, `xhigh`, `max`, or future ones) passed through as the
+provider reports them. If the options cannot be determined, those last determined for the same
+model are kept; otherwise only the provider defaults are offered, which are always accepted.
+
 Local processes are classified as external endpoints or app-owned children.
 AudiobookAI may observe either, but may stop/restart only an app-owned child.
 Managed-child profiles store an absolute executable, an optional absolute
@@ -148,9 +171,8 @@ streaming WAV header so normalization and progressive playback need no format-sp
 
 Provider-native download progress is visible and cancellable for the current app
 session, but its operation journal is not yet durable across a service restart.
-Restart recovery for these provider-native downloads and model-specific reasoning
-capability discovery remain 1.0 release gates. The shipped pre-1.0 build therefore
-does not claim those gates have passed.
+Restart recovery for these provider-native downloads remains a 1.0 release gate. The
+shipped pre-1.0 build therefore does not claim that gate has passed.
 
 Normal tests use mock transports and fixture audio and never require credentials.
 The opt-in live contract matrix is a separate 1.0 release gate and must receive

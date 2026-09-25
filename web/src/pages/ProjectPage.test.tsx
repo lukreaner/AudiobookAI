@@ -345,6 +345,7 @@ describe("character review", () => {
         voiceCloning: false,
         temperature: "nullable",
         reasoning: ["disabled", "effort"],
+        reasoningEfforts: ["low", "medium", "high", "xhigh", "max"],
       },
     };
     vi.mocked(api.providers).mockResolvedValue({ items: [provider], total: 1 });
@@ -353,7 +354,10 @@ describe("character review", () => {
     await user.selectOptions(await screen.findByRole("combobox", { name: "Detection provider" }), provider.id);
     await user.selectOptions(screen.getByRole("combobox", { name: /^Temperature mode/ }), "null");
     await user.selectOptions(screen.getByRole("combobox", { name: /^Reasoning mode/ }), "effort");
-    await user.selectOptions(screen.getByRole("combobox", { name: "Effort level" }), "high");
+    const effort = screen.getByRole("combobox", { name: "Effort level" });
+    expect(screen.queryByRole("option", { name: "Minimal" })).not.toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "Very high" })).toBeInTheDocument();
+    await user.selectOptions(effort, "high");
     await user.click(screen.getByRole("button", { name: "Run detection again" }));
 
     await waitFor(() => expect(api.detectCharacters).toHaveBeenCalledWith("project-1", {

@@ -198,6 +198,7 @@ pub(super) async fn start_character_detection(
             )
         })?;
     let provider_endpoint = provider.endpoint.clone();
+    let model_controls = crate::api::model_generation_controls_for(provider, &model);
     let project = catalog
         .projects
         .get_mut(&project_id)
@@ -238,6 +239,11 @@ pub(super) async fn start_character_detection(
     input
         .reasoning
         .validate(runtime_provider.capabilities())
+        .map_err(|error| ServiceError::InvalidRequest(error.to_string()))?;
+    // The adapter contract above covers every model of the provider; the selected model may
+    // accept fewer options, so the request must also fit what was determined for that model.
+    model_controls
+        .validate(input.temperature, &input.reasoning)
         .map_err(|error| ServiceError::InvalidRequest(error.to_string()))?;
     let job = new_job(
         project_id,

@@ -117,7 +117,8 @@ export type DetectionTemperature =
 export type DetectionReasoning =
   | { mode: "inherit" }
   | { mode: "disabled" }
-  | { mode: "effort"; effort: "minimal" | "low" | "medium" | "high" }
+  /** A level from the selected model's `reasoningEfforts`. */
+  | { mode: "effort"; effort: string }
   | { mode: "adaptive" }
   | { mode: "token_budget"; tokens: number };
 
@@ -228,6 +229,14 @@ export interface ProviderCapabilities {
   modelSwitch: boolean;
   temperature: "unsupported" | "number" | "nullable";
   reasoning: string[];
+  /** Effort levels the selected LLM accepts, ascending; determined per model by the service. */
+  reasoningEfforts?: string[];
+  minReasoningBudget?: number | null;
+  maxReasoningBudget?: number | null;
+  maxTemperature?: number | null;
+  /** The model the temperature and reasoning options were determined for. */
+  generationControlsModel?: string | null;
+  generationControlsSource?: string | null;
   maxConcurrency?: number;
   /** Exact-model descriptors; an absent model or control is unsupported. */
   modelPerformance: ModelPerformanceCapabilities[];

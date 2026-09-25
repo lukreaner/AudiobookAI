@@ -182,7 +182,7 @@ fn detection_request_preserves_explicit_provider_controls() {
         false,
         Temperature::Null,
         ReasoningControl::Effort {
-            effort: ReasoningEffort::High,
+            effort: ReasoningEffort::new("high").expect("effort"),
         },
     );
 
@@ -190,7 +190,7 @@ fn detection_request_preserves_explicit_provider_controls() {
     assert_eq!(
         request.reasoning,
         ReasoningControl::Effort {
-            effort: ReasoningEffort::High,
+            effort: ReasoningEffort::new("high").expect("effort"),
         }
     );
 }
@@ -500,7 +500,7 @@ fn detection_reservation_estimate_is_conservative_and_keeps_reasoning_separate()
     let estimate = detection_request_estimate(
         &batch,
         &ReasoningControl::Effort {
-            effort: ReasoningEffort::High,
+            effort: ReasoningEffort::new("high").expect("effort"),
         },
     );
     assert_eq!(

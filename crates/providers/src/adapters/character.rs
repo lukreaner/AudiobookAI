@@ -6,14 +6,18 @@ use serde_json::{Map, Value, json};
 use super::{
     HttpAdapter,
     dialogue::{DETECTION_SCHEMA, parse_and_resolve, wire_input},
+    generation_controls::{
+        anthropic_model_controls, gemini_model_controls, ollama_model_controls,
+        openai_effort_probe, openai_model_controls, openai_temperature_probe,
+    },
     json_body,
 };
 use crate::{
     Authentication, CharacterDetectionRequest, CharacterDetectionResult, CharacterProvider,
     EndpointConfig, HttpMethod, HttpRequest, HttpTransport, Model, ModelContextWindow,
-    ParameterSupport, ProviderCapabilities, ProviderDescriptor, ProviderError, ProviderHealth,
-    ProviderId, ProviderUsage, ReasoningControl, ReasoningEffort, ReasoningMode, Result,
-    Temperature, UsageSource,
+    ModelGenerationControls, ParameterSupport, ProviderCapabilities, ProviderDescriptor,
+    ProviderError, ProviderHealth, ProviderId, ProviderUsage, ReasoningControl, ReasoningMode,
+    Result, Temperature, UsageSource,
 };
 
 // Local model startup plus schema-constrained generation can take several minutes, especially on
@@ -262,6 +266,78 @@ impl JsonCharacterProvider {
         parse_lm_studio_context_window(&json_body(&response)?, model)
     }
 
+    async fn generation_controls(&self, model: &str) -> Result<ModelGenerationControls> {
+        match self.flavor {
+            CharacterFlavor::Anthropic => {
+                let path = format!("v1/models/{}", encode_path_segment(model));
+                let response = self
+                    .http
+                    .execute(
+                        self.decorate_request(self.http.empty_request(HttpMethod::Get, &path)?),
+                    )
+                    .await?;
+                Ok(anthropic_model_controls(&json_body(&response)?))
+            }
+            CharacterFlavor::Gemini => {
+                let path = format!("v1beta/models/{}", encode_path_segment(model));
+                let response = self
+                    .http
+                    .execute(self.http.empty_request(HttpMethod::Get, &path)?)
+                    .await?;
+                Ok(gemini_model_controls(&json_body(&response)?))
+            }
+            CharacterFlavor::Ollama => {
+                let response = self
+                    .http
+                    .execute(self.http.json_request(
+                        HttpMethod::Post,
+                        "api/show",
+                        &json!({ "model": model }),
+                    )?)
+                    .await?;
+                Ok(ollama_model_controls(model, &json_body(&response)?))
+            }
+            CharacterFlavor::OpenAiResponses => {
+                // OpenAI publishes no per-model metadata, but validates enumerations and ranges
+                // before generating and names the accepted values. Both probes carry an invalid
+                // value, so neither is ever executed or billed.
+                let effort = self
+                    .probe(json!({
+                        "model": model,
+                        "input": "capability probe",
+                        "max_output_tokens": 16,
+                        "reasoning": { "effort": "__audiobookai_probe__" }
+                    }))
+                    .await?;
+                let temperature = self
+                    .probe(json!({
+                        "model": model,
+                        "input": "capability probe",
+                        "max_output_tokens": 16,
+                        "temperature": 3
+                    }))
+                    .await?;
+                Ok(openai_model_controls(
+                    &openai_effort_probe(effort.0, &effort.1),
+                    &openai_temperature_probe(temperature.0, &temperature.1),
+                ))
+            }
+            CharacterFlavor::OpenAiChat(_) => Ok(ModelGenerationControls::from_adapter_contract(
+                &self.capabilities,
+            )),
+        }
+    }
+
+    /// Sends a validation probe and returns its status and body without treating 4xx as failure.
+    async fn probe(&self, body: Value) -> Result<(u16, bytes::Bytes)> {
+        let mut request = self
+            .http
+            .json_request(HttpMethod::Post, "v1/responses", &body)?;
+        request.timeout = Duration::from_secs(20);
+        let response = self.http.transport.execute(request).await?;
+        Ok((response.status, response.body))
+    }
+
     fn decorate_request(&self, mut request: HttpRequest) -> HttpRequest {
         if matches!(self.flavor, CharacterFlavor::Anthropic) {
             request
@@ -368,6 +444,12 @@ macro_rules! provider_wrapper {
             async fn model_context_window(&self, model: &str) -> Result<ModelContextWindow> {
                 self.0.model_context_window(model).await
             }
+            async fn model_generation_controls(
+                &self,
+                model: &str,
+            ) -> Result<ModelGenerationControls> {
+                self.0.generation_controls(model).await
+            }
             async fn detect_characters(
                 &self,
                 request: CharacterDetectionRequest,
@@ -443,6 +525,7 @@ impl AnthropicProvider {
         let mut capabilities = base_capabilities(ParameterSupport::Value);
         capabilities.reasoning = BTreeSet::from([
             ReasoningMode::Disabled,
+            ReasoningMode::Effort,
             ReasoningMode::Adaptive,
             ReasoningMode::TokenBudget,
         ]);
@@ -541,13 +624,16 @@ fn apply_reasoning(
             object.insert("reasoning".to_owned(), json!({ "effort": "none" }));
         }
         (CharacterFlavor::OpenAiResponses, ReasoningControl::Effort { effort }) => {
-            object.insert(
-                "reasoning".to_owned(),
-                json!({ "effort": effort_name(*effort) }),
-            );
+            object.insert("reasoning".to_owned(), json!({ "effort": effort.as_str() }));
         }
         (CharacterFlavor::OpenAiChat(_), ReasoningControl::Disabled) => {
             object.insert("enable_thinking".to_owned(), Value::Bool(false));
+        }
+        (CharacterFlavor::Anthropic, ReasoningControl::Effort { effort }) => {
+            object.insert(
+                "output_config".to_owned(),
+                json!({ "effort": effort.as_str() }),
+            );
         }
         (CharacterFlavor::Anthropic, ReasoningControl::Disabled) => {
             object.insert("thinking".to_owned(), json!({ "type": "disabled" }));
@@ -575,7 +661,7 @@ fn apply_reasoning(
             object.insert("think".to_owned(), Value::Bool(false));
         }
         (CharacterFlavor::Ollama, ReasoningControl::Effort { effort }) => {
-            object.insert("think".to_owned(), json!(effort_name(*effort)));
+            object.insert("think".to_owned(), json!(effort.as_str()));
         }
         _ => {
             return Err(ProviderError::Unsupported {
@@ -594,15 +680,6 @@ fn nested_object<'a>(
         .get_mut(key)
         .and_then(Value::as_object_mut)
         .ok_or_else(|| ProviderError::Configuration(format!("missing {key} object")))
-}
-
-fn effort_name(effort: ReasoningEffort) -> &'static str {
-    match effort {
-        ReasoningEffort::Minimal => "minimal",
-        ReasoningEffort::Low => "low",
-        ReasoningEffort::Medium => "medium",
-        ReasoningEffort::High => "high",
-    }
 }
 
 fn extract_content(envelope: &Value, flavor: CharacterFlavor) -> Result<String> {
@@ -853,7 +930,10 @@ fn parse_lm_studio_context_window(value: &Value, requested: &str) -> Result<Mode
 /// `OpenAI`'s model-list response has no endpoint/capability metadata. Character detection requires
 /// the Responses API plus structured text output, so discovery must positively recognize a text
 /// generation family and reject specialized audio, image, search, realtime, and Codex models.
-/// Unknown families intentionally remain hidden until the adapter contract is updated.
+///
+/// Every general GPT generation from 5 on (`gpt-5`, `gpt-5.6-luna`, `gpt-6-luna`, `gpt-6-sol`,
+/// ...) supports both, so new generations are accepted without an adapter release; the marker list
+/// keeps their specialized variants hidden. Other unknown families remain hidden.
 pub fn is_openai_responses_model_id(id: &str) -> bool {
     let normalized = id.to_ascii_lowercase();
     if [
@@ -877,11 +957,28 @@ pub fn is_openai_responses_model_id(id: &str) -> bool {
         return false;
     }
 
-    ["gpt-5", "gpt-4.1", "gpt-4o"].into_iter().any(|family| {
-        normalized == family
-            || normalized.starts_with(&format!("{family}-"))
-            || (family == "gpt-5" && normalized.starts_with("gpt-5."))
-    })
+    is_general_gpt_generation(&normalized)
+        || ["gpt-4.1", "gpt-4o"]
+            .into_iter()
+            .any(|family| normalized == family || normalized.starts_with(&format!("{family}-")))
+}
+
+/// Matches `gpt-<major>[.<minor>][-<variant>]` for major versions 5 and later.
+fn is_general_gpt_generation(normalized: &str) -> bool {
+    let Some(version) = normalized.strip_prefix("gpt-") else {
+        return false;
+    };
+    let version = version
+        .split_once('-')
+        .map_or(version, |(version, _)| version);
+    let (major, minor) = version
+        .split_once('.')
+        .map_or((version, None), |(major, minor)| (major, Some(minor)));
+    let is_number =
+        |value: &str| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit());
+    is_number(major)
+        && major.parse::<u32>().is_ok_and(|major| major >= 5)
+        && minor.is_none_or(is_number)
 }
 
 fn encode_path_segment(value: &str) -> String {
@@ -1148,6 +1245,7 @@ mod tests {
         let models = parse_models(
             &json!({
                 "data": [
+                    { "id": "gpt-6-luna" },
                     { "id": "gpt-5.6-luna" },
                     { "id": "gpt-4.1-mini" },
                     { "id": "gpt-4o-mini-tts" },
@@ -1165,8 +1263,41 @@ mod tests {
                 .iter()
                 .map(|model| model.id.as_str())
                 .collect::<Vec<_>>(),
-            ["gpt-5.6-luna", "gpt-4.1-mini"]
+            ["gpt-6-luna", "gpt-5.6-luna", "gpt-4.1-mini"]
         );
+    }
+
+    #[test]
+    fn current_and_future_gpt_generations_are_recognized_for_detection() {
+        for id in [
+            "gpt-5",
+            "gpt-5-mini",
+            "gpt-5.6-luna",
+            "gpt-6-luna",
+            "gpt-6-sol",
+            "GPT-6-Luna",
+            "gpt-6.1-luna",
+            "gpt-7",
+            "gpt-4.1-mini",
+            "gpt-4o",
+        ] {
+            assert!(is_openai_responses_model_id(id), "{id} should be offered");
+        }
+        for id in [
+            "gpt-6-realtime",
+            "gpt-6-luna-audio",
+            "gpt-6-luna-tts",
+            "gpt-6-image",
+            "gpt-6-codex",
+            "gpt-3.5-turbo",
+            "gpt-4",
+            "gpt-6x",
+            "gpt-6.x-luna",
+            "gpt-",
+            "o3-mini",
+        ] {
+            assert!(!is_openai_responses_model_id(id), "{id} should stay hidden");
+        }
     }
 
     #[test]
@@ -1263,13 +1394,33 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_effort_uses_output_config_and_passes_new_levels_through() {
+        let provider = AnthropicProvider::new(
+            crate::Credential::new("test-only"),
+            Arc::new(NeverTransport),
+        )
+        .unwrap();
+        let request = provider
+            .build_detection_request(&request(
+                Temperature::Default,
+                ReasoningControl::Effort {
+                    effort: crate::ReasoningEffort::new("xhigh").unwrap(),
+                },
+            ))
+            .unwrap();
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["output_config"], json!({ "effort": "xhigh" }));
+        assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
     fn ollama_reasoning_effort_uses_think_field() {
         let provider = OllamaProvider::new(local_endpoint(), Arc::new(NeverTransport)).unwrap();
         let request = provider
             .build_detection_request(&request(
                 Temperature::Value(0.2),
                 ReasoningControl::Effort {
-                    effort: ReasoningEffort::Low,
+                    effort: crate::ReasoningEffort::new("low").unwrap(),
                 },
             ))
             .unwrap();

@@ -1417,6 +1417,7 @@ pub(crate) async fn refresh_provider(
                 .await
         }
     };
+    let previous_capabilities = profile.capabilities.clone();
     let mut updated = profile;
     updated.capabilities = Some(default_capabilities(
         &updated.kind,
@@ -1445,6 +1446,10 @@ pub(crate) async fn refresh_provider(
             updated.status = ProviderStatusView::Error;
             updated.last_error = Some(error.to_string());
         }
+    }
+
+    if matches!(updated.role, ProviderRoleView::Llm) {
+        refresh_generation_controls(state, &runtime_id, previous_capabilities, &mut updated).await;
     }
 
     if matches!(updated.role, ProviderRoleView::Tts)
@@ -1521,6 +1526,163 @@ pub(crate) async fn refresh_provider(
         .providers
         .insert(id, updated.clone());
     Ok(updated)
+}
+
+const GENERATION_CONTROLS_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Restricts an LLM connection's temperature and reasoning options to what its exact model
+/// accepts, as reported by the provider.
+///
+/// When the provider cannot be asked, the options last determined for the same model are kept;
+/// otherwise only provider defaults remain, because those are always accepted.
+async fn refresh_generation_controls(
+    state: &AppState,
+    runtime_id: &audiobookai_providers::ProviderId,
+    previous: Option<crate::models::ProviderCapabilitiesView>,
+    updated: &mut ProviderProfileView,
+) {
+    let Some(model) = updated.model.clone() else {
+        apply_generation_controls(
+            updated,
+            &audiobookai_providers::ModelGenerationControls::provider_default_only(),
+            None,
+        );
+        return;
+    };
+    let discovered = if matches!(updated.status, ProviderStatusView::Online) {
+        match state.providers.character(runtime_id).await {
+            Ok(provider) => tokio::time::timeout(
+                GENERATION_CONTROLS_TIMEOUT,
+                provider.model_generation_controls(&model),
+            )
+            .await
+            .map_err(|_| "timed out".to_owned())
+            .and_then(|result| result.map_err(|error| error.to_string())),
+            Err(error) => Err(error.to_string()),
+        }
+    } else {
+        Err("provider offline".to_owned())
+    };
+    match discovered {
+        Ok(controls) => apply_generation_controls(updated, &controls, Some(model)),
+        Err(error) => {
+            tracing::debug!(diagnostic_code = "provider.generation_controls.unavailable", provider_id = %updated.id, %error, "model generation controls could not be determined");
+            let reusable = previous.filter(|capabilities| {
+                capabilities.generation_controls_model.as_deref() == Some(model.as_str())
+            });
+            if let (Some(previous), Some(current)) = (reusable, updated.capabilities.as_mut()) {
+                current.temperature = previous.temperature;
+                current.reasoning = previous.reasoning;
+                current.reasoning_efforts = previous.reasoning_efforts;
+                current.min_reasoning_budget = previous.min_reasoning_budget;
+                current.max_reasoning_budget = previous.max_reasoning_budget;
+                current.max_temperature = previous.max_temperature;
+                current.generation_controls_model = previous.generation_controls_model;
+                current.generation_controls_source = previous.generation_controls_source;
+            } else {
+                apply_generation_controls(
+                    updated,
+                    &audiobookai_providers::ModelGenerationControls::provider_default_only(),
+                    Some(model),
+                );
+            }
+        }
+    }
+}
+
+/// The options determined for `model` on this connection; only provider defaults when none were
+/// determined for exactly this model.
+pub(crate) fn model_generation_controls_for(
+    profile: &ProviderProfileView,
+    model: &str,
+) -> audiobookai_providers::ModelGenerationControls {
+    use audiobookai_providers::{
+        GenerationControlsSource, ModelGenerationControls, ParameterSupport, ReasoningEffort,
+        ReasoningMode,
+    };
+
+    let Some(capabilities) = profile
+        .capabilities
+        .as_ref()
+        .filter(|capabilities| capabilities.generation_controls_model.as_deref() == Some(model))
+    else {
+        return ModelGenerationControls::provider_default_only();
+    };
+    ModelGenerationControls {
+        temperature: match capabilities.temperature.as_str() {
+            "number" => ParameterSupport::Value,
+            "nullable" => ParameterSupport::NullableValue,
+            _ => ParameterSupport::Unsupported,
+        },
+        max_temperature: capabilities.max_temperature,
+        reasoning: capabilities
+            .reasoning
+            .iter()
+            .filter_map(|mode| match mode.as_str() {
+                "disabled" => Some(ReasoningMode::Disabled),
+                "effort" => Some(ReasoningMode::Effort),
+                "adaptive" => Some(ReasoningMode::Adaptive),
+                "token_budget" => Some(ReasoningMode::TokenBudget),
+                _ => None,
+            })
+            .collect(),
+        efforts: capabilities
+            .reasoning_efforts
+            .iter()
+            .filter_map(|level| ReasoningEffort::new(level.as_str()).ok())
+            .collect(),
+        min_token_budget: capabilities.min_reasoning_budget,
+        max_token_budget: capabilities.max_reasoning_budget,
+        source: GenerationControlsSource::AdapterContract,
+    }
+}
+
+pub(crate) fn apply_generation_controls(
+    profile: &mut ProviderProfileView,
+    controls: &audiobookai_providers::ModelGenerationControls,
+    model: Option<String>,
+) {
+    use audiobookai_providers::{GenerationControlsSource, ParameterSupport, ReasoningMode};
+
+    let Some(capabilities) = profile.capabilities.as_mut() else {
+        return;
+    };
+    match controls.temperature {
+        ParameterSupport::Value => "number",
+        ParameterSupport::NullableValue => "nullable",
+        ParameterSupport::Unsupported | ParameterSupport::OmitOnly => "unsupported",
+    }
+    .clone_into(&mut capabilities.temperature);
+    capabilities.max_temperature = controls.max_temperature;
+    capabilities.reasoning = [
+        (ReasoningMode::Disabled, "disabled"),
+        (ReasoningMode::Effort, "effort"),
+        (ReasoningMode::Adaptive, "adaptive"),
+        (ReasoningMode::TokenBudget, "token_budget"),
+    ]
+    .into_iter()
+    .filter(|(mode, _)| controls.reasoning.contains(mode))
+    .map(|(_, name)| name.to_owned())
+    .collect();
+    capabilities.reasoning_efforts = controls
+        .efforts
+        .iter()
+        .map(|level| level.as_str().to_owned())
+        .collect();
+    capabilities.min_reasoning_budget = controls.min_token_budget;
+    capabilities.max_reasoning_budget = controls.max_token_budget;
+    capabilities.generation_controls_model = model;
+    let source = match controls.source {
+        GenerationControlsSource::ModelApi => "model_api",
+        GenerationControlsSource::ValidationProbe => "validation_probe",
+        GenerationControlsSource::AdapterContract => "adapter_contract",
+        GenerationControlsSource::ProviderDefaultOnly => "provider_default_only",
+    };
+    capabilities.generation_controls_source = Some(source.to_owned());
+    if let Some(capability_source) = profile.capability_source.as_mut() {
+        capability_source.push_str("+generation_controls:");
+        capability_source.push_str(source);
+    }
 }
 
 pub(super) async fn persist_discovered_voice(

@@ -506,11 +506,15 @@ pub(super) fn detection_request_estimate(
     let reasoning_tokens = match reasoning {
         ReasoningControl::Disabled => 0,
         ReasoningControl::TokenBudget { tokens } => u64::from(*tokens),
-        ReasoningControl::Effort { effort } => match effort {
-            audiobookai_providers::ReasoningEffort::Minimal => 2_048,
-            audiobookai_providers::ReasoningEffort::Low => 4_096,
-            audiobookai_providers::ReasoningEffort::Medium => 8_192,
-            audiobookai_providers::ReasoningEffort::High => 16_384,
+        // Unknown future levels are reserved at the largest known depth.
+        ReasoningControl::Effort { effort } => match effort.as_str() {
+            "none" => 0,
+            "minimal" => 2_048,
+            "low" => 4_096,
+            "medium" => 8_192,
+            "high" => 16_384,
+            "xhigh" => 32_768,
+            _ => 65_536,
         },
         ReasoningControl::Inherit | ReasoningControl::Adaptive => 16_384,
     };

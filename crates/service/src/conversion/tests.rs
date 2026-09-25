@@ -840,6 +840,12 @@ async fn semantic_assignment_resolution_does_not_require_dispatch_readiness_or_c
         reasoning: Vec::new(),
         max_concurrency: Some(1),
         model_performance: Vec::new(),
+        reasoning_efforts: Vec::new(),
+        min_reasoning_budget: None,
+        max_reasoning_budget: None,
+        max_temperature: None,
+        generation_controls_model: None,
+        generation_controls_source: None,
     });
     let consent_only = HashMap::from([(provider_id, consent_only)]);
     assert!(matches!(
