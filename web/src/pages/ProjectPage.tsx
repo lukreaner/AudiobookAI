@@ -38,6 +38,7 @@ import { DEFAULT_EXPORT_SETTINGS, requiresMusicOwnership, toJobExportSettings, t
 import { formatBytes, formatCount, formatDuration, formatMoney } from "../lib/format";
 import { AUTO_SPEAKER, NARRATOR_SPEAKER, paragraphIdFor, parseAliases, speakerOverrideInput, storedSpeakerSelection } from "../features/characterReview";
 import { DistributionPanel } from "../features/DistributionPanel";
+import { localizeJobStage } from "../features/jobStage";
 import { ProofingWorkbench } from "../features/ProofingWorkbench";
 import { VoiceAuditionPanel } from "../features/VoiceAuditionPanel";
 
@@ -52,6 +53,13 @@ const tabs: { id: ProjectTab; label: string; icon: typeof BookOpen }[] = [
   { id: "proofing", label: "project.proofing", icon: ShieldCheck },
   { id: "distribution", label: "project.distribution", icon: PackageCheck },
 ];
+
+/** The detected narrator is stored under a language-neutral name; show it in the UI language. */
+function characterDisplayName(character: Character, t: (key: string) => string): string {
+  return character.role === "narrator" && character.canonicalName === "Narrator"
+    ? t("characters.narratorSpeaker")
+    : character.canonicalName;
+}
 
 function retryIdempotencyKey(error: unknown, previous?: string): string {
   return error instanceof ApiError && error.problem.status === 0 && previous
@@ -339,6 +347,11 @@ function CharactersPanel({ projectId, reviewStatus, consentCloudAudio }: { proje
   const filteredVoices = voices.data?.items.filter((voice) => !voiceProvider || voice.providerProfileId === voiceProvider) ?? [];
   const cloneProviders = providers.data?.items.filter((provider) => provider.role === "tts" && provider.capabilities?.voiceCloning) ?? [];
   const selectedDetectionProvider = aiProviders.find((provider) => provider.id === detectionProvider);
+  // With exactly one detection-capable connection there is nothing to choose.
+  const onlyDetectionProviderId = aiProviders.length === 1 ? aiProviders[0].id : undefined;
+  useEffect(() => {
+    if (!detectionProvider && onlyDetectionProviderId) setDetectionProvider(onlyDetectionProviderId);
+  }, [detectionProvider, onlyDetectionProviderId]);
   const characterMutationPending = detection.isPending || approve.isPending || assignment.isPending || identity.isPending
     || speakerOverride.isPending || createIdentity.isPending || mergeIdentity.isPending || deleteIdentity.isPending;
 
@@ -361,7 +374,7 @@ function CharactersPanel({ projectId, reviewStatus, consentCloudAudio }: { proje
       {providers.isError ? <ErrorState error={providers.error} onRetry={() => void providers.refetch()} /> : null}
       {voices.isError ? <ErrorState error={voices.error} onRetry={() => void voices.refetch()} /> : null}
       {activeDetection ? <Card className="detection-config stack" role="status">
-        <div className="space-between"><div><h2>{t("characters.detectionStatus", { status: t(`characters.detectionState_${activeDetection.status}`, { defaultValue: activeDetection.status.replace("_", " ") }) })}</h2><p>{activeDetection.currentStage ? t(`stage.${activeDetection.currentStage}`, { defaultValue: activeDetection.currentStage }) : t("characters.detectionPreparing")}</p></div><Badge tone={activeDetection.status === "paused" ? "warning" : "accent"}>{Math.round(activeDetection.progress)}%</Badge></div>
+        <div className="space-between"><div><h2>{t("characters.detectionStatus", { status: t(`characters.detectionState_${activeDetection.status}`, { defaultValue: activeDetection.status.replace("_", " ") }) })}</h2><p>{activeDetection.currentStage ? localizeJobStage(activeDetection.currentStage, t) : t("characters.detectionPreparing")}</p></div><Badge tone={activeDetection.status === "paused" ? "warning" : "accent"}>{Math.round(activeDetection.progress)}%</Badge></div>
         <ProgressBar value={activeDetection.progress} label={t("characters.detectionProgress", { value: Math.round(activeDetection.progress) })} />
         <div className="cluster">
           {(["queued", "running"] as const).includes(activeDetection.status as "queued" | "running") ? <Button size="sm" variant="secondary" disabled={detectionAction.isPending} onClick={() => detectionAction.mutate("pause")}>{t("jobs.pause")}</Button> : null}
@@ -428,7 +441,7 @@ function CharactersPanel({ projectId, reviewStatus, consentCloudAudio }: { proje
           <div className="character-grid">
             {characterItems.map((character) => (
               <Card className="character-card" key={character.id}>
-                <div className="character-top"><div className="avatar">{character.canonicalName.slice(0, 1).toUpperCase()}</div><div><div className="cluster"><h2>{character.canonicalName}</h2>{character.role === "narrator" ? <Badge tone="accent">{t("characters.narratorRole")}</Badge> : null}</div><p>{t("characters.dialogue", { count: character.dialogueCount })}</p></div><div className="character-card-actions"><Badge tone={character.confidence >= .8 ? "positive" : "warning"}>{t("characters.confidence", { value: `${Math.round(character.confidence * 100)}%` })}</Badge><Button disabled={Boolean(activeDetection) || characterMutationPending} size="sm" variant="ghost" aria-label={t("characters.editIdentity", { name: character.canonicalName })} onClick={() => { setEditingIdentity(character); setIdentityName(character.canonicalName); setIdentityAliases(character.aliases.join(", ")); identity.reset(); }}><Pencil size={14} /></Button>{character.role !== "narrator" ? <><Button disabled={Boolean(activeDetection) || characterMutationPending} size="sm" variant="ghost" aria-label={t("characters.mergeCharacterLabel", { name: character.canonicalName })} onClick={() => { setMergingCharacter(character); setMergeTargetId(""); setMergeConfirmed(false); }}><UserRound size={14} /></Button><Button disabled={Boolean(activeDetection) || characterMutationPending} size="sm" variant="ghost" aria-label={t("characters.deleteCharacterLabel", { name: character.canonicalName })} onClick={() => { setDeletingCharacter(character); setDeleteCharacterConfirmed(false); }}><Trash2 size={14} /></Button></> : null}</div></div>
+                <div className="character-top"><div className="avatar">{characterDisplayName(character, t).slice(0, 1).toUpperCase()}</div><div><div className="cluster"><h2>{characterDisplayName(character, t)}</h2>{character.role === "narrator" && characterDisplayName(character, t) !== t("characters.narratorRole") ? <Badge tone="accent">{t("characters.narratorRole")}</Badge> : null}</div><p>{character.role === "narrator" && character.dialogueCount === 0 ? t("characters.narratorCoverage") : t("characters.dialogue", { count: character.dialogueCount })}</p></div><div className="character-card-actions"><Badge tone={character.confidence >= .8 ? "positive" : "warning"}>{t("characters.confidence", { value: `${Math.round(character.confidence * 100)}%` })}</Badge><Button disabled={Boolean(activeDetection) || characterMutationPending} size="sm" variant="ghost" aria-label={t("characters.editIdentity", { name: character.canonicalName })} onClick={() => { setEditingIdentity(character); setIdentityName(character.canonicalName); setIdentityAliases(character.aliases.join(", ")); identity.reset(); }}><Pencil size={14} /></Button>{character.role !== "narrator" ? <><Button disabled={Boolean(activeDetection) || characterMutationPending} size="sm" variant="ghost" aria-label={t("characters.mergeCharacterLabel", { name: character.canonicalName })} onClick={() => { setMergingCharacter(character); setMergeTargetId(""); setMergeConfirmed(false); }}><UserRound size={14} /></Button><Button disabled={Boolean(activeDetection) || characterMutationPending} size="sm" variant="ghost" aria-label={t("characters.deleteCharacterLabel", { name: character.canonicalName })} onClick={() => { setDeletingCharacter(character); setDeleteCharacterConfirmed(false); }}><Trash2 size={14} /></Button></> : null}</div></div>
                 {character.aliases.length ? <div className="aliases"><span>{t("characters.aliases")}</span>{character.aliases.map((alias) => <Badge key={alias}>{alias}</Badge>)}</div> : null}
                 <button type="button" className="voice-assignment" disabled={Boolean(activeDetection) || characterMutationPending || providers.isLoading || providers.isError || voices.isLoading || voices.isError} onClick={() => { setAssigning(character); setVoiceProvider(character.voiceAssignment?.providerProfileId ?? ""); setVoiceId(character.voiceAssignment?.voiceId ?? ""); }}>
                   <span className="voice-icon"><Mic2 size={17} /></span><span><small>{t("characters.voice")}</small><strong>{character.voiceAssignment?.voiceName ?? t("characters.noVoice")}</strong>{character.voiceAssignment ? <em>{character.voiceAssignment.providerName}</em> : null}</span><span>{t("common.edit")}</span>
@@ -452,7 +465,7 @@ function CharactersPanel({ projectId, reviewStatus, consentCloudAudio }: { proje
         </>
       )}
 
-      <Dialog open={Boolean(assigning)} onOpenChange={(open) => !open && !assignment.isPending && setAssigning(undefined)} title={t("characters.assignVoice", { name: assigning?.canonicalName })} description={t("characters.subtitle")} footer={<><Button variant="secondary" disabled={assignment.isPending} onClick={() => setAssigning(undefined)}>{t("common.cancel")}</Button><Button disabled={!voiceProvider || !voiceId || characterMutationPending} onClick={() => assignment.mutate()}>{assignment.isPending ? t("state.saving") : t("common.save")}</Button></>}>
+      <Dialog open={Boolean(assigning)} onOpenChange={(open) => !open && !assignment.isPending && setAssigning(undefined)} title={t("characters.assignVoice", { name: assigning ? characterDisplayName(assigning, t) : "" })} description={t("characters.subtitle")} footer={<><Button variant="secondary" disabled={assignment.isPending} onClick={() => setAssigning(undefined)}>{t("common.cancel")}</Button><Button disabled={!voiceProvider || !voiceId || characterMutationPending} onClick={() => assignment.mutate()}>{assignment.isPending ? t("state.saving") : t("common.save")}</Button></>}>
         <div className="stack">
           <Field label={t("providers.title")}><Select value={voiceProvider} disabled={characterMutationPending} onChange={(event) => { setVoiceProvider(event.target.value); setVoiceId(""); }}><option value="">{t("common.select")}</option>{providers.data?.items.filter((provider) => provider.role === "tts" && provider.capabilities?.tts).map((provider) => <option value={provider.id} key={provider.id}>{provider.name}</option>)}</Select></Field>
           <Field label={t("characters.voice")}><Select value={voiceId} onChange={(event) => setVoiceId(event.target.value)} disabled={!voiceProvider || characterMutationPending}><option value="">{t("common.select")}</option>{filteredVoices.map((voice) => <option value={voice.id} key={voice.id}>{voice.name}{voice.locale ? ` · ${voice.locale}` : ""}</option>)}</Select></Field>

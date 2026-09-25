@@ -32,7 +32,7 @@ describe("provider presets", () => {
   });
 
   it("keeps TTS and LLM presets separate and supplies required endpoints", () => {
-    expect(providerPresetsFor("tts")).toHaveLength(7);
+    expect(providerPresetsFor("tts")).toHaveLength(8);
     expect(providerPresetsFor("llm")).toHaveLength(9);
     for (const preset of providerPresets) {
       expect(providerPreset(preset.kind)).toBe(preset);
@@ -61,6 +61,14 @@ describe("provider presets", () => {
     expect(providerDefaultsForRole(openai, "llm")).toEqual({ defaultModel: "", modelSource: "discover" });
     expect(providerPresetsFor("tts").filter((preset) => preset.kind === "openai")).toHaveLength(1);
     expect(providerPresetsFor("llm").filter((preset) => preset.kind === "openai")).toHaveLength(1);
+  });
+
+  it("offers Gemini 3.8 Flash TTS and keeps Gemini LLM detection independent", () => {
+    const gemini = providerPreset("gemini");
+    expect(providerRoles(gemini)).toEqual(["tts", "llm"]);
+    expect(providerDefaultsForRole(gemini, "tts")).toEqual({ defaultModel: "gemini-3.8-flash-tts", modelSource: "discover" });
+    expect(providerDefaultsForRole(gemini, "llm")).toEqual({ defaultModel: "", modelSource: "discover" });
+    expect(providerPresetsFor("tts").filter((preset) => preset.kind === "gemini")).toHaveLength(1);
   });
 
   it("offers Piper only as a native TTS provider with installed-model discovery", () => {

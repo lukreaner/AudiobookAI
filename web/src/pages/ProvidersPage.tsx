@@ -106,6 +106,7 @@ export function ProvidersPage() {
     refetchInterval: (query) => query.state.data?.activeOperation ? 750 : false,
   });
   const [editing, setEditing] = useState<ProviderProfile>();
+  const [focusCredential, setFocusCredential] = useState(false);
   const [deleting, setDeleting] = useState<ProviderProfile>();
   const [controlling, setControlling] = useState<ProviderProfile>();
   const [modelName, setModelName] = useState("");
@@ -266,7 +267,7 @@ export function ProvidersPage() {
     if (addOpen) void nativeAvailability.refetch();
   }, [addOpen, nativeAvailability.refetch]);
 
-  const closeDialog = () => { setAddOpen(false); setEditing(undefined); setForm(emptyProviderForm()); };
+  const closeDialog = () => { setFocusCredential(false); setAddOpen(false); setEditing(undefined); setForm(emptyProviderForm()); };
   const openAddForRole = (role: ProviderRole) => {
     setEditing(undefined);
     setForm(providerFormFor(role === "tts" ? "elevenlabs" : "openai", role));
@@ -317,7 +318,7 @@ export function ProvidersPage() {
     });
     setAddOpen(true);
   };
-  const openEdit = (provider: ProviderProfile) => { setEditing(provider); setForm({ name: provider.name, kind: provider.kind === "openai_tts" ? "openai" : provider.kind, role: provider.role, mode: provider.mode, endpoint: provider.endpoint ?? "", executablePath: provider.executablePath ?? "", workingDirectory: provider.workingDirectory ?? "", argumentsText: provider.arguments.join("\n"), credential: "", model: provider.model ?? "", contextWindowTokens: provider.contextWindowTokens?.toString() ?? "" }); };
+  const openEdit = (provider: ProviderProfile, focusCredential = false) => { setFocusCredential(focusCredential); setEditing(provider); setForm({ name: provider.name, kind: provider.kind === "openai_tts" ? "openai" : provider.kind, role: provider.role, mode: provider.mode, endpoint: provider.endpoint ?? "", executablePath: provider.executablePath ?? "", workingDirectory: provider.workingDirectory ?? "", argumentsText: provider.arguments.join("\n"), credential: "", model: provider.model ?? "", contextWindowTokens: provider.contextWindowTokens?.toString() ?? "" }); };
   const requestDelete = (provider: ProviderProfile) => {
     closeDialog();
     remove.reset();
@@ -369,65 +370,6 @@ export function ProvidersPage() {
   return (
     <div className="page providers-page">
       <PageHeading eyebrow={t("providers.eyebrow")} title={t("providers.title")} subtitle={t("providers.subtitle")} actions={<Button onClick={() => setAddOpen(true)}><Plus size={17} />{t("providers.add")}</Button>} />
-      <Card className="provider-model-discovery-card">
-        <span className="provider-logo"><RefreshCw size={20} /></span>
-        <div><strong>{t("providers.modelDiscoveryTitle")}</strong><p>{t("providers.modelDiscoveryOverview")}</p></div>
-        <Badge tone="info">{t("providers.automatic")}</Badge>
-      </Card>
-      <PiperManagementCard providers={providers.data?.items ?? []} onAddConnection={() => { setEditing(undefined); setForm(providerFormFor("piper", "tts")); setAddOpen(true); }} />
-      {mlx.isError ? <ErrorState error={mlx.error} onRetry={() => void mlx.refetch()} /> : null}
-      {mlx.data ? <Card className="mlx-management-card">
-        <div className="mlx-management-head">
-          <span className="provider-logo"><PackageOpen size={21} /></span>
-          <div><h2>{t("providers.mlxManagerTitle")}</h2><p>{t("providers.mlxManagerDetail")}</p></div>
-          <Badge tone={mlx.data.installed ? "positive" : mlxInstallerUnavailable ? "warning" : "neutral"}>{mlx.data.installed ? t("providers.mlxInstalled", { version: mlx.data.installedVersion }) : t(mlxInstallerUnavailable ? "providers.mlxInstallerUnavailableBadge" : "providers.mlxNotInstalled")}</Badge>
-        </div>
-        <p id="mlx-installer-status" className={mlxInstallerUnavailable ? "provider-form-warning" : "mlx-support-detail"}>{t(installerStatusKeys[mlx.data.installerStatus])} {t("providers.mlxUvRequirement", { version: mlx.data.requiredUvVersion })}</p>
-        {mlxDeveloperFallback ? <details className="mlx-developer-setup">
-          <summary>{t("providers.mlxDeveloperSetup")}</summary>
-          <p>{t("providers.mlxDeveloperSetupDetail")}</p>
-        </details> : null}
-        {mlx.data.activeOperation ? <div className="mlx-operation" aria-live="polite">
-          <div className="space-between"><strong>{mlx.data.activeOperation.message}</strong><span>{mlx.data.activeOperation.progressPercent}%</span></div>
-          <progress max={100} value={mlx.data.activeOperation.progressPercent} />
-          <Button size="sm" variant="ghost" disabled={cancelMlx.isPending || mlx.data.activeOperation.state === "cancelling"} onClick={() => cancelMlx.mutate(mlx.data!.activeOperation!.id)}><XCircle size={14} />{t("providers.mlxCancel")}</Button>
-        </div> : null}
-        {mlx.data.lastOperation && mlx.data.lastOperation.state !== "succeeded" ? <p className="provider-form-warning">{mlx.data.lastOperation.message}</p> : null}
-        {mlx.data.lastOperation && (mlx.data.lastOperation.diagnostics?.length || mlx.data.lastOperation.exitCode != null) ? <details className="mlx-operation-diagnostics">
-          <summary>{t("providers.mlxDiagnostics")}</summary>
-          {mlx.data.lastOperation.exitCode != null ? <p>{t("providers.mlxExitCode", { code: mlx.data.lastOperation.exitCode })}</p> : null}
-          {mlx.data.lastOperation.diagnostics?.length ? <ul>{mlx.data.lastOperation.diagnostics.map((line) => <li key={line}>{line}</li>)}</ul> : null}
-        </details> : null}
-        {mlx.data.profileActionRequired ? <p className="provider-form-warning">{t("providers.mlxProfileActionRequired")}</p> : null}
-        <div className="mlx-management-actions">
-          {!mlx.data.installed ? <Button aria-describedby="mlx-installer-status" disabled={!mlx.data.supported || !mlx.data.installerPayloadAvailable || Boolean(mlx.data.activeOperation) || installMlx.isPending} onClick={() => installMlx.mutate()}>{installMlx.isPending ? <LoaderCircle className="spin" size={16} /> : <Download size={16} />}{t("providers.mlxInstall")}</Button> : null}
-          {mlxDeveloperFallback ? <Button variant="secondary" onClick={configureDeveloperMlx}>{t("providers.mlxConfigureExisting")}</Button> : null}
-          {mlx.data.installed ? <Button variant="danger" disabled={Boolean(mlx.data.activeOperation) || managedMlxProfiles.length > 0 || uninstallMlx.isPending} onClick={() => setConfirmingUninstall(true)}><Trash2 size={16} />{t("providers.mlxUninstall")}</Button> : null}
-          <Button variant="ghost" size="sm" onClick={() => void mlx.refetch()}><RefreshCw size={14} />{t("common.refresh")}</Button>
-        </div>
-        {mlx.data.installed && managedMlxProfiles.length > 0 ? <p className="mlx-uninstall-note">{t("providers.mlxDeleteProfileFirst")}</p> : null}
-        {mlx.data.installed ? <section className="mlx-model-library" aria-labelledby="mlx-model-heading">
-          <div><h3 id="mlx-model-heading">{t("providers.mlxModels")}</h3><p>{t("providers.mlxModelsDetail")}</p></div>
-          <div className="mlx-download-form">
-            <Field label={t("providers.mlxRepository")} hint={t("providers.mlxRepositoryHint")}><Input value={modelRepository} onChange={(event) => setModelRepository(event.target.value)} placeholder="owner/public-model" /></Field>
-            <Field label={t("providers.mlxRevision")} hint={t("providers.mlxRevisionHint")}><Input value={modelRevision} onChange={(event) => setModelRevision(event.target.value)} /></Field>
-            <Button disabled={!modelRepository.trim() || !modelRevision.trim() || Boolean(mlx.data.activeOperation) || downloadMlx.isPending} onClick={() => downloadMlx.mutate()}>{downloadMlx.isPending ? <LoaderCircle className="spin" size={16} /> : <Download size={16} />}{t("providers.mlxDownloadModel")}</Button>
-          </div>
-          {mlx.data.models.length ? <div className="mlx-model-list">{mlx.data.models.map((model) => <div key={model.id}>
-            <HardDrive size={17} />
-            <div><strong>{model.repository}</strong><span>{model.resolvedCommit ? `${model.revision} · ${model.resolvedCommit.slice(0, 12)}` : model.revision} · {formatBytes(model.bytes)}</span><code>{model.localPath}</code></div>
-            <div className="card-actions">
-              <Button size="sm" variant="secondary" disabled={!managedMlxProfile || model.state !== "ready" || selectMlxModel.isPending} onClick={() => managedMlxProfile && selectMlxModel.mutate({ providerId: managedMlxProfile.id, path: model.localPath })}>{t("providers.mlxUseModel")}</Button>
-              <Button aria-label={t("providers.mlxRemoveModel", { name: model.repository })} size="sm" variant="ghost" disabled={model.state === "downloading"} onClick={() => setRemovingModel(model)}><Trash2 size={14} /></Button>
-            </div>
-          </div>)}</div> : <p className="mlx-empty-models">{t("providers.mlxNoModels")}</p>}
-        </section> : null}
-        {installMlx.isError ? <ErrorState error={installMlx.error} /> : null}
-        {uninstallMlx.isError ? <ErrorState error={uninstallMlx.error} /> : null}
-        {cancelMlx.isError ? <ErrorState error={cancelMlx.error} /> : null}
-        {downloadMlx.isError ? <ErrorState error={downloadMlx.error} /> : null}
-        {selectMlxModel.isError ? <ErrorState error={selectMlxModel.error} /> : null}
-      </Card> : null}
       {!providers.data?.items.length ? <EmptyState title={t("providers.emptyTitle")} detail={t("providers.emptyDetail")} action={<Button onClick={() => setAddOpen(true)}><Plus size={16} />{t("providers.add")}</Button>} /> : (
         <div className="provider-role-groups">
           {(["tts", "llm"] as ProviderRole[]).map((role) => {
@@ -446,6 +388,8 @@ export function ProvidersPage() {
                   const roleDefaults = providerDefaultsForRole(preset, provider.role);
                   const isNativeSystemProvider = provider.kind === "native_os";
                   const nativeSetupRequired = isNativeSystemProvider && provider.status === "unconfigured";
+                  // A cloud connection without its key cannot run; explain the fix instead of the raw error.
+                  const credentialMissing = provider.mode === "cloud_remote" && !provider.credentialConfigured;
                   const nativeProfileGuidanceKey = nativeAvailability.data?.available === false
                     ? nativeGuidanceKey
                     : "providers.nativeProfileNeedsSetup";
@@ -457,7 +401,7 @@ export function ProvidersPage() {
                         <Badge tone={statusTone[provider.status]}><span className="service-dot" />{t(`providers.${provider.status}`)}</Badge>
                       </div>
                       <div className="provider-connection">
-                        <span>{provider.model || (roleDefaults.modelSource === "none" ? t("providers.systemVoicesNoModelCatalog", { name: isNativeSystemProvider ? nativeProviderName : t("providers.systemVoices") }) : provider.endpoint || t(modeLabel(provider.mode)))}</span>
+                        <span title={provider.model || undefined}>{provider.model || (roleDefaults.modelSource === "none" ? t("providers.systemVoicesNoModelCatalog", { name: isNativeSystemProvider ? nativeProviderName : t("providers.systemVoices") }) : provider.endpoint || t(modeLabel(provider.mode)))}</span>
                         {provider.mode !== "native" ? <span className={provider.credentialConfigured ? "credential-ok" : "credential-missing"}><KeyRound size={13} />{t(provider.credentialConfigured ? "providers.apiKeyConfigured" : "providers.apiKeyMissing")}</span> : null}
                       </div>
                       <div className="capability-list">
@@ -469,7 +413,7 @@ export function ProvidersPage() {
                           {caps.modelControl ? <Badge>{t("providers.modelControl")}</Badge> : null}
                         </> : <span className="capability-unknown">{t("providers.capabilityUnknown")}</span>}
                       </div>
-                      {nativeSetupRequired ? <div className="provider-error"><span /><div><strong>{t("providers.nativeSetupRequiredTitle", { name: nativeProviderName })}</strong><p>{t(nativeProfileGuidanceKey, { name: nativeProviderName })} {t("providers.nativePiperAlternative")}</p></div></div> : provider.lastError ? <div className="provider-error"><span />{provider.lastError}</div> : null}
+                      {nativeSetupRequired ? <div className="provider-error"><span /><div><strong>{t("providers.nativeSetupRequiredTitle", { name: nativeProviderName })}</strong><p>{t(nativeProfileGuidanceKey, { name: nativeProviderName })} {t("providers.nativePiperAlternative")}</p></div></div> : credentialMissing ? <div className="provider-error provider-credential-required"><span /><div><strong>{t("providers.credentialRequiredTitle")}</strong><p>{t("providers.credentialRequiredDetail", { name: provider.name })}</p><Button size="sm" variant="secondary" onClick={() => openEdit(provider, true)}><KeyRound size={14} />{t("providers.addCredential")}</Button></div></div> : provider.lastError ? <div className="provider-error"><span />{provider.lastError}</div> : null}
                       <div className="provider-actions">
                         {provider.capabilities?.processControl ? <>
                           {provider.status === "online" ? <Button size="sm" variant="secondary" onClick={() => control.mutate({ id: provider.id, action: "stop" })} disabled={control.isPending}><Square size={13} />{t("providers.stop")}</Button> : <Button size="sm" variant="secondary" onClick={() => control.mutate({ id: provider.id, action: "start" })} disabled={control.isPending}><Play size={13} />{t("providers.start")}</Button>}
@@ -489,6 +433,68 @@ export function ProvidersPage() {
           })}
         </div>
       )}
+      <Card className="provider-model-discovery-card">
+        <span className="provider-logo"><RefreshCw size={20} /></span>
+        <div><strong>{t("providers.modelDiscoveryTitle")}</strong><p>{t("providers.modelDiscoveryOverview")}</p></div>
+        <Badge tone="info">{t("providers.automatic")}</Badge>
+      </Card>
+      <section className="provider-local-engines" aria-labelledby="local-engines-heading">
+        <div className="section-heading"><div><h2 id="local-engines-heading">{t("providers.localEnginesTitle")}</h2><p>{t("providers.localEnginesDetail")}</p></div></div>
+        <PiperManagementCard providers={providers.data?.items ?? []} onAddConnection={() => { setEditing(undefined); setForm(providerFormFor("piper", "tts")); setAddOpen(true); }} />
+        {mlx.isError ? <ErrorState error={mlx.error} onRetry={() => void mlx.refetch()} /> : null}
+        {mlx.data && (mlx.data.supported || mlx.data.installed) ? <Card className="mlx-management-card">
+          <div className="mlx-management-head">
+            <span className="provider-logo"><PackageOpen size={21} /></span>
+            <div><h2>{t("providers.mlxManagerTitle")}</h2><p>{t("providers.mlxManagerDetail")}</p></div>
+            <Badge tone={mlx.data.installed ? "positive" : mlxInstallerUnavailable ? "warning" : "neutral"}>{mlx.data.installed ? t("providers.mlxInstalled", { version: mlx.data.installedVersion }) : t(mlxInstallerUnavailable ? "providers.mlxInstallerUnavailableBadge" : "providers.mlxNotInstalled")}</Badge>
+          </div>
+          <p id="mlx-installer-status" className={mlxInstallerUnavailable ? "provider-form-warning" : "mlx-support-detail"}>{t(installerStatusKeys[mlx.data.installerStatus])} {t("providers.mlxUvRequirement", { version: mlx.data.requiredUvVersion })}</p>
+          {mlxDeveloperFallback ? <details className="mlx-developer-setup">
+            <summary>{t("providers.mlxDeveloperSetup")}</summary>
+            <p>{t("providers.mlxDeveloperSetupDetail")}</p>
+          </details> : null}
+          {mlx.data.activeOperation ? <div className="mlx-operation" aria-live="polite">
+            <div className="space-between"><strong>{mlx.data.activeOperation.message}</strong><span>{mlx.data.activeOperation.progressPercent}%</span></div>
+            <progress max={100} value={mlx.data.activeOperation.progressPercent} />
+            <Button size="sm" variant="ghost" disabled={cancelMlx.isPending || mlx.data.activeOperation.state === "cancelling"} onClick={() => cancelMlx.mutate(mlx.data!.activeOperation!.id)}><XCircle size={14} />{t("providers.mlxCancel")}</Button>
+          </div> : null}
+          {mlx.data.lastOperation && mlx.data.lastOperation.state !== "succeeded" ? <p className="provider-form-warning">{mlx.data.lastOperation.message}</p> : null}
+          {mlx.data.lastOperation && (mlx.data.lastOperation.diagnostics?.length || mlx.data.lastOperation.exitCode != null) ? <details className="mlx-operation-diagnostics">
+            <summary>{t("providers.mlxDiagnostics")}</summary>
+            {mlx.data.lastOperation.exitCode != null ? <p>{t("providers.mlxExitCode", { code: mlx.data.lastOperation.exitCode })}</p> : null}
+            {mlx.data.lastOperation.diagnostics?.length ? <ul>{mlx.data.lastOperation.diagnostics.map((line) => <li key={line}>{line}</li>)}</ul> : null}
+          </details> : null}
+          {mlx.data.profileActionRequired ? <p className="provider-form-warning">{t("providers.mlxProfileActionRequired")}</p> : null}
+          <div className="mlx-management-actions">
+            {!mlx.data.installed ? <Button aria-describedby="mlx-installer-status" disabled={!mlx.data.supported || !mlx.data.installerPayloadAvailable || Boolean(mlx.data.activeOperation) || installMlx.isPending} onClick={() => installMlx.mutate()}>{installMlx.isPending ? <LoaderCircle className="spin" size={16} /> : <Download size={16} />}{t("providers.mlxInstall")}</Button> : null}
+            {mlxDeveloperFallback ? <Button variant="secondary" onClick={configureDeveloperMlx}>{t("providers.mlxConfigureExisting")}</Button> : null}
+            {mlx.data.installed ? <Button variant="danger" disabled={Boolean(mlx.data.activeOperation) || managedMlxProfiles.length > 0 || uninstallMlx.isPending} onClick={() => setConfirmingUninstall(true)}><Trash2 size={16} />{t("providers.mlxUninstall")}</Button> : null}
+            <Button variant="ghost" size="sm" onClick={() => void mlx.refetch()}><RefreshCw size={14} />{t("common.refresh")}</Button>
+          </div>
+          {mlx.data.installed && managedMlxProfiles.length > 0 ? <p className="mlx-uninstall-note">{t("providers.mlxDeleteProfileFirst")}</p> : null}
+          {mlx.data.installed ? <section className="mlx-model-library" aria-labelledby="mlx-model-heading">
+            <div><h3 id="mlx-model-heading">{t("providers.mlxModels")}</h3><p>{t("providers.mlxModelsDetail")}</p></div>
+            <div className="mlx-download-form">
+              <Field label={t("providers.mlxRepository")} hint={t("providers.mlxRepositoryHint")}><Input value={modelRepository} onChange={(event) => setModelRepository(event.target.value)} placeholder="owner/public-model" /></Field>
+              <Field label={t("providers.mlxRevision")} hint={t("providers.mlxRevisionHint")}><Input value={modelRevision} onChange={(event) => setModelRevision(event.target.value)} /></Field>
+              <Button disabled={!modelRepository.trim() || !modelRevision.trim() || Boolean(mlx.data.activeOperation) || downloadMlx.isPending} onClick={() => downloadMlx.mutate()}>{downloadMlx.isPending ? <LoaderCircle className="spin" size={16} /> : <Download size={16} />}{t("providers.mlxDownloadModel")}</Button>
+            </div>
+            {mlx.data.models.length ? <div className="mlx-model-list">{mlx.data.models.map((model) => <div key={model.id}>
+              <HardDrive size={17} />
+              <div><strong>{model.repository}</strong><span>{model.resolvedCommit ? `${model.revision} · ${model.resolvedCommit.slice(0, 12)}` : model.revision} · {formatBytes(model.bytes)}</span><code>{model.localPath}</code></div>
+              <div className="card-actions">
+                <Button size="sm" variant="secondary" disabled={!managedMlxProfile || model.state !== "ready" || selectMlxModel.isPending} onClick={() => managedMlxProfile && selectMlxModel.mutate({ providerId: managedMlxProfile.id, path: model.localPath })}>{t("providers.mlxUseModel")}</Button>
+                <Button aria-label={t("providers.mlxRemoveModel", { name: model.repository })} size="sm" variant="ghost" disabled={model.state === "downloading"} onClick={() => setRemovingModel(model)}><Trash2 size={14} /></Button>
+              </div>
+            </div>)}</div> : <p className="mlx-empty-models">{t("providers.mlxNoModels")}</p>}
+          </section> : null}
+          {installMlx.isError ? <ErrorState error={installMlx.error} /> : null}
+          {uninstallMlx.isError ? <ErrorState error={uninstallMlx.error} /> : null}
+          {cancelMlx.isError ? <ErrorState error={cancelMlx.error} /> : null}
+          {downloadMlx.isError ? <ErrorState error={downloadMlx.error} /> : null}
+          {selectMlxModel.isError ? <ErrorState error={selectMlxModel.error} /> : null}
+        </Card> : null}
+      </section>
       {control.isError ? <ErrorState error={control.error} onRetry={() => control.reset()} /> : null}
 
       <Dialog open={addOpen || Boolean(editing)} onOpenChange={(open) => !open && closeDialog()} title={editing ? t("providers.configure", { name: editing.name }) : t("providers.add")} description={t("providers.subtitle")} size="lg" footer={<>{editing ? <Button variant="danger" onClick={() => requestDelete(editing)}><Trash2 size={16} />{t("providers.delete")}</Button> : null}<Button variant="secondary" onClick={closeDialog}>{t("common.cancel")}</Button><Button disabled={!form.name.trim() || contextWindowInvalid || (managed && !form.executablePath.trim()) || (form.kind === "piper" && !form.model.trim()) || (form.kind === "native_os" && !nativeProviderAvailable && (!editing || editing.status === "unconfigured")) || editBlockedByOwnedProcess || save.isPending} onClick={() => save.mutate()}>{save.isPending ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}{t("providers.saveAndCheck")}</Button></>}>
@@ -512,7 +518,7 @@ export function ProvidersPage() {
               return <option value={preset.kind} key={preset.kind} disabled={native && !nativeProviderAvailable}>{native ? nativeOptionLabel : label}</option>;
             })}</Select></Field>
           </div>
-          {form.role === "tts" && !nativeProviderAvailable && !nativeAvailability.isLoading ? <details className="native-provider-setup-note"><summary>{nativeAvailability.isError ? t("providers.nativeAvailabilityFailedShort") : t("providers.nativeSetupOption", { name: nativeProviderName })}</summary><div className="native-provider-warning" role="status"><strong>{nativeAvailability.isError ? t("providers.nativeAvailabilityFailed") : t("providers.nativeUnavailableTitle", { name: nativeProviderName })}</strong>{nativeAvailability.data ? <><span>{t(nativeGuidanceKey, { name: nativeProviderName })}</span><span>{t("providers.nativePiperAlternative")}</span></> : null}<Button size="sm" variant="ghost" disabled={nativeAvailability.isFetching} onClick={() => void nativeAvailability.refetch()}><RefreshCw className={nativeAvailability.isFetching ? "spin" : undefined} size={14} />{t("providers.nativeCheckAgain")}</Button></div></details> : null}
+          {form.role === "tts" && (!editing || form.kind === "native_os") && !nativeProviderAvailable && !nativeAvailability.isLoading ? <details className="native-provider-setup-note"><summary>{nativeAvailability.isError ? t("providers.nativeAvailabilityFailedShort") : t("providers.nativeSetupOption", { name: nativeProviderName })}</summary><div className="native-provider-warning" role="status"><strong>{nativeAvailability.isError ? t("providers.nativeAvailabilityFailed") : t("providers.nativeUnavailableTitle", { name: nativeProviderName })}</strong>{nativeAvailability.data ? <><span>{t(nativeGuidanceKey, { name: nativeProviderName })}</span><span>{t("providers.nativePiperAlternative")}</span></> : null}<Button size="sm" variant="ghost" disabled={nativeAvailability.isFetching} onClick={() => void nativeAvailability.refetch()}><RefreshCw className={nativeAvailability.isFetching ? "spin" : undefined} size={14} />{t("providers.nativeCheckAgain")}</Button></div></details> : null}
           <Field label={t("providers.mode")}><Select value={form.mode} onChange={(event) => selectProviderMode(event.target.value as ProviderProfile["mode"])}>{selectedPreset.modes.map((mode) => <option value={mode} key={mode}>{t(modeLabel(mode))}</option>)}</Select></Field>
           <Field label={t("import.titleLabel")}><Input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} /></Field>
           {hasEndpoint ? <Field label={t("providers.endpoint")} hint={managed ? t("providers.managedEndpointHint") : t("providers.presetEndpointHint")}><Input type="url" value={form.endpoint} onChange={(event) => setForm({ ...form, endpoint: event.target.value })} placeholder={selectedPreset.defaultEndpoint || "https://provider.example/v1"} /></Field> : null}
@@ -523,7 +529,7 @@ export function ProvidersPage() {
           </div> : null}
           {managed ? <p className="provider-form-note">{t("providers.environmentSecurity")}</p> : null}
           <div className="grid-2">
-            {form.mode !== "native" ? <Field label={t("providers.apiKey")} hint={editing?.credentialConfigured ? t("providers.apiKeyConfigured") : t("providers.apiKeyPlaceholder")}><Input type="password" autoComplete="new-password" value={form.credential} onChange={(event) => setForm({ ...form, credential: event.target.value })} placeholder="••••••••••••" /></Field> : null}
+            {form.mode !== "native" ? <Field label={t("providers.apiKey")} hint={editing?.credentialConfigured ? t("providers.apiKeyConfigured") : t("providers.apiKeyPlaceholder")}><Input type="password" autoComplete="new-password" autoFocus={focusCredential} value={form.credential} onChange={(event) => setForm({ ...form, credential: event.target.value })} placeholder="••••••••••••" /></Field> : null}
             <ProviderModelField role={form.role} source={selectedRoleDefaults.modelSource} value={form.model} models={availableModels.models} status={availableModels.status} strict={availableModels.strict} onChange={(model) => setForm((current) => ({ ...current, model }))} />
           </div>
           {form.role === "llm" ? <Field label={t("providers.contextWindow")} hint={t(form.kind === "lm_studio" ? "providers.contextWindowLmStudioHint" : "providers.contextWindowHint")} error={contextWindowInvalid ? t("providers.contextWindowInvalid") : undefined}><Input type="number" min={2_048} max={2_097_152} step={1} value={form.contextWindowTokens} onChange={(event) => setForm({ ...form, contextWindowTokens: event.target.value })} placeholder={form.kind === "lm_studio" ? "4096" : "16384"} /></Field> : null}

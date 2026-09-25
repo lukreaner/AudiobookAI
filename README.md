@@ -18,6 +18,8 @@ out of scope.
 - Typed voice direction and side-by-side, explicitly billable voice auditions
 - ElevenLabs, MLX-audio, Piper, LocalAI, AllTalk V2, native OS TTS, OpenAI, Anthropic,
   Gemini, Qwen, Kimi/Moonshot, LM Studio, and Ollama adapter families
+- Google Gemini 3.8 Flash and Flash-Lite TTS with 30 prebuilt voices, delivery styles, and
+  streaming
 - In-app MLX-audio installation plus capability-gated local model management
 - Explicit in-app online Piper engine and curated-voice installation on Linux x86_64
 - Preview, estimate, dry-run, budgets, reservations, and provenance-led usage
@@ -56,6 +58,17 @@ pnpm --dir web build
 cargo test --workspace
 pnpm --dir web tauri dev
 ```
+
+For dashboard work in a normal browser, run the development-only API against a disposable data
+directory and the Vite dev server, which proxies `/api` to it:
+
+```bash
+cargo run -p audiobookai-service --example dev_server -- /tmp/audiobookai-dev
+pnpm --dir web dev
+```
+
+The example is never packaged and binds to loopback without the desktop bootstrap, so use it only
+with test data and never with real provider credentials.
 
 To produce a fresh native executable and non-release-signed host package from the current
 checkout, run:

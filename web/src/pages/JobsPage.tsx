@@ -1,3 +1,4 @@
+import { localizeJobStage } from "../features/jobStage";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertTriangle, ArrowLeft, Box, Check, ChevronRight, CircleStop, Clock3, Headphones, LoaderCircle, Pause, Play, RefreshCw, RotateCcw, Volume2 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
@@ -51,7 +52,7 @@ function JobSection({ title, jobs, locale }: { title: string; jobs: Job[]; local
         {jobs.map((job) => (
           <Link className="job-card card" key={job.id} to={`/jobs/${job.id}`}>
             <div className="job-icon"><Box size={20} /></div>
-            <div className="job-copy"><div className="cluster"><h3>{job.projectTitle}</h3><Badge>{job.kind.replaceAll("_", " ")}</Badge><Badge tone={jobTone(job.status)}>{t(`jobs.${job.status}`)}</Badge></div><p>{job.currentStage ? t("jobs.now", { stage: t(`stage.${job.currentStage}`, { defaultValue: job.currentStage }) }) : t("jobs.updated", { value: formatRelative(job.updatedAt, locale) })}</p><ProgressBar value={job.progress} label={t("jobs.progress", { value: Math.round(job.progress) })} tone={job.status === "failed" ? "warning" : "accent"} /></div>
+            <div className="job-copy"><div className="cluster"><h3>{job.projectTitle}</h3><Badge>{t(`jobs.kinds.${job.kind}`, { defaultValue: job.kind.replaceAll("_", " ") })}</Badge><Badge tone={jobTone(job.status)}>{t(`jobs.${job.status}`)}</Badge></div><p>{job.currentStage ? t("jobs.now", { stage: localizeJobStage(job.currentStage, t) }) : t("jobs.updated", { value: formatRelative(job.updatedAt, locale) })}</p><ProgressBar value={job.progress} label={t("jobs.progress", { value: Math.round(job.progress) })} tone={job.status === "failed" ? "warning" : "accent"} /></div>
             <div className="job-time">{job.estimatedRemainingSeconds ? <><Clock3 size={14} />{t("jobs.remaining", { value: formatDuration(job.estimatedRemainingSeconds, locale) })}</> : <>{Math.round(job.progress)}%</>}</div>
             <ChevronRight size={18} className="job-chevron" />
           </Link>
@@ -92,7 +93,7 @@ function JobDetail({ jobId }: { jobId: string }) {
   return (
     <div className="page job-detail-page">
       <Link className="back-link" to="/jobs"><ArrowLeft size={16} />{t("jobs.title")}</Link>
-      <PageHeading title={value.projectTitle} subtitle={value.currentStage ? t("jobs.now", { stage: t(`stage.${value.currentStage}`, { defaultValue: value.currentStage }) }) : t(`jobs.${value.status}`)} actions={<div className="cluster">{["queued", "running"].includes(value.status) ? <Button variant="secondary" onClick={() => action.mutate("pause")} disabled={action.isPending}><Pause size={16} />{t("jobs.pause")}</Button> : null}{value.status === "paused" ? <Button onClick={() => action.mutate("resume")} disabled={action.isPending}><Play size={16} />{t("jobs.resume")}</Button> : null}{value.status === "failed" ? <Button onClick={() => action.mutate("retry")} disabled={action.isPending}><RotateCcw size={16} />{t("jobs.retry")}</Button> : null}{!["complete", "cancelled"].includes(value.status) ? <Button variant="ghost" onClick={() => action.mutate("cancel")} disabled={action.isPending}><CircleStop size={16} />{t("jobs.cancel")}</Button> : null}</div>} />
+      <PageHeading title={value.projectTitle} subtitle={value.currentStage ? t("jobs.now", { stage: localizeJobStage(value.currentStage, t) }) : t(`jobs.${value.status}`)} actions={<div className="cluster">{["queued", "running"].includes(value.status) ? <Button variant="secondary" onClick={() => action.mutate("pause")} disabled={action.isPending}><Pause size={16} />{t("jobs.pause")}</Button> : null}{value.status === "paused" ? <Button onClick={() => action.mutate("resume")} disabled={action.isPending}><Play size={16} />{t("jobs.resume")}</Button> : null}{value.status === "failed" ? <Button onClick={() => action.mutate("retry")} disabled={action.isPending}><RotateCcw size={16} />{t("jobs.retry")}</Button> : null}{!["complete", "cancelled"].includes(value.status) ? <Button variant="ghost" onClick={() => action.mutate("cancel")} disabled={action.isPending}><CircleStop size={16} />{t("jobs.cancel")}</Button> : null}</div>} />
       {action.isError ? <ErrorState error={action.error} /> : null}
       {value.uncertainCharge ? <Card className="uncertain-charge" role="alert"><AlertTriangle size={20} /><p>{t("jobs.uncertainCharge")}</p></Card> : null}
       <Card className="job-overview">

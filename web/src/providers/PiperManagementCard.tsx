@@ -3,7 +3,7 @@ import { AlertTriangle, Download, HardDrive, LoaderCircle, PackageOpen, Plus, Re
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../api/client";
-import type { PiperCatalogVoice, PiperInstalledVoice, ProviderProfile } from "../api/types";
+import type { PiperCatalogVoice, PiperInstalledVoice, PiperManagement, ProviderProfile } from "../api/types";
 import { ErrorState } from "../components/StateViews";
 import { Badge, Button, Card, Dialog, Field, Select } from "../components/ui";
 
@@ -104,7 +104,7 @@ export function PiperManagementCard({ providers, onAddConnection }: { providers:
             : t(installingAvailable ? "providers.piperNotInstalled" : "providers.piperUnavailable")}
         </Badge>
       </div>
-      <p className={management.supported ? "piper-support-detail" : "provider-form-warning"}>{management.supportDetail}</p>
+      <p className={management.supported && management.installerStatus === "ready" ? "piper-support-detail" : "provider-form-warning"}>{piperSupportDetail(management, t)}</p>
 
       {management.activeOperation ? <div className="piper-operation" aria-live="polite">
         <div className="space-between"><strong>{management.activeOperation.message}</strong><span>{management.activeOperation.progressPercent}%</span></div>
@@ -231,4 +231,17 @@ export function PiperManagementCard({ providers, onAddConnection }: { providers:
       <Field label={t("providers.piperConnection")}><Select value={profileId} onChange={(event) => setProfileId(event.target.value)}>{piperProfiles.map((provider) => <option value={provider.id} key={provider.id}>{provider.name}</option>)}</Select></Field>
     </Dialog>
   </>;
+}
+
+const piperSupportDetailKeys: Partial<Record<PiperManagement["installerStatus"], string>> = {
+  ready: "providers.piperSupportReady",
+  unsupported_platform: "providers.piperSupportUnsupported",
+  incomplete: "providers.piperSupportIncomplete",
+  unsafe_filesystem: "providers.piperSupportUnsafe",
+};
+
+/** Localizes the service's support detail by status, falling back to the service text. */
+function piperSupportDetail(management: PiperManagement, t: (key: string) => string): string {
+  const key = piperSupportDetailKeys[management.installerStatus];
+  return key ? t(key) : management.supportDetail;
 }

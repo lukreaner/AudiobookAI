@@ -142,6 +142,12 @@ export const providerPresets: ProviderPreset[] = [
     kind: "gemini",
     name: "Google Gemini",
     role: "llm",
+    roles: ["tts", "llm"],
+    roleDefaults: {
+      // Gemini 3.8 Flash TTS; "gemini-3.8-flash-lite-tts" shares the same request schema.
+      tts: { defaultModel: "gemini-3.8-flash-tts", modelSource: "discover" },
+      llm: { defaultModel: "", modelSource: "discover" },
+    },
     local: false,
     defaultMode: "cloud_remote",
     modes: ["cloud_remote"],

@@ -55,7 +55,7 @@ export function LibraryPage() {
               <Search size={17} />
               <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder={t("library.searchPlaceholder")} />
             </label>
-            <span className="book-count">{t("library.chapters", { count: books.data.total ?? books.data.items.length })}</span>
+            <span className="book-count">{t("library.bookCount", { count: books.data.total ?? books.data.items.length })}</span>
           </div>
           {filtered.length === 0 ? <EmptyState title={t("library.noMatch")} detail={t("library.searchPlaceholder")} /> : (
             <div className="book-grid">
