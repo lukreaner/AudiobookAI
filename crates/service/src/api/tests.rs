@@ -2176,3 +2176,59 @@ async fn mlx_model_path_comparison_resolves_symlink_aliases_but_contains_targets
         "a deletion target outside managed storage must fail closed"
     );
 }
+
+#[tokio::test]
+async fn project_with_an_active_job_cannot_be_deleted() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let database = audiobookai_storage::Database::open_in(directory.path())
+        .await
+        .expect("database");
+    let state = Arc::new(
+        AppState::new(
+            crate::ServiceConfig {
+                bind: "127.0.0.1:0".parse().expect("address"),
+                data_dir: directory.path().to_path_buf(),
+                bundled_sidecar_dir: None,
+                tls: None,
+                lan_hostnames: Vec::new(),
+                allow_insecure_lan: false,
+                desktop_bootstrap: false,
+            },
+            database,
+        )
+        .await
+        .expect("state"),
+    );
+    let project = project_fixture();
+    let project_id = project.summary.id;
+    let mut job = new_job(
+        project_id,
+        project.summary.title.clone(),
+        crate::models::JobKindView::Preview,
+        Vec::new(),
+    );
+    job.status = JobStatusView::Running;
+    {
+        let mut catalog = state.catalog.write().await;
+        catalog.projects.insert(project_id, project);
+        catalog.jobs.insert(job.id, job);
+    }
+
+    let result = delete_project(State(Arc::clone(&state)), Path(project_id)).await;
+
+    assert!(matches!(
+        result,
+        Err(ServiceError::ConflictDetails {
+            code: "active_conversion",
+            ..
+        })
+    ));
+    assert!(
+        state
+            .catalog
+            .read()
+            .await
+            .projects
+            .contains_key(&project_id)
+    );
+}

@@ -62,6 +62,7 @@ fn imported_entities() -> (Book, Project, Chapter, Paragraph) {
         selected: true,
         text_hash: "chapter-hash".into(),
         character_count: 11,
+        word_count: 2,
     };
     let paragraph = Paragraph {
         id: ParagraphId::new(),

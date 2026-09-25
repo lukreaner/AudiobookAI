@@ -156,6 +156,18 @@ pub(super) async fn delete_project(
     let _dispatch_consent_guard = dispatch_consent_lock.write().await;
     let project_lock = state.character_lifecycle_lock(id).await;
     let _project_guard = project_lock.lock().await;
+    // Deleting would orphan any job still working on the project, including previews.
+    let active_job = state
+        .catalog
+        .read()
+        .await
+        .jobs
+        .values()
+        .find(|job| job.project_id == id && active_job_status(job.status))
+        .cloned();
+    if let Some(job) = active_job {
+        return Err(active_job_conflict(&job));
+    }
     archive_project(&state, id).await?;
     let mut catalog = state.catalog.write().await;
     catalog.projects.remove(&id).ok_or(ServiceError::NotFound)?;
@@ -637,6 +649,7 @@ pub(super) async fn commit_import(
             selected: chapter_view.selected,
             text_hash: imported_chapter.content_hash.clone(),
             character_count: imported_chapter.text.chars().count() as u64,
+            word_count: imported_chapter.text.split_whitespace().count() as u64,
         });
         domain_paragraphs.extend(imported_chapter.paragraphs.iter().enumerate().map(
             |(ordinal, paragraph)| audiobookai_core::Paragraph {

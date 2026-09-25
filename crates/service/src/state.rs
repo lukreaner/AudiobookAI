@@ -1030,19 +1030,32 @@ async fn hydrate_projects(
             .list_chapters(book.id)
             .await
             .map_err(|error| crate::ServiceError::Storage(error.to_string()))?;
-        let chapter_views = chapters
-            .into_iter()
-            .map(|chapter| ChapterView {
+        let mut chapter_views = Vec::with_capacity(chapters.len());
+        for chapter in chapters {
+            let word_count = if chapter.word_count == 0 && chapter.character_count > 0 {
+                // Chapters imported before the word count was stored are counted from their text.
+                repositories
+                    .projects
+                    .list_paragraphs(chapter.id)
+                    .await
+                    .map_err(|error| crate::ServiceError::Storage(error.to_string()))?
+                    .iter()
+                    .map(|paragraph| paragraph.text.split_whitespace().count())
+                    .sum()
+            } else {
+                usize::try_from(chapter.word_count).unwrap_or(usize::MAX)
+            };
+            chapter_views.push(ChapterView {
                 id: chapter.id.as_uuid(),
                 index: chapter.ordinal as usize,
                 title: chapter.title,
                 selected: chapter.selected,
-                word_count: 0,
+                word_count,
                 character_count: usize::try_from(chapter.character_count).unwrap_or(usize::MAX),
                 estimated_seconds: Some(chapter.character_count.div_ceil(14)),
                 status: crate::models::ChapterDisplayStatus::Pending,
-            })
-            .collect::<Vec<_>>();
+            });
+        }
         let selected_count = chapter_views
             .iter()
             .filter(|chapter| chapter.selected)
@@ -3242,6 +3255,7 @@ mod tests {
             selected: true,
             text_hash: "chapter-hash".to_owned(),
             character_count: 11,
+            word_count: 2,
         };
         let paragraph = Paragraph {
             id: paragraph_id,
@@ -3538,6 +3552,36 @@ mod tests {
             .find(|character| character.id == rejected_character.id.as_uuid())
             .expect("rejected character");
         assert!(rejected.voice_assignment.is_none());
+    }
+
+    #[tokio::test]
+    async fn restart_restores_chapter_word_counts_including_legacy_chapters() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let database = Database::open_in(directory.path()).await.expect("database");
+        let ids = seed_project_and_provider(&database).await;
+        let paths = AppPaths::from_root(directory.path());
+        let mut catalog = Catalog::new(&paths);
+        hydrate_projects(&database, &mut catalog)
+            .await
+            .expect("hydrate projects");
+        assert_eq!(
+            catalog.projects[&ids.project.as_uuid()].chapters[0].word_count,
+            2
+        );
+
+        // Chapters stored before the word count existed are counted from their paragraphs.
+        sqlx::query("UPDATE chapters SET payload = json_remove(payload, '$.word_count')")
+            .execute(database.pool())
+            .await
+            .expect("strip stored word count");
+        let mut catalog = Catalog::new(&paths);
+        hydrate_projects(&database, &mut catalog)
+            .await
+            .expect("hydrate legacy projects");
+        assert_eq!(
+            catalog.projects[&ids.project.as_uuid()].chapters[0].word_count,
+            2
+        );
     }
 
     #[allow(clippy::too_many_lines)]

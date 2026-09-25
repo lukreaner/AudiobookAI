@@ -258,6 +258,9 @@ pub struct Chapter {
     pub selected: bool,
     pub text_hash: String,
     pub character_count: u64,
+    /// Whitespace-separated words; `0` for chapters stored before the count was recorded.
+    #[serde(default)]
+    pub word_count: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
